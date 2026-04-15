@@ -3,10 +3,11 @@
 <h3 align="center">NVIDIA Spatial Intelligence Lab</h3>
 </p>
 
+https://github.com/user-attachments/assets/f47c24c0-453e-4134-84f1-80c56613f4af
 
-<p align="center">
+<!-- <p align="center">
   <img src="https://github.com/user-attachments/assets/12d44362-8b7f-4952-9488-0e45cf759b57" alt="teaser"/>
-</p>
+</p> -->
 
 ## 🫨 News
 
