@@ -32,6 +32,7 @@ NVIDIA <br>
 - 🚀 [April 15, 2026] Paper, model weights, and inference code are now publicly available!
 - 🚀 [April 17, 2026] 4-step DMD distillation LoRA is now available! See [Fast Inference with DMD Distillation](#fast-inference-with-dmd-distillation) for details.
 - 🔜 [Coming Soon] GUI for interactive scene generation.
+- ⏳ [Planned] Training code and data processing scripts.
 
 ## Installation
 
