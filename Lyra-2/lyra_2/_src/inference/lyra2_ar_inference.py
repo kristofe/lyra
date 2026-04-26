@@ -1231,14 +1231,25 @@ def run_lyra2_sample(
     first_intrinsics = data_batch["intrinsics"][:, 0]
 
     # Multiview input: pass full data tensors so the pipeline can seed the cache.
+    # Prefer dedicated multiview_* keys (used when anchor frames are independent of the
+    # main trajectory tensors, e.g. pre-rendered Unreal keyframes); fall back to the
+    # main keys when the trajectory tensors themselves contain the anchor frames.
     multiview_data = None
     if getattr(args, "multiview_ids", None):
-        multiview_data = {
-            "video": data_batch["video"],
-            "depth": data_batch["depth"],
-            "camera_w2c": data_batch["camera_w2c"],
-            "intrinsics": data_batch["intrinsics"],
-        }
+        if "multiview_video" in data_batch:
+            multiview_data = {
+                "video": data_batch["multiview_video"],
+                "depth": data_batch["multiview_depth"],
+                "camera_w2c": data_batch["multiview_camera_w2c"],
+                "intrinsics": data_batch["multiview_intrinsics"],
+            }
+        else:
+            multiview_data = {
+                "video": data_batch["video"],
+                "depth": data_batch["depth"],
+                "camera_w2c": data_batch["camera_w2c"],
+                "intrinsics": data_batch["intrinsics"],
+            }
 
     pipeline = Lyra2InferencePipeline(
         model=model,

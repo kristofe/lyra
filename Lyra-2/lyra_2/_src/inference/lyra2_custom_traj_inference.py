@@ -169,6 +169,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--num_retrieval_views", type=int, default=1)
     parser.add_argument("--disable_cache_update", action="store_true")
     parser.add_argument("--multiview_ids", type=int, nargs="+", default=None)
+    parser.add_argument("--multiview_path", type=str, default=None,
+                        help="Path to multiview .npz with keys: video [1,3,K,H,W] in [-1,1], "
+                             "depth [1,K,H,W] (true metric, same world units as poses), "
+                             "camera_w2c [1,K,4,4], intrinsics [1,K,3,3]. Optional: "
+                             "image_height, image_width for intrinsic rescaling. When set, "
+                             "the K frames are added as spatial anchors to the Sparse3DCache "
+                             "and --multiview_ids is overridden to range(K).")
     parser.add_argument("--offload_da3_diffusion", action="store_true")
 
     return parser.parse_args()
@@ -504,7 +511,51 @@ if __name__ == "__main__":
             data_batch["t5_chunk_mask"] = t5_chunk_mask
             data_batch["sample_frame_indices"] = sample_frame_indices
 
-        skip_keys = {"camera_w2c", "intrinsics", "depth", "t5_chunk_keys", "sample_frame_indices"}
+        # ---- Optional: load multiview anchors and inject into data_batch ----
+        if args.multiview_path is not None:
+            if not os.path.isfile(args.multiview_path):
+                log.error(f"Multiview file not found: {args.multiview_path}")
+            else:
+                mv = np.load(args.multiview_path)
+                mv_video = torch.from_numpy(mv["video"]).to(
+                    device=desired_device, dtype=model.tensor_kwargs["dtype"]
+                )
+                mv_depth = torch.from_numpy(mv["depth"]).to(
+                    device=desired_device, dtype=torch.float32
+                )
+                mv_w2c = torch.from_numpy(mv["camera_w2c"]).to(
+                    device=desired_device, dtype=torch.float32
+                )
+                mv_K = torch.from_numpy(mv["intrinsics"]).to(
+                    device=desired_device, dtype=torch.float32
+                )
+                K_anchors = mv_video.shape[2]
+                # Rescale intrinsics if multiview was rendered at a different resolution.
+                if "image_height" in mv.files and "image_width" in mv.files:
+                    orig_h = int(mv["image_height"])
+                    orig_w = int(mv["image_width"])
+                    if (orig_h, orig_w) != (target_h, target_w):
+                        sx = target_w / orig_w
+                        sy = target_h / orig_h
+                        mv_K[..., 0, 0] *= sx
+                        mv_K[..., 0, 2] *= sx
+                        mv_K[..., 1, 1] *= sy
+                        mv_K[..., 1, 2] *= sy
+                data_batch["multiview_video"] = mv_video
+                data_batch["multiview_depth"] = mv_depth
+                data_batch["multiview_camera_w2c"] = mv_w2c
+                data_batch["multiview_intrinsics"] = mv_K
+                args.multiview_ids = list(range(K_anchors))
+                log.info(
+                    f"Loaded {K_anchors} multiview anchors from {args.multiview_path}",
+                    rank0_only=True,
+                )
+
+        skip_keys = {
+            "camera_w2c", "intrinsics", "depth",
+            "t5_chunk_keys", "sample_frame_indices",
+            "multiview_camera_w2c", "multiview_intrinsics", "multiview_depth",
+        }
         data_batch = safe_to(
             data_batch,
             device=model.tensor_kwargs.get("device", None),
