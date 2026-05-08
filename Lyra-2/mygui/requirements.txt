@@ -1,0 +1,11 @@
+# Tested with the lyra2 conda env on this machine (CUDA 12.8, Python 3.10).
+# torch + gsplat are inherited from the Lyra-2 environment; the rest is
+# additive for the viewer.
+glfw>=2.7
+moderngl>=5.10
+imgui-bundle>=1.5
+cuda-python>=12.0
+gsplat>=1.4
+torch>=2.0
+numpy>=1.24
+plyfile>=1.0
