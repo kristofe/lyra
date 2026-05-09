@@ -21,6 +21,9 @@ phase's "Prerequisites" section will tell you what it expects.
   threading-ready `SceneState`. No splats yet. ~1 evening.
 - **`phase_1_static_ply.md`** — load a real `.ply`, render it correctly,
   nail down the camera convention. ~1 day with the convention sanity-check.
+- **`phase_1_5_point_clouds.md`** — native viser point-cloud rendering for
+  gap inspection on video-model output. Different render path from splats
+  (client-side Three.js, not server-side gsplat). ~1 day.
 - **`phase_2_gui_controls.md`** — SH degree, render mode (RGB/depth), FOV,
   FPS readout, reset camera. Brings it to feature parity with the native
   ImGui plan. ~1 day.
