@@ -1,11 +1,13 @@
 """
-Phase 1.5 — splat rendering with a point-cloud toggle.
+Phase 2 — splat rendering with full GUI controls + point-cloud toggle.
 
-Loads a 3DGS .ply (Phase 1 path) and optionally additional point clouds via
-`--points`. A "Render mode" GUI toggle switches the scene between gsplat-
-rasterized splats and viser-native point clouds. The splat .ply is also
-auto-derived as a `splat_centers` point-cloud layer so the toggle is useful
-out of the box without any extra inputs.
+Loads a 3DGS .ply (Phase 1 path), optionally additional point clouds via
+`--points` (Phase 1.5), and exposes the inspection / rendering controls from
+Phase 2: SH-degree pinning, RGB/Depth render modes, FOV, near/far for depth
+normalization, render-resolution cap, FPS / render-ms readouts, camera
+readout, and a reset-camera button. The "Display" toggle still switches
+the whole scene between gsplat-rasterized splats and viser-native point
+clouds.
 
 Remote use:
   On GPU box:  python viewer.py path/to/scene.ply --port 8080
@@ -20,6 +22,7 @@ from __future__ import annotations
 import argparse
 import math
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -120,16 +123,15 @@ def _turbo_lut() -> np.ndarray:
 class PointCloudLayer:
     name: str
     points: np.ndarray             # (N, 3) float32, CPU
-    colors_rgb: np.ndarray         # (N, 3) uint8, "natural" colors from source
+    colors_rgb: np.ndarray         # (N, 3) uint8
     metadata: dict = field(default_factory=dict)
     visible: bool = True
-    point_size: float = 0.01       # world units
+    point_size: float = 0.01
     color_mode: str = "rgb"        # "rgb" | "axis" | "confidence" | "uniform"
     uniform_color: tuple[int, int, int] = (255, 51, 51)
 
 
 def compute_colors(layer: PointCloudLayer) -> np.ndarray:
-    """Resolve the (N, 3) uint8 array to push to viser, given layer.color_mode."""
     mode = layer.color_mode
     if mode == "rgb":
         return layer.colors_rgb
@@ -154,8 +156,6 @@ def compute_colors(layer: PointCloudLayer) -> np.ndarray:
 
 
 class PointCloudLoader:
-    """Loads point clouds from .ply, .npy, .npz. Subsamples to a max budget."""
-
     def __init__(self, max_points: int = 1_000_000, seed: int = 42) -> None:
         self.max_points = max_points
         self.seed = seed
@@ -179,9 +179,7 @@ class PointCloudLoader:
             metadata=extras,
         )
 
-    def _downsample(
-        self, points: np.ndarray, colors: np.ndarray, extras: dict
-    ) -> tuple[np.ndarray, np.ndarray, dict]:
+    def _downsample(self, points, colors, extras):
         rng = np.random.default_rng(self.seed)
         idx = rng.choice(len(points), size=self.max_points, replace=False)
         idx.sort()
@@ -192,14 +190,14 @@ class PointCloudLoader:
         )
 
     @staticmethod
-    def _load_ply(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+    def _load_ply(path: Path):
         ply = PlyData.read(str(path))
         v = ply["vertex"].data
         points = np.stack([v["x"], v["y"], v["z"]], axis=-1).astype(np.float32)
         names = set(v.dtype.names)
         if {"red", "green", "blue"}.issubset(names):
             r, g, b = v["red"], v["green"], v["blue"]
-            if r.dtype.kind == "f":  # float in [0, 1]
+            if r.dtype.kind == "f":
                 colors = (
                     np.stack([r, g, b], axis=-1).clip(0.0, 1.0) * 255.0
                 ).astype(np.uint8)
@@ -210,7 +208,7 @@ class PointCloudLoader:
         return points, colors, {}
 
     @staticmethod
-    def _load_npz(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+    def _load_npz(path: Path):
         data = np.load(str(path))
         if "points" not in data.files:
             raise ValueError(f"{path}: .npz must contain a 'points' array")
@@ -226,7 +224,7 @@ class PointCloudLoader:
         return points, colors, extras
 
     @staticmethod
-    def _load_npy(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+    def _load_npy(path: Path):
         points = np.load(str(path)).astype(np.float32)
         colors_path = path.parent / (path.stem + ".colors.npy")
         if colors_path.exists():
@@ -237,7 +235,6 @@ class PointCloudLoader:
 
 
 def derive_splat_centers_layer(scene: "SceneState") -> PointCloudLayer | None:
-    """Build a PointCloudLayer from the loaded splat scene's centers + DC color."""
     with scene.read() as s:
         if s.means is None or s.num_splats == 0:
             return None
@@ -254,23 +251,21 @@ def derive_splat_centers_layer(scene: "SceneState") -> PointCloudLayer | None:
 
 
 # --------------------------------------------------------------------------- #
-# Splat .ply loader (unchanged from Phase 1)
+# Splat .ply loader
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class LoadedSplats:
-    means: torch.Tensor       # (N, 3) float32
-    quats: torch.Tensor       # (N, 4) wxyz
-    scales: torch.Tensor      # (N, 3) float32
-    opacities: torch.Tensor   # (N,)  float32
-    sh: torch.Tensor          # (N, K, 3) float32
+    means: torch.Tensor
+    quats: torch.Tensor
+    scales: torch.Tensor
+    opacities: torch.Tensor
+    sh: torch.Tensor
     sh_degree: int
 
 
 class PlyLoader:
-    """Parses a 3DGS .ply (Inria-format export) into CUDA tensors."""
-
     def __init__(self, device: torch.device) -> None:
         self.device = device
 
@@ -298,11 +293,11 @@ class PlyLoader:
             key=lambda s: int(s.split("_")[-1]),
         )
         if rest_props:
-            assert len(rest_props) % 3 == 0, f"f_rest_* count {len(rest_props)} not /3"
+            assert len(rest_props) % 3 == 0
             K_minus_1 = len(rest_props) // 3
             K = K_minus_1 + 1
             sh_degree = int(round(math.sqrt(K))) - 1
-            assert (sh_degree + 1) ** 2 == K, f"K={K} not a perfect square"
+            assert (sh_degree + 1) ** 2 == K
             rest_np = np.stack([v[n] for n in rest_props], axis=-1).astype(np.float32)
             rest_np = rest_np.reshape(-1, 3, K_minus_1).transpose(0, 2, 1)
             sh_np = np.concatenate([dc_np[:, None, :], rest_np], axis=1)
@@ -355,9 +350,7 @@ class SceneState:
         with self._lock:
             yield self
 
-    def load_from_ply(
-        self, path: str | Path, device: torch.device, flip_x: bool = True
-    ) -> None:
+    def load_from_ply(self, path, device, flip_x=True):
         loaded = PlyLoader(device).load(path, flip_x=flip_x)
         with self.write():
             self.means = loaded.means
@@ -378,16 +371,26 @@ class SceneState:
 
 
 # --------------------------------------------------------------------------- #
-# Renderer (gsplat path, unchanged from Phase 1)
+# Renderer
 # --------------------------------------------------------------------------- #
 
 
 class Renderer:
-    """Single splat-render entry point. Point clouds bypass this entirely —
-    viser draws them client-side."""
+    """Single splat-render entry point. Returns (img_uint8_HW3, render_ms).
+
+    `color_mode='RGB'` runs gsplat with render_mode='RGB'.
+    `color_mode='Depth'` runs render_mode='RGB+ED' and turbo-colorizes the
+    expected-z-depth channel using a GPU LUT, normalized by [near, far].
+    """
 
     def __init__(self, device: str = "cuda") -> None:
         self.device = torch.device(device)
+        self._depth_lut: torch.Tensor | None = None
+
+    def _get_depth_lut(self) -> torch.Tensor:
+        if self._depth_lut is None:
+            self._depth_lut = torch.from_numpy(_turbo_lut()).to(self.device)
+        return self._depth_lut
 
     @torch.inference_mode()
     def render(
@@ -396,10 +399,15 @@ class Renderer:
         camera: viser.CameraHandle,
         width: int,
         height: int,
-    ) -> np.ndarray:
+        *,
+        sh_degree: int,
+        color_mode: str = "RGB",
+        near: float = 0.1,
+        far: float = 100.0,
+    ) -> tuple[np.ndarray, float]:
         with scene.read() as s:
             if s.num_splats == 0 or s.means is None:
-                return np.zeros((height, width, 3), dtype=np.uint8)
+                return np.zeros((height, width, 3), dtype=np.uint8), 0.0
 
             viewmat_np = viser_camera_to_opencv_viewmat(camera.position, camera.wxyz)
             viewmats = torch.from_numpy(viewmat_np.astype(np.float32))[None].to(self.device)
@@ -414,21 +422,50 @@ class Renderer:
                 device=self.device,
             )
 
-            rgb, _alpha, _info = gsplat.rasterization(
-                means=s.means,
-                quats=s.quats,
-                scales=s.scales,
-                opacities=s.opacities,
-                colors=s.sh,
-                viewmats=viewmats,
-                Ks=K,
-                width=width,
-                height=height,
-                sh_degree=s.sh_degree,
-                render_mode="RGB",
-            )
-            img = rgb[0].clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
-            return img.cpu().numpy()
+            sh_degree_eff = max(0, min(int(sh_degree), int(s.sh_degree)))
+            t0 = time.perf_counter()
+
+            if color_mode == "Depth":
+                out, _alpha, _info = gsplat.rasterization(
+                    means=s.means,
+                    quats=s.quats,
+                    scales=s.scales,
+                    opacities=s.opacities,
+                    colors=s.sh,
+                    viewmats=viewmats,
+                    Ks=K,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_eff,
+                    render_mode="RGB+ED",
+                )
+                # Last channel is expected depth.
+                depth = out[0, :, :, 3]
+                span = max(far - near, 1e-6)
+                d_norm = ((depth - near) / span).clamp(0.0, 1.0)
+                idx = (d_norm * 255.0).to(torch.long)
+                img_t = self._get_depth_lut()[idx]  # (H, W, 3) uint8
+            else:
+                rgb, _alpha, _info = gsplat.rasterization(
+                    means=s.means,
+                    quats=s.quats,
+                    scales=s.scales,
+                    opacities=s.opacities,
+                    colors=s.sh,
+                    viewmats=viewmats,
+                    Ks=K,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_eff,
+                    render_mode="RGB",
+                )
+                img_t = rgb[0].clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            img_np = img_t.cpu().numpy()
+            t1 = time.perf_counter()
+            return img_np, (t1 - t0) * 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -443,9 +480,29 @@ def _viser_pc_name(layer_name: str) -> str:
     return _VISER_PC_PREFIX + layer_name
 
 
+def _compute_home_pose(means_np: np.ndarray) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    """Return (position, look_at, up_direction) for a reset-camera home view."""
+    mn = means_np.min(axis=0)
+    mx = means_np.max(axis=0)
+    center = ((mn + mx) * 0.5).astype(np.float64)
+    extent = (mx - mn).astype(np.float64)
+    diag = float(np.linalg.norm(extent))
+    if diag <= 1e-9:
+        diag = 1.0
+    # Pull back along world +Z (viser default up) and slightly along +X for a
+    # 3/4-ish view. Adjust empirically once you've seen your scene.
+    offset = np.array([0.6, -0.6, 0.6], dtype=np.float64)
+    offset = offset / np.linalg.norm(offset) * diag * 1.2
+    pos = center + offset
+    return (
+        (float(pos[0]), float(pos[1]), float(pos[2])),
+        (float(center[0]), float(center[1]), float(center[2])),
+        (0.0, 0.0, 1.0),
+    )
+
+
 class ViewerApp:
-    """Owns the viser server, GUI controls, and dispatch between splat /
-    point-cloud render modes."""
+    """Owns the viser server, the GUI controls, and per-client render dispatch."""
 
     def __init__(
         self,
@@ -470,6 +527,11 @@ class ViewerApp:
             f"flip_x={flip_x}"
         )
 
+        # Home pose computed once from the splat bbox.
+        means_np = self.scene.means.detach().cpu().numpy()
+        self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+        print(f"  home pose: pos={self.home_position} look_at={self.home_look_at}")
+
         if derive_splat_points:
             derived = derive_splat_centers_layer(self.scene)
             if derived is not None:
@@ -481,24 +543,81 @@ class ViewerApp:
             print(f"loading point cloud {p}...")
             layer = loader.load(p)
             self.scene.add_point_cloud(layer)
-            print(
-                f"  layer '{layer.name}': {len(layer.points)} pts, "
-                f"metadata={list(layer.metadata.keys())}"
-            )
+            print(f"  layer '{layer.name}': {len(layer.points)} pts")
 
         self.server = viser.ViserServer(host=host, port=port)
-        # Per-layer GUI handles, keyed by layer name.
         self._handles: dict[str, dict[str, object]] = {}
-        # Pushed viser names so we can clean up on switch.
         self._pushed: set[str] = set()
 
-        # Top-level GUI: render mode + global size.
-        self.render_mode_handle = self.server.gui.add_dropdown(
-            "Render mode",
+        # ---- Perf throttling state --------------------------------------- #
+        self._fps_ema: float = 0.0
+        self._render_ms_ema: float = 0.0
+        self._last_frame_t: float = 0.0
+        self._last_readout_push: float = 0.0
+        self._last_cam_push: float = 0.0
+
+        self._build_gui()
+        self.server.on_client_connect(self._on_client_connect)
+
+    # ---- GUI construction -------------------------------------------- #
+
+    def _build_gui(self) -> None:
+        # Top-level: Display toggle (splats vs point clouds).
+        self.gui_display = self.server.gui.add_dropdown(
+            "Display",
             options=("splats", "points"),
             initial_value="splats",
+            hint="Switch the whole scene between splat rasterization and point clouds.",
         )
-        self.render_mode_handle.on_update(lambda _ev: self._apply_render_mode())
+        self.gui_display.on_update(lambda _ev: self._apply_display_mode())
+
+        sh_options = tuple(str(d) for d in range(self.scene.sh_degree + 1))
+        with self.server.gui.add_folder("Render"):
+            self.gui_sh_degree = self.server.gui.add_dropdown(
+                "sh_degree",
+                options=sh_options,
+                initial_value=str(self.scene.sh_degree),
+                hint="SH degree used by the rasterizer. Capped at the loaded .ply's degree.",
+            )
+            self.gui_render_mode = self.server.gui.add_dropdown(
+                "render_mode", options=("RGB", "Depth"), initial_value="RGB"
+            )
+            self.gui_fov = self.server.gui.add_slider(
+                "fov_deg", min=30.0, max=110.0, step=1.0, initial_value=60.0,
+                hint="Vertical field of view in degrees. Pushed to viser's per-client camera.",
+            )
+            self.gui_near = self.server.gui.add_slider(
+                "depth_near", min=0.001, max=10.0, step=0.001, initial_value=0.1,
+                hint="Near plane for depth normalization.",
+            )
+            self.gui_far = self.server.gui.add_slider(
+                "depth_far", min=1.0, max=1000.0, step=1.0, initial_value=100.0,
+                hint="Far plane for depth normalization.",
+            )
+
+        with self.server.gui.add_folder("Performance"):
+            self.gui_max_res = self.server.gui.add_slider(
+                "max_res", min=256, max=2048, step=16, initial_value=1080,
+                hint="Caps the rendered image's longest edge.",
+            )
+            self.gui_fps_readout = self.server.gui.add_number(
+                "fps", initial_value=0.0, disabled=True
+            )
+            self.gui_render_ms_readout = self.server.gui.add_number(
+                "render_ms", initial_value=0.0, disabled=True
+            )
+
+        with self.server.gui.add_folder("Scene"):
+            self.gui_splat_count_readout = self.server.gui.add_number(
+                "splat_count", initial_value=int(self.scene.num_splats), disabled=True
+            )
+            self.gui_camera_pos_readout = self.server.gui.add_vector3(
+                "camera_pos", initial_value=(0.0, 0.0, 0.0), disabled=True
+            )
+            self.gui_camera_look_readout = self.server.gui.add_vector3(
+                "look_dir", initial_value=(0.0, 0.0, 1.0), disabled=True
+            )
+            self.gui_reset_camera = self.server.gui.add_button("reset camera")
 
         with self.server.gui.add_folder("Point Clouds"):
             self.global_size_mult_handle = self.server.gui.add_slider(
@@ -510,30 +629,44 @@ class ViewerApp:
             for name in list(self.scene.point_clouds.keys()):
                 self._build_layer_gui(name)
 
-        self.server.on_client_connect(self._on_client_connect)
+        # Wire control callbacks.
+        self.gui_render_mode.on_update(lambda _ev: self._render_all_clients())
+        self.gui_sh_degree.on_update(lambda _ev: self._render_all_clients())
+        self.gui_max_res.on_update(lambda _ev: self._render_all_clients())
+        self.gui_near.on_update(lambda _ev: self._maybe_render_depth())
+        self.gui_far.on_update(lambda _ev: self._maybe_render_depth())
+        self.gui_fov.on_update(lambda _ev: self._on_fov_change())
+        self.gui_reset_camera.on_click(lambda _ev: self._on_reset_camera())
 
-    # ---- mode-state predicates ---------------------------------------- #
+    # ---- Display mode (splats vs points) ----------------------------- #
 
     @property
-    def render_mode(self) -> str:
-        return str(self.render_mode_handle.value)
+    def display_mode(self) -> str:
+        return str(self.gui_display.value)
 
-    # ---- per-layer GUI ------------------------------------------------ #
+    def _apply_display_mode(self) -> None:
+        if self.display_mode == "splats":
+            for name in list(self.scene.point_clouds.keys()):
+                self._remove_pushed(name)
+            for client in self.server.get_clients().values():
+                self._render_for(client)
+        else:
+            for client in self.server.get_clients().values():
+                client.scene.set_background_image(None)
+            self._push_all_visible_layers()
+
+    # ---- Per-layer GUI ----------------------------------------------- #
 
     def _build_layer_gui(self, name: str) -> None:
         layer = self.scene.point_clouds[name]
         with self.server.gui.add_folder(name):
             visible = self.server.gui.add_checkbox("visible", initial_value=layer.visible)
             size = self.server.gui.add_slider(
-                "point_size",
-                min=0.0005,
-                max=0.1,
-                step=0.0005,
+                "point_size", min=0.0005, max=0.1, step=0.0005,
                 initial_value=layer.point_size,
             )
             color_mode = self.server.gui.add_dropdown(
-                "color_mode",
-                options=("rgb", "axis", "confidence", "uniform"),
+                "color_mode", options=("rgb", "axis", "confidence", "uniform"),
                 initial_value=layer.color_mode,
             )
             uniform_color = self.server.gui.add_rgb(
@@ -551,22 +684,8 @@ class ViewerApp:
             "count": count,
         }
         self._handles[name] = handles
-
         for h in (visible, size, color_mode, uniform_color):
             h.on_update(lambda _ev, n=name: self._push_layer(n))
-
-    # ---- mode-switching ---------------------------------------------- #
-
-    def _apply_render_mode(self) -> None:
-        if self.render_mode == "splats":
-            for name in list(self.scene.point_clouds.keys()):
-                self._remove_pushed(name)
-            for client in self.server.get_clients().values():
-                self._render_for(client)
-        else:  # points
-            for client in self.server.get_clients().values():
-                client.scene.set_background_image(None)
-            self._push_all_visible_layers()
 
     def _push_all_visible_layers(self) -> None:
         for name in list(self.scene.point_clouds.keys()):
@@ -578,10 +697,9 @@ class ViewerApp:
         if layer is None or handles is None:
             self._remove_pushed(name)
             return
-        if self.render_mode != "points" or not bool(handles["visible"].value):
+        if self.display_mode != "points" or not bool(handles["visible"].value):
             self._remove_pushed(name)
             return
-
         resolved = replace(
             layer,
             visible=True,
@@ -592,12 +710,8 @@ class ViewerApp:
         colors = compute_colors(resolved)
         size = resolved.point_size * float(self.global_size_mult_handle.value)
         viser_name = _viser_pc_name(name)
-        # add_point_cloud is idempotent on name — replaces existing.
         self.server.scene.add_point_cloud(
-            name=viser_name,
-            points=resolved.points,
-            colors=colors,
-            point_size=size,
+            name=viser_name, points=resolved.points, colors=colors, point_size=size,
         )
         self._pushed.add(viser_name)
 
@@ -607,17 +721,46 @@ class ViewerApp:
             self.server.scene.remove_by_name(viser_name)
             self._pushed.discard(viser_name)
 
-    # ---- client lifecycle / rendering -------------------------------- #
+    # ---- Render-control callbacks ------------------------------------ #
+
+    def _render_all_clients(self) -> None:
+        for client in self.server.get_clients().values():
+            self._render_for(client)
+
+    def _maybe_render_depth(self) -> None:
+        if str(self.gui_render_mode.value) == "Depth":
+            self._render_all_clients()
+
+    def _on_fov_change(self) -> None:
+        rad = math.radians(float(self.gui_fov.value))
+        for client in self.server.get_clients().values():
+            try:
+                client.camera.fov = rad
+            except Exception:
+                pass
+
+    def _on_reset_camera(self) -> None:
+        for client in self.server.get_clients().values():
+            client.camera.position = self.home_position
+            client.camera.look_at = self.home_look_at
+            client.camera.up_direction = self.home_up
+
+    # ---- Client lifecycle / rendering -------------------------------- #
 
     def _on_client_connect(self, client: viser.ClientHandle) -> None:
         client.camera.on_update(lambda _cam: self._render_for(client))
-        if self.render_mode == "splats":
+        # Apply current FOV to this client.
+        try:
+            client.camera.fov = math.radians(float(self.gui_fov.value))
+        except Exception:
+            pass
+        if self.display_mode == "splats":
             self._render_for(client)
         else:
             client.scene.set_background_image(None)
 
     def _render_for(self, client: viser.ClientHandle) -> None:
-        if self.render_mode != "splats":
+        if self.display_mode != "splats":
             return
         cam = client.camera
         try:
@@ -627,8 +770,70 @@ class ViewerApp:
             return
         if W <= 0 or H <= 0:
             return
-        img = self.renderer.render(self.scene, cam, W, H)
+
+        # Snapshot all GUI-driven state.
+        sh_degree = int(self.gui_sh_degree.value)
+        color_mode = str(self.gui_render_mode.value)
+        near = float(self.gui_near.value)
+        far = float(self.gui_far.value)
+        max_res = int(self.gui_max_res.value)
+
+        max_dim = max(W, H)
+        if max_dim > max_res:
+            scale = max_res / max_dim
+            W = max(1, int(round(W * scale)))
+            H = max(1, int(round(H * scale)))
+
+        img, render_ms = self.renderer.render(
+            self.scene, cam, W, H,
+            sh_degree=sh_degree,
+            color_mode=color_mode,
+            near=near,
+            far=far,
+        )
         client.scene.set_background_image(img)
+        self._update_perf_readouts(render_ms)
+        self._update_camera_readout(cam)
+
+    # ---- Throttled GUI readouts -------------------------------------- #
+
+    def _update_perf_readouts(self, render_ms: float) -> None:
+        now = time.perf_counter()
+        # EMA of render-ms regardless of throttle (cheap, informative).
+        if self._render_ms_ema == 0.0:
+            self._render_ms_ema = render_ms
+        else:
+            self._render_ms_ema = 0.9 * self._render_ms_ema + 0.1 * render_ms
+        if self._last_frame_t > 0.0:
+            dt = now - self._last_frame_t
+            if dt > 1e-9:
+                inst = 1.0 / dt
+                self._fps_ema = (
+                    inst if self._fps_ema == 0.0 else 0.9 * self._fps_ema + 0.1 * inst
+                )
+        self._last_frame_t = now
+
+        if now - self._last_readout_push >= 0.1:  # 10 Hz
+            self.gui_fps_readout.value = round(float(self._fps_ema), 1)
+            self.gui_render_ms_readout.value = round(float(self._render_ms_ema), 2)
+            self._last_readout_push = now
+
+    def _update_camera_readout(self, cam: viser.CameraHandle) -> None:
+        now = time.perf_counter()
+        if now - self._last_cam_push < 0.1:  # 10 Hz
+            return
+        R = _quat_wxyz_to_rotmat(np.asarray(cam.wxyz))
+        look = R[:, 2]  # camera +Z = forward in OpenCV = viser convention
+        pos = np.asarray(cam.position)
+        self.gui_camera_pos_readout.value = (
+            round(float(pos[0]), 3), round(float(pos[1]), 3), round(float(pos[2]), 3),
+        )
+        self.gui_camera_look_readout.value = (
+            round(float(look[0]), 3), round(float(look[1]), 3), round(float(look[2]), 3),
+        )
+        self._last_cam_push = now
+
+    # ---- Run ---------------------------------------------------------- #
 
     def run(self) -> None:
         host = self.server.get_host()
@@ -644,32 +849,16 @@ class ViewerApp:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 1.5 splat viewer with point-cloud toggle."
+        description="Phase 2 splat viewer with full GUI controls + point-cloud toggle."
     )
-    parser.add_argument("ply_path", type=Path, help="3DGS .ply scene to load.")
+    parser.add_argument("ply_path", type=Path)
     parser.add_argument(
-        "--points",
-        type=Path,
-        action="append",
-        default=[],
+        "--points", type=Path, action="append", default=[],
         help="Additional point cloud (.ply / .npy / .npz). Repeatable.",
     )
-    parser.add_argument(
-        "--no-flip",
-        action="store_true",
-        help="Skip the 180°-about-X flip applied by default to the splat .ply.",
-    )
-    parser.add_argument(
-        "--no-derive-points",
-        action="store_true",
-        help="Don't auto-create the 'splat_centers' point cloud layer from the splat .ply.",
-    )
-    parser.add_argument(
-        "--max-points",
-        type=int,
-        default=1_000_000,
-        help="Per-layer point cap (uniform random subsample with seed=42). 0 disables.",
-    )
+    parser.add_argument("--no-flip", action="store_true")
+    parser.add_argument("--no-derive-points", action="store_true")
+    parser.add_argument("--max-points", type=int, default=1_000_000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
