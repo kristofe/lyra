@@ -34,6 +34,12 @@ import torch
 import viser
 from plyfile import PlyData
 
+# Phase 5: only the Protocol type — no concrete trainer is imported here.
+# `training.py` itself is stdlib-only so this import stays cheap.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from training import TrainingControl  # noqa: E402
+
 
 SH_C0 = 0.28209479177387814  # band-0 SH normalization (gsplat / Inria convention)
 
@@ -126,7 +132,7 @@ class PointCloudLayer:
     colors_rgb: np.ndarray         # (N, 3) uint8
     metadata: dict = field(default_factory=dict)
     visible: bool = True
-    point_size: float = 0.01
+    point_size: float = 0.0005
     color_mode: str = "rgb"        # "rgb" | "axis" | "confidence" | "uniform"
     uniform_color: tuple[int, int, int] = (255, 51, 51)
 
@@ -246,7 +252,7 @@ def derive_splat_centers_layer(scene: "SceneState") -> PointCloudLayer | None:
         name="splat_centers",
         points=means_np,
         colors_rgb=colors_u8,
-        point_size=0.005,
+        point_size=0.0005,
     )
 
 
@@ -327,7 +333,8 @@ class PlyLoader:
 
 
 class SceneState:
-    """Splat tensors + named point-cloud layers, all guarded by an RLock."""
+    """Splat tensors + named point-cloud layers + training progress,
+    all guarded by an RLock."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -339,6 +346,10 @@ class SceneState:
         self.sh_degree: int = 0
         self.num_splats: int = 0
         self.point_clouds: dict[str, PointCloudLayer] = {}
+        # Phase 5: training progress. Trainer writes via record_step under
+        # the same lock; the GUI pump reads them under read().
+        self.step: int = 0
+        self.loss_history: list[tuple[int, float]] = []
 
     @contextmanager
     def read(self):
@@ -369,6 +380,59 @@ class SceneState:
         with self.write():
             self.point_clouds.pop(name, None)
 
+    def record_step(self, step: int, loss: float) -> None:
+        """Trainer-side hook. Records progress under the write lock so the
+        GUI pump's reader can never observe a partially-mutated history."""
+        with self.write():
+            self.step = int(step)
+            self.loss_history.append((int(step), float(loss)))
+            if len(self.loss_history) > 10_000:
+                self.loss_history = self.loss_history[-10_000:]
+
+
+# --------------------------------------------------------------------------- #
+# Motion tracking (Phase 3)
+# --------------------------------------------------------------------------- #
+
+
+class MotionTracker:
+    """Per-renderer (singleton) camera motion detector with idle-frame hysteresis.
+
+    Thresholds are in world units (meters) for translation and radians for
+    rotation. Quaternion sign ambiguity is handled with abs(dot).
+    """
+
+    def __init__(
+        self,
+        trans_thresh: float = 1e-3,
+        rot_thresh: float = 1e-3,
+        idle_frames: int = 5,
+    ) -> None:
+        self.last_pos: np.ndarray | None = None
+        self.last_wxyz: np.ndarray | None = None
+        self.idle_count: int = 0
+        self.trans_thresh = trans_thresh
+        self.rot_thresh = rot_thresh
+        self.idle_frames_required = idle_frames
+
+    def update(self, position: np.ndarray, wxyz: np.ndarray) -> bool:
+        """Returns True if the camera is currently considered 'moving'."""
+        if self.last_pos is None:
+            self.last_pos = position.copy()
+            self.last_wxyz = wxyz.copy()
+            return False
+        d_trans = float(np.linalg.norm(position - self.last_pos))
+        dot = abs(float(np.dot(wxyz, self.last_wxyz)))
+        d_rot = 2.0 * math.acos(min(1.0, dot))
+        moving = d_trans > self.trans_thresh or d_rot > self.rot_thresh
+        if moving:
+            self.idle_count = 0
+        else:
+            self.idle_count += 1
+        self.last_pos = position.copy()
+        self.last_wxyz = wxyz.copy()
+        return self.idle_count < self.idle_frames_required
+
 
 # --------------------------------------------------------------------------- #
 # Renderer
@@ -386,6 +450,7 @@ class Renderer:
     def __init__(self, device: str = "cuda") -> None:
         self.device = torch.device(device)
         self._depth_lut: torch.Tensor | None = None
+        self.motion = MotionTracker()
 
     def _get_depth_lut(self) -> torch.Tensor:
         if self._depth_lut is None:
@@ -404,10 +469,24 @@ class Renderer:
         color_mode: str = "RGB",
         near: float = 0.1,
         far: float = 100.0,
-    ) -> tuple[np.ndarray, float]:
+        adaptive_res: bool = False,
+        moving_scale: float = 1.0,
+        force_full_res: bool = False,
+    ) -> tuple[np.ndarray, float, bool]:
+        # Update motion tracker on every render so its history stays
+        # consistent. force_full_res still tracks motion but bypasses scaling.
+        moving = self.motion.update(
+            np.asarray(camera.position, dtype=np.float64),
+            np.asarray(camera.wxyz, dtype=np.float64),
+        )
+        if adaptive_res and moving and not force_full_res:
+            scale = max(0.05, min(1.0, float(moving_scale)))
+            width = max(64, int(round(width * scale)))
+            height = max(64, int(round(height * scale)))
+
         with scene.read() as s:
             if s.num_splats == 0 or s.means is None:
-                return np.zeros((height, width, 3), dtype=np.uint8), 0.0
+                return np.zeros((height, width, 3), dtype=np.uint8), 0.0, moving
 
             viewmat_np = viser_camera_to_opencv_viewmat(camera.position, camera.wxyz)
             viewmats = torch.from_numpy(viewmat_np.astype(np.float32))[None].to(self.device)
@@ -465,7 +544,7 @@ class Renderer:
                 torch.cuda.synchronize(self.device)
             img_np = img_t.cpu().numpy()
             t1 = time.perf_counter()
-            return img_np, (t1 - t0) * 1000.0
+            return img_np, (t1 - t0) * 1000.0, moving
 
 
 # --------------------------------------------------------------------------- #
@@ -513,11 +592,17 @@ class ViewerApp:
         extra_point_paths: Iterable[Path] = (),
         max_points: int = 1_000_000,
         derive_splat_points: bool = True,
+        scene: SceneState | None = None,
+        training_control: TrainingControl | None = None,
     ) -> None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_str)
 
-        self.scene = SceneState()
+        # Allow the caller to construct SceneState in advance — the trainer
+        # needs a reference *before* the .ply finishes loading so it can
+        # close over scene.write() inside its step function.
+        self.scene = scene if scene is not None else SceneState()
+        self.training_control = training_control
         self.renderer = Renderer(device=device_str)
 
         print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -546,6 +631,7 @@ class ViewerApp:
             print(f"  layer '{layer.name}': {len(layer.points)} pts")
 
         self.server = viser.ViserServer(host=host, port=port)
+        self.server.gui.configure_theme(dark_mode=True)
         self._handles: dict[str, dict[str, object]] = {}
         self._pushed: set[str] = set()
 
@@ -555,13 +641,36 @@ class ViewerApp:
         self._last_frame_t: float = 0.0
         self._last_readout_push: float = 0.0
         self._last_cam_push: float = 0.0
+        self._last_motion_push: float = 0.0
+        # Per-client settle timers fire a full-res render shortly after motion stops.
+        self._settle_timers: dict[int, threading.Timer] = {}
+        self._settle_delay_s: float = 0.15
+
+        # Phase 5 pump state.
+        self._pump_stop_event: threading.Event = threading.Event()
+        self._pump_thread: threading.Thread | None = None
 
         self._build_gui()
+        if self.training_control is not None:
+            self._start_training_pump()
         self.server.on_client_connect(self._on_client_connect)
 
     # ---- GUI construction -------------------------------------------- #
 
     def _build_gui(self) -> None:
+        # If training is attached, split the right panel into two tabs so
+        # the inspection controls and the training controls don't fight for
+        # vertical space. Static viewer keeps the original flat layout.
+        if self.training_control is not None:
+            tabs = self.server.gui.add_tab_group()
+            with tabs.add_tab("Inspect"):
+                self._build_inspect_panel()
+            with tabs.add_tab("Training"):
+                self._build_training_gui(with_folder=False)
+        else:
+            self._build_inspect_panel()
+
+    def _build_inspect_panel(self) -> None:
         # Top-level: Display toggle (splats vs point clouds).
         self.gui_display = self.server.gui.add_dropdown(
             "Display",
@@ -600,22 +709,43 @@ class ViewerApp:
                 "max_res", min=256, max=2048, step=16, initial_value=1080,
                 hint="Caps the rendered image's longest edge.",
             )
-            self.gui_fps_readout = self.server.gui.add_number(
-                "fps", initial_value=0.0, disabled=True
+            self.gui_fps_readout = self.server.gui.add_markdown("**fps:** —")
+            self.gui_render_ms_readout = self.server.gui.add_markdown("**render ms:** —")
+            self.gui_adaptive_res = self.server.gui.add_checkbox(
+                "adaptive_res", initial_value=True,
+                hint="Render at lower resolution while the camera is moving.",
             )
-            self.gui_render_ms_readout = self.server.gui.add_number(
-                "render_ms", initial_value=0.0, disabled=True
+            self.gui_moving_scale = self.server.gui.add_slider(
+                "moving_scale", min=0.25, max=1.0, step=0.05, initial_value=0.5,
+                hint="Resolution scale during motion (1.0 disables the drop).",
+            )
+            self.gui_idle_frames = self.server.gui.add_slider(
+                "idle_frames", min=1, max=30, step=1, initial_value=5,
+                hint="Consecutive still frames before declaring 'idle'.",
+            )
+            self.gui_trans_thresh = self.server.gui.add_number(
+                "trans_thresh", initial_value=1e-3,
+                min=1e-5, max=1.0, step=1e-4,
+                hint="World-units (m) translation delta to count as motion.",
+            )
+            self.gui_rot_thresh = self.server.gui.add_number(
+                "rot_thresh", initial_value=1e-3,
+                min=1e-5, max=1.0, step=1e-4,
+                hint="Radians rotation delta to count as motion.",
+            )
+            self.gui_motion_state_readout = self.server.gui.add_markdown(
+                "**motion:** idle"
             )
 
         with self.server.gui.add_folder("Scene"):
-            self.gui_splat_count_readout = self.server.gui.add_number(
-                "splat_count", initial_value=int(self.scene.num_splats), disabled=True
+            self.gui_splat_count_readout = self.server.gui.add_markdown(
+                f"**splat_count:** {int(self.scene.num_splats):,}"
             )
-            self.gui_camera_pos_readout = self.server.gui.add_vector3(
-                "camera_pos", initial_value=(0.0, 0.0, 0.0), disabled=True
+            self.gui_camera_pos_readout = self.server.gui.add_markdown(
+                "**camera pos:** —"
             )
-            self.gui_camera_look_readout = self.server.gui.add_vector3(
-                "look_dir", initial_value=(0.0, 0.0, 1.0), disabled=True
+            self.gui_camera_look_readout = self.server.gui.add_markdown(
+                "**look dir:** —"
             )
             self.gui_reset_camera = self.server.gui.add_button("reset camera")
 
@@ -637,6 +767,17 @@ class ViewerApp:
         self.gui_far.on_update(lambda _ev: self._maybe_render_depth())
         self.gui_fov.on_update(lambda _ev: self._on_fov_change())
         self.gui_reset_camera.on_click(lambda _ev: self._on_reset_camera())
+        self.gui_idle_frames.on_update(lambda _ev: self._on_idle_frames_change())
+        self.gui_trans_thresh.on_update(
+            lambda _ev: setattr(
+                self.renderer.motion, "trans_thresh", float(self.gui_trans_thresh.value)
+            )
+        )
+        self.gui_rot_thresh.on_update(
+            lambda _ev: setattr(
+                self.renderer.motion, "rot_thresh", float(self.gui_rot_thresh.value)
+            )
+        )
 
     # ---- Display mode (splats vs points) ----------------------------- #
 
@@ -672,8 +813,8 @@ class ViewerApp:
             uniform_color = self.server.gui.add_rgb(
                 "uniform_color", initial_value=layer.uniform_color
             )
-            count = self.server.gui.add_text(
-                "count", initial_value=str(len(layer.points)), disabled=True
+            count = self.server.gui.add_markdown(
+                f"**count:** {len(layer.points):,}"
             )
 
         handles = {
@@ -759,7 +900,9 @@ class ViewerApp:
         else:
             client.scene.set_background_image(None)
 
-    def _render_for(self, client: viser.ClientHandle) -> None:
+    def _render_for(
+        self, client: viser.ClientHandle, *, force_full_res: bool = False
+    ) -> None:
         if self.display_mode != "splats":
             return
         cam = client.camera
@@ -777,6 +920,8 @@ class ViewerApp:
         near = float(self.gui_near.value)
         far = float(self.gui_far.value)
         max_res = int(self.gui_max_res.value)
+        adaptive_res = bool(self.gui_adaptive_res.value)
+        moving_scale = float(self.gui_moving_scale.value)
 
         max_dim = max(W, H)
         if max_dim > max_res:
@@ -784,16 +929,29 @@ class ViewerApp:
             W = max(1, int(round(W * scale)))
             H = max(1, int(round(H * scale)))
 
-        img, render_ms = self.renderer.render(
+        img, render_ms, moving = self.renderer.render(
             self.scene, cam, W, H,
             sh_degree=sh_degree,
             color_mode=color_mode,
             near=near,
             far=far,
+            adaptive_res=adaptive_res,
+            moving_scale=moving_scale,
+            force_full_res=force_full_res,
         )
         client.scene.set_background_image(img)
         self._update_perf_readouts(render_ms)
         self._update_camera_readout(cam)
+        self._update_motion_readout(moving)
+
+        # If we just rendered low-res due to motion, schedule a delayed full-res
+        # follow-up so the still frame the user lands on is crisp. No camera
+        # update will fire while they hold still, so we cannot rely on the
+        # idle-counter alone — it only ticks when renders fire.
+        if adaptive_res and moving and not force_full_res:
+            self._schedule_settle(client)
+        else:
+            self._cancel_settle(client)
 
     # ---- Throttled GUI readouts -------------------------------------- #
 
@@ -814,8 +972,10 @@ class ViewerApp:
         self._last_frame_t = now
 
         if now - self._last_readout_push >= 0.1:  # 10 Hz
-            self.gui_fps_readout.value = round(float(self._fps_ema), 1)
-            self.gui_render_ms_readout.value = round(float(self._render_ms_ema), 2)
+            self.gui_fps_readout.content = f"**fps:** {self._fps_ema:.1f}"
+            self.gui_render_ms_readout.content = (
+                f"**render ms:** {self._render_ms_ema:.2f}"
+            )
             self._last_readout_push = now
 
     def _update_camera_readout(self, cam: viser.CameraHandle) -> None:
@@ -825,13 +985,143 @@ class ViewerApp:
         R = _quat_wxyz_to_rotmat(np.asarray(cam.wxyz))
         look = R[:, 2]  # camera +Z = forward in OpenCV = viser convention
         pos = np.asarray(cam.position)
-        self.gui_camera_pos_readout.value = (
-            round(float(pos[0]), 3), round(float(pos[1]), 3), round(float(pos[2]), 3),
+        self.gui_camera_pos_readout.content = (
+            f"**camera pos:** {float(pos[0]):.3f}, {float(pos[1]):.3f}, {float(pos[2]):.3f}"
         )
-        self.gui_camera_look_readout.value = (
-            round(float(look[0]), 3), round(float(look[1]), 3), round(float(look[2]), 3),
+        self.gui_camera_look_readout.content = (
+            f"**look dir:** {float(look[0]):.3f}, {float(look[1]):.3f}, {float(look[2]):.3f}"
         )
         self._last_cam_push = now
+
+    def _update_motion_readout(self, moving: bool) -> None:
+        now = time.perf_counter()
+        if now - self._last_motion_push < 0.1:  # 10 Hz
+            return
+        self.gui_motion_state_readout.content = (
+            f"**motion:** {'moving' if moving else 'idle'}"
+        )
+        self._last_motion_push = now
+
+    # ---- Adaptive-resolution helpers --------------------------------- #
+
+    def _on_idle_frames_change(self) -> None:
+        self.renderer.motion.idle_frames_required = int(self.gui_idle_frames.value)
+
+    def _schedule_settle(self, client: viser.ClientHandle) -> None:
+        cid = int(client.client_id)
+        old = self._settle_timers.pop(cid, None)
+        if old is not None:
+            old.cancel()
+        timer = threading.Timer(
+            self._settle_delay_s, lambda: self._settle_render(cid)
+        )
+        timer.daemon = True
+        self._settle_timers[cid] = timer
+        timer.start()
+
+    def _cancel_settle(self, client: viser.ClientHandle) -> None:
+        cid = int(client.client_id)
+        old = self._settle_timers.pop(cid, None)
+        if old is not None:
+            old.cancel()
+
+    def _settle_render(self, client_id: int) -> None:
+        # Resolve the live ClientHandle; the user may have disconnected.
+        client = self.server.get_clients().get(client_id)
+        if client is None:
+            return
+        self._settle_timers.pop(client_id, None)
+        self._render_for(client, force_full_res=True)
+
+    # ---- Training (Phase 5) ----------------------------------------- #
+
+    def _build_training_gui(self, *, with_folder: bool = True) -> None:
+        # When called from inside a "Training" tab the outer folder would
+        # be redundant, so the caller can suppress it.
+        from contextlib import nullcontext
+        ctx = self.server.gui.add_folder("Training") if with_folder else nullcontext()
+        with ctx:
+            self.gui_train_resume = self.server.gui.add_button("resume")
+            self.gui_train_pause = self.server.gui.add_button("pause")
+            self.gui_train_status = self.server.gui.add_markdown("**status:** stopped")
+            self.gui_train_step = self.server.gui.add_markdown("**step:** 0")
+            self.gui_train_loss = self.server.gui.add_markdown("**loss:** —")
+            self.gui_train_splat_count = self.server.gui.add_markdown(
+                f"**splats:** {int(self.scene.num_splats):,}"
+            )
+            self.gui_train_loss_plot = self.server.gui.add_plotly(
+                self._make_loss_figure([]), aspect=2.0
+            )
+
+        self.gui_train_resume.on_click(lambda _ev: self._on_resume_training())
+        self.gui_train_pause.on_click(lambda _ev: self._on_pause_training())
+
+    def _on_resume_training(self) -> None:
+        ctl = self.training_control
+        if ctl is None:
+            return
+        ctl.start()   # idempotent on BackgroundTrainingThread
+        ctl.resume()
+
+    def _on_pause_training(self) -> None:
+        ctl = self.training_control
+        if ctl is None:
+            return
+        ctl.pause()
+
+    @staticmethod
+    def _make_loss_figure(history: list[tuple[int, float]]):
+        """Build a small plotly figure from a (step, loss) list, downsampled
+        stride-uniformly to ≤1000 points so websocket pushes stay cheap."""
+        import plotly.graph_objects as go
+        h = history
+        if len(h) > 1000:
+            stride = len(h) // 1000
+            h = h[::stride]
+        xs = [p[0] for p in h]
+        ys = [p[1] for p in h]
+        fig = go.Figure(data=[go.Scatter(x=xs, y=ys, mode="lines", name="loss")])
+        fig.update_layout(
+            margin=dict(l=20, r=20, t=20, b=20),
+            height=220,
+            xaxis_title="step",
+            yaxis_title="loss",
+        )
+        return fig
+
+    def _start_training_pump(self) -> None:
+        self._pump_stop_event.clear()
+        t = threading.Thread(target=self._pump_loop, daemon=True)
+        self._pump_thread = t
+        t.start()
+
+    def _pump_loop(self) -> None:
+        last_plot_t = 0.0
+        ctl = self.training_control
+        while not self._pump_stop_event.is_set():
+            time.sleep(0.1)  # 10 Hz readouts
+            if ctl is None:
+                continue
+            with self.scene.read() as s:
+                step = s.step
+                splats = s.num_splats
+                history_snapshot = list(s.loss_history)
+            latest_loss = history_snapshot[-1][1] if history_snapshot else 0.0
+            try:
+                self.gui_train_status.content = f"**status:** {ctl.status()}"
+                self.gui_train_step.content = f"**step:** {int(step):,}"
+                self.gui_train_loss.content = f"**loss:** {float(latest_loss):.6f}"
+                self.gui_train_splat_count.content = f"**splats:** {int(splats):,}"
+            except Exception:
+                # Server may have shut down; tolerate races on exit.
+                continue
+            now = time.perf_counter()
+            if now - last_plot_t >= 0.5:  # 2 Hz plot
+                try:
+                    self.gui_train_loss_plot.figure = self._make_loss_figure(history_snapshot)
+                except Exception:
+                    pass
+                last_plot_t = now
 
     # ---- Run ---------------------------------------------------------- #
 
@@ -839,7 +1129,18 @@ class ViewerApp:
         host = self.server.get_host()
         port = self.server.get_port()
         print(f"viser server listening on http://{host}:{port}")
-        self.server.sleep_forever()
+        try:
+            self.server.sleep_forever()
+        finally:
+            # Best-effort shutdown; either order is fine since they don't depend on each other.
+            self._pump_stop_event.set()
+            if self._pump_thread is not None:
+                self._pump_thread.join(timeout=2.0)
+            if self.training_control is not None:
+                try:
+                    self.training_control.stop()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
