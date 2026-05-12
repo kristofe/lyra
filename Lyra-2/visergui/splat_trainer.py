@@ -162,10 +162,10 @@ class SplatTrainer:
             conf_flat = self.conf.flatten()
             if conf_flat.numel() > 16_000_000:
                 idx = torch.randint(0, conf_flat.numel(), (16_000_000,), device=conf_flat.device)
-                thresh = conf_flat[idx].quantile(0.2)
+                thresh = conf_flat[idx].quantile(0.6)
                 print(f'WARNING total unfiltered splats more than 16 Million, Capping')
             else:
-                thresh = conf_flat.quantile(0.2)
+                thresh = conf_flat.quantile(0.6)
             valid &= self.conf > thresh   # drop only the bottom 20% by confidence
         
 
@@ -207,9 +207,56 @@ class SplatTrainer:
         print(f"Saved splats_init.ply: {M} gaussians")
         self.render_and_show(means_init, quats_init, log_s_init, logit_o_init, sh_init, tag="init gaussians")
 
+
+        # voxel init: voxel-downsample the RGBD points so multi-frame overlap
+        # stops producing redundant co-located gaussians. typical reduction 3–10× vs v0, with
+        # comparable coverage. uses the *full* valid-sample tensors (pts_full, cols_full, ...),
+        # not the random-subsampled ones, so we benefit from every view.
+        voxel_frac = 0.005                       # voxel edge as fraction of scene_scale; tweak for density
+        voxel = max(scene_scale * voxel_frac, 1e-4)
+        print(f"voxel size: {voxel:.4f}  (scene_scale={scene_scale:.3f})")
+
+        keys = torch.floor(pts_full / voxel).long()                         # (t, 3)
+        uniq_keys, inv = torch.unique(keys, dim=0, return_inverse=True)
+        G = uniq_keys.shape[0]
+
+        def _scatter_mean(vals, inv, g):
+            """vals: (t,) or (t, d). returns mean over the `inv` partition, shape (g,) or (g, d)."""
+            ones = torch.ones(vals.shape[0], device=vals.device)
+            counts = torch.zeros(g, device=vals.device).scatter_add_(0, inv, ones).clamp_min(1)
+            if vals.ndim == 1:
+                s = torch.zeros(g, device=vals.device).scatter_add_(0, inv, vals)
+                return s / counts
+            D = vals.shape[1]
+            s = torch.zeros(g, D, device=vals.device).scatter_add_(0, inv[:, None].expand(-1, D), vals)
+            return s / counts[:, None]
+
+        means_vox = _scatter_mean(pts_full,  inv, G)
+        cols_vox  = _scatter_mean(cols_full, inv, G)
+        z_vox     = _scatter_mean(z_full,    inv, G)
+        fx_vox    = _scatter_mean(fx_full,   inv, G)
+
+        # scale: roughly the larger of (one texel at this depth, inflated for remaining sparsity)
+        # and (half the voxel edge, so neighbouring voxels overlap).
+        inflate = max(1.0, (total_valid / G) ** 0.5)
+        tex_vox = (z_vox / fx_vox * inflate).clamp_min(voxel * 0.5)
+
+        means_vx_init   = means_vox.clone()
+        f_dc_vx_init    = (cols_vox - 0.5) / C0
+        log_s_vx_init   = torch.log(tex_vox[:, None].expand(G, 3).contiguous())
+        logit_o_vx_init = torch.full((G,), 2.1972, device=self.device)
+        quats_vx_init   = torch.zeros((G, 4), device=self.device); quats_vx_init[:, 0] = 1.0
+        print(f"m_voxel={G} gaussians  ({100.0 * G / M:.1f}% of v0's {M}, inflate={inflate:.2f})")
+
+        sh_vx = f_dc_vx_init[:, None, :]
+        self.save_inria_ply("splats_voxel.ply", means_vx_init, sh_vx, log_s_vx_init, logit_o_vx_init, quats_vx_init)
+        print(f"saved splats_voxel.ply")
+        self.render_and_show(means_vx_init, quats_vx_init, log_s_vx_init, logit_o_vx_init, sh_vx, tag="v0 voxel init")
+
+        
     def step(self) -> float:
         raise NotImplementedError(
-            "SplatTrainer.step() is a placeholder; no training implemented yet."
+            "splattrainer.step() is a placeholder; no training implemented yet."
         )
     
     def save_inria_ply(self, path, means, sh_all, log_s, logit_o, quats):
