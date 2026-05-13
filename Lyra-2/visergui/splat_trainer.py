@@ -136,7 +136,7 @@ class SplatTrainer:
         self.read_video_frames(self.output_root / (name or video_path.stem), video_path, max_frames=max_frames)
         self.depth_anything_inference(self.device)
 
-    def initialize_gaussians(self, remove_sky : bool = True):
+    def initialize_gaussians(self, confidence : float  = 0.6, remove_sky : bool = True):
         #Put pixels as a point cloud in world space
         #Then create a gaussian splat per point.
         # position — unprojected world point.
@@ -156,18 +156,31 @@ class SplatTrainer:
         self.world = torch.einsum("nij,nhwj->nhwi", R, cam_pts) + t[:, None, None, :]
 
         valid = self.depth > 0
+        self.remove_sky = remove_sky
+        print(f'masking out sky = {"False" if remove_sky else "True"}')
         if self.sky is not None and remove_sky:
             valid &= ~self.sky
+        self.conf_thresh: float | None = None
         if self.conf is not None:
             conf_flat = self.conf.flatten()
             if conf_flat.numel() > 16_000_000:
                 idx = torch.randint(0, conf_flat.numel(), (16_000_000,), device=conf_flat.device)
-                thresh = conf_flat[idx].quantile(0.6)
+                self.conf_thresh = float(conf_flat[idx].quantile(confidence))
                 print(f'WARNING total unfiltered splats more than 16 Million, Capping')
             else:
-                thresh = conf_flat.quantile(0.6)
+                self.conf_thresh = float(conf_flat.quantile(confidence))
+            valid &= self.conf > self.conf_thresh 
+        '''
+        if self.conf is not None:
+            conf_flat = self.conf.flatten()
+            if conf_flat.numel() > 16_000_000:
+                idx = torch.randint(0, conf_flat.numel(), (16_000_000,), device=conf_flat.device)
+                thresh = conf_flat[idx].quantile(confidence)
+                print(f'WARNING total unfiltered splats more than 16 Million, Capping')
+            else:
+                thresh = conf_flat.quantile(confidence)
             valid &= self.conf > thresh   # drop only the bottom 20% by confidence
-        
+        ''' 
 
         fx_nhw = self.K[:, 0, 0][:, None, None].expand(self.N, self.H, self.W)
         # Keep the full valid-sample tensors as cols_full / z_full / fx_full for the voxel cell.
@@ -253,11 +266,62 @@ class SplatTrainer:
         print(f"saved splats_voxel.ply")
         self.render_and_show(means_vx_init, quats_vx_init, log_s_vx_init, logit_o_vx_init, sh_vx, tag="v0 voxel init")
 
+        # Per-pixel loss mask.
+        # per-frame so step() can index it as self.train_mask[idx].
+        train_mask = self.depth > 0                                          # (N,H,W) bool
+        if self.sky is not None and self.remove_sky:
+            train_mask &= ~self.sky
+        if self.conf is not None and self.conf_thresh is not None:
+            train_mask &= self.conf > self.conf_thresh
+        self.train_mask = train_mask
+        print(f"loss mask: {train_mask.float().mean().item()*100:.1f}% pixels kept across {self.N} frames")
+
+        return means_vx_init, quats_vx_init, log_s_vx_init, logit_o_vx_init, f_dc_vx_init
+
+    def refine_gaussians(self, steps, means_init, quats_init, log_s_init, logit_o_init, f_dc_init):
+        #refinement: L1 loss only, SH deg 0. Quick baseline.
+        torch.set_grad_enabled(True)
+
+        self.means_t   = means_init.clone().requires_grad_(True)
+        self.log_s_t   = log_s_init.clone().requires_grad_(True)
+        self.quats_t   = quats_init.clone().requires_grad_(True)
+        self.logit_o_t = logit_o_init.clone().requires_grad_(True)
+        self.sh0_t     = f_dc_init[:, None, :].clone().requires_grad_(True)
+
+        self.opt = torch.optim.Adam([
+            {"params": self.means_t,   "lr": 1.6e-4},
+            {"params": self.log_s_t,   "lr": 5e-3},
+            {"params": self.quats_t,   "lr": 1e-3},
+            {"params": self.logit_o_t, "lr": 5e-2},
+            {"params": self.sh0_t,     "lr": 2.5e-3},
+        ])
+
+        pbar = tqdm(range(steps), desc="L1 Loss gaussians", unit="step")
+        for step in pbar:
+            loss = self.step()
+            if step % 100 == 0: pbar.set_postfix(loss=f"{loss:.4f}")
+
+        torch.set_grad_enabled(False)
+        self.save_inria_ply("splats_v1_l1.ply", self.means_t, self.sh0_t, self.log_s_t, self.logit_o_t, self.quats_t)
+        print(f"Saved splats_v1_l1.ply")
+        self.render_and_show(self.means_t, self.quats_t, self.log_s_t, self.logit_o_t, self.sh0_t, tag="v1 L1 1k")
         
     def step(self) -> float:
-        raise NotImplementedError(
-            "splattrainer.step() is a placeholder; no training implemented yet."
-        )
+        idx = int(torch.randint(0, self.N, (1,)).item())
+        out, _, _ = rasterization(
+            self.means_t, self.quats_t, torch.exp(self.log_s_t), torch.sigmoid(self.logit_o_t),
+            self.sh0_t, self.w2c[idx:idx+1], self.K[idx:idx+1], self.W, self.H,
+            sh_degree=0, packed=False)
+        
+        diff = (out[0] - self.rgb[idx]).abs()              # (H,W,3)
+        mask = self.train_mask[idx].unsqueeze(-1)          # (H,W,1) bool
+        n_kept = int(mask.sum().item())
+        if n_kept == 0:
+            return 0.0                                     # nothing to supervise — skip step
+        loss = (diff * mask).sum() / (n_kept * 3)
+        # loss = (out[0] - self.rgb[idx]).abs().mean()
+        self.opt.zero_grad(); loss.backward(); self.opt.step()
+        return loss.item()
     
     def save_inria_ply(self, path, means, sh_all, log_s, logit_o, quats):
         """sh_all: (M, K, 3) where K = (sh_deg+1)**2. Writes Inria 3DGS PLY with matching f_rest fields."""
@@ -306,7 +370,10 @@ class SplatTrainer:
                 r = self.render_view(means, quats, log_s, logit_o, sh_all, i).cpu().numpy()
                 ax[0, c].imshow(self.rgb[i].cpu().numpy()); ax[0, c].set_title(f"gt frame {i}"); ax[0, c].axis("off")
                 ax[1, c].imshow(r);                    ax[1, c].set_title(f"{tag} cam {i}"); ax[1, c].axis("off")
-        plt.suptitle(tag); plt.tight_layout(); plt.show()
+        plt.suptitle(tag)
+        plt.tight_layout()
+        plt.savefig(f"{tag}.png", dpi=150, bbox_inches='tight')
+        #plt.show()
 
     def lpips_loss(pred_bchw, gt_bchw):
         """Inputs in [0,1], shape (B,3,H,W). Returns scalar LPIPS distance."""
@@ -351,10 +418,23 @@ def main() -> None:
         type=int,
         default=1
     )
+    p.add_argument(
+        '--confidence_quantile',
+        type=float,
+        default=0.6,
+        help="Percentile to keep in depth confidence",
+    )
+    p.add_argument(
+        '--steps',
+        type=int,
+        default=3000
+    )
     args = p.parse_args()
 
     #DEBUGGING
     args.max_frames = 32
+    args.confidence_quantile = 0.6
+    args.remove_sky = 1
     #args.video = Path("/home/kristofe/Documents/Projects/lyra/Lyra-2/outputs/zoomgs/videos/14.mp4")
 
     if not args.video.exists():
@@ -365,7 +445,8 @@ def main() -> None:
         args.video, name=args.name, max_frames=args.max_frames
     )
     remove_sky = False if args.remove_sky == 0 else True
-    trainer.initialize_gaussians(remove_sky=remove_sky)
+    means, quats, log_s, logit_o, f_dc = trainer.initialize_gaussians(confidence=args.confidence_quantile, remove_sky=remove_sky)
+    trainer.refine_gaussians(args.steps, means, quats, log_s, logit_o, f_dc)
 
     out = None
     print(f"[splat_trainer] done -> {out}")
