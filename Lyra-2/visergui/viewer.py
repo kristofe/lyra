@@ -26,7 +26,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import gsplat
 import numpy as np
@@ -350,6 +350,9 @@ class SceneState:
         # the same lock; the GUI pump reads them under read().
         self.step: int = 0
         self.loss_history: list[tuple[int, float]] = []
+        # Bumped by anything that swaps the splat tensors; the GUI pump
+        # watches this so live-training publishes trigger a re-render.
+        self.splat_version: int = 0
 
     @contextmanager
     def read(self):
@@ -585,7 +588,7 @@ class ViewerApp:
 
     def __init__(
         self,
-        ply_path: Path,
+        ply_path: Path | None,
         host: str,
         port: int,
         flip_x: bool = True,
@@ -594,6 +597,9 @@ class ViewerApp:
         derive_splat_points: bool = True,
         scene: SceneState | None = None,
         training_control: TrainingControl | None = None,
+        initializer: "Callable[[dict], None] | None" = None,
+        resetter: "Callable[[], None] | None" = None,
+        default_init_args: dict | None = None,
     ) -> None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_str)
@@ -604,20 +610,37 @@ class ViewerApp:
         self.scene = scene if scene is not None else SceneState()
         self.training_control = training_control
         self.renderer = Renderer(device=device_str)
+        self._initializer = initializer
+        self._resetter = resetter
+        self._default_init_args = default_init_args or {}
 
-        print(f"loading splat .ply {ply_path} on {device_str}...")
-        self.scene.load_from_ply(ply_path, device=device, flip_x=flip_x)
-        print(
-            f"  {self.scene.num_splats} splats, sh_degree={self.scene.sh_degree}, "
-            f"flip_x={flip_x}"
-        )
+        if ply_path is not None:
+            print(f"loading splat .ply {ply_path} on {device_str}...")
+            self.scene.load_from_ply(ply_path, device=device, flip_x=flip_x)
+        if self.scene.means is None and initializer is None:
+            raise RuntimeError(
+                "ViewerApp: scene has no splats; pass ply_path, pre-populate "
+                "the scene, or provide an `initializer` to set it up at runtime"
+            )
+        if self.scene.means is not None:
+            print(
+                f"  {self.scene.num_splats} splats, sh_degree={self.scene.sh_degree}, "
+                f"flip_x={flip_x}"
+            )
 
-        # Home pose computed once from the splat bbox.
-        means_np = self.scene.means.detach().cpu().numpy()
-        self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
-        print(f"  home pose: pos={self.home_position} look_at={self.home_look_at}")
+        # Home pose: compute from splat bbox if we have one; otherwise default
+        # to a generic origin-looking pose. The init callback re-computes it
+        # from the freshly-populated scene.
+        if self.scene.means is not None:
+            means_np = self.scene.means.detach().cpu().numpy()
+            self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+            print(f"  home pose: pos={self.home_position} look_at={self.home_look_at}")
+        else:
+            self.home_position = (0.0, 0.0, 5.0)
+            self.home_look_at = (0.0, 0.0, 0.0)
+            self.home_up = (0.0, 1.0, 0.0)
 
-        if derive_splat_points:
+        if derive_splat_points and self.scene.means is not None:
             derived = derive_splat_centers_layer(self.scene)
             if derived is not None:
                 self.scene.add_point_cloud(derived)
@@ -651,24 +674,59 @@ class ViewerApp:
         self._pump_thread: threading.Thread | None = None
 
         self._build_gui()
-        if self.training_control is not None:
+        # The pump watches splat_version (live training publishes) AND drives
+        # the training-control readouts. Start it whenever either reason exists.
+        if self.training_control is not None or self._initializer is not None:
             self._start_training_pump()
         self.server.on_client_connect(self._on_client_connect)
 
     # ---- GUI construction -------------------------------------------- #
 
     def _build_gui(self) -> None:
-        # If training is attached, split the right panel into two tabs so
-        # the inspection controls and the training controls don't fight for
-        # vertical space. Static viewer keeps the original flat layout.
-        if self.training_control is not None:
+        # If training is attached or runtime-init is wired, split the right
+        # panel into two tabs so the inspection controls and the training
+        # controls don't fight for vertical space. Static viewer keeps the
+        # original flat layout.
+        if self.training_control is not None or self._initializer is not None:
             tabs = self.server.gui.add_tab_group()
             with tabs.add_tab("Inspect"):
                 self._build_inspect_panel()
             with tabs.add_tab("Training"):
+                if self._initializer is not None:
+                    self._build_init_panel()
                 self._build_training_gui(with_folder=False)
         else:
             self._build_inspect_panel()
+
+    def _build_init_panel(self) -> None:
+        """Runtime init/reset controls. Only built when `initializer` was passed."""
+        d = self._default_init_args
+        with self.server.gui.add_folder("Setup"):
+            self.gui_init_video = self.server.gui.add_text(
+                "video", initial_value=str(d.get("video", "")),
+            )
+            self.gui_init_max_frames = self.server.gui.add_number(
+                "max_frames",
+                initial_value=int(d.get("max_frames", 32)),
+                min=1, max=1000, step=1,
+            )
+            self.gui_init_conf_q = self.server.gui.add_slider(
+                "confidence_quantile",
+                min=0.0, max=1.0, step=0.01,
+                initial_value=float(d.get("confidence_quantile", 0.6)),
+                hint="Quantile threshold for both point pruning and the loss mask.",
+            )
+            self.gui_init_remove_sky = self.server.gui.add_checkbox(
+                "remove_sky",
+                initial_value=bool(d.get("remove_sky", True)),
+            )
+            self.gui_init_btn = self.server.gui.add_button("Initialize")
+            self.gui_init_reset_btn = self.server.gui.add_button("Reset")
+            self.gui_init_status = self.server.gui.add_markdown(
+                "**init:** not initialized"
+            )
+        self.gui_init_btn.on_click(lambda _ev: self._on_init_click())
+        self.gui_init_reset_btn.on_click(lambda _ev: self._on_reset_click())
 
     def _build_inspect_panel(self) -> None:
         # Top-level: Display toggle (splats vs point clouds).
@@ -1069,6 +1127,58 @@ class ViewerApp:
             return
         ctl.pause()
 
+    def _on_init_click(self) -> None:
+        """Run the user-supplied initializer with the current Init-panel
+        values. Updates status + recomputes the home pose so 'reset camera'
+        targets the new bbox."""
+        if self._initializer is None:
+            return
+        try:
+            self.gui_init_btn.disabled = True
+            self.gui_init_reset_btn.disabled = True
+            self.gui_init_status.content = "**init:** preprocessing video + DA3…"
+            opts = dict(
+                video=Path(self.gui_init_video.value),
+                max_frames=int(self.gui_init_max_frames.value),
+                confidence_quantile=float(self.gui_init_conf_q.value),
+                remove_sky=bool(self.gui_init_remove_sky.value),
+            )
+            # viser runs on_click in a thread pool, so blocking here is fine.
+            self._initializer(opts)
+            # Recompute home pose from the newly-populated scene so the
+            # camera-reset button lands somewhere sensible.
+            if self.scene.means is not None:
+                means_np = self.scene.means.detach().cpu().numpy()
+                self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+            self.gui_init_status.content = (
+                f"**init:** ready ({self.scene.num_splats:,} splats) — click resume"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_init_status.content = f"**init:** error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_init_btn.disabled = False
+            self.gui_init_reset_btn.disabled = False
+
+    def _on_reset_click(self) -> None:
+        """Pause training (caller's responsibility actually pauses; we also
+        try via training_control) and ask the user's resetter to tear down."""
+        try:
+            self.gui_init_reset_btn.disabled = True
+            if self.training_control is not None:
+                try:
+                    self.training_control.pause()
+                except Exception:
+                    pass
+            if self._resetter is not None:
+                self._resetter()
+            self.gui_init_status.content = "**init:** reset — re-initialize to train"
+        except Exception as e:
+            self.gui_init_status.content = f"**init:** reset error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_init_reset_btn.disabled = False
+
     @staticmethod
     def _make_loss_figure(history: list[tuple[int, float]]):
         """Build a small plotly figure from a (step, loss) list, downsampled
@@ -1097,6 +1207,7 @@ class ViewerApp:
 
     def _pump_loop(self) -> None:
         last_plot_t = 0.0
+        last_splat_version = -1
         ctl = self.training_control
         while not self._pump_stop_event.is_set():
             time.sleep(0.1)  # 10 Hz readouts
@@ -1106,6 +1217,13 @@ class ViewerApp:
                 step = s.step
                 splats = s.num_splats
                 history_snapshot = list(s.loss_history)
+                splat_version = s.splat_version
+            if splat_version != last_splat_version:
+                last_splat_version = splat_version
+                try:
+                    self._render_all_clients()
+                except Exception:
+                    pass
             latest_loss = history_snapshot[-1][1] if history_snapshot else 0.0
             try:
                 self.gui_train_status.content = f"**status:** {ctl.status()}"

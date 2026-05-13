@@ -22,7 +22,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -35,6 +35,9 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from plyfile import PlyData, PlyElement
 from gsplat import rasterization, DefaultStrategy
+
+if TYPE_CHECKING:
+    from viewer import SceneState
 
 # --------------------------------------------------------------------------- #
 # Video loading
@@ -55,7 +58,9 @@ class SplatTrainer:
         self,
         output_root: Path = Path("outputs"),
         device: str = "cuda",
-        max_points : int = 1_000_000
+        max_points : int = 1_000_000,
+        scene: "SceneState | None" = None,
+        publish_every: int = 25,
     ) -> None:
         self.output_root = Path(output_root)
         self.device = torch.device(
@@ -76,8 +81,17 @@ class SplatTrainer:
 
         self._lpips_net = None
 
+        # Live-viewer bridge. `scene` is the shared SceneState whose splat
+        # tensors the viewer reads; `publish_every` throttles how often we
+        # detach + activate working tensors into it.
+        self.scene = scene
+        self.publish_every = int(publish_every)
+        self._step_count = 0
+        self._initialized = False
+        self._last_video: tuple[Path, int] | None = None
+
     def read_video_frames(self, output_dir: Path, video_path: Path, max_frames: int = -1) -> list[Path]:
-        Path(output_dir).mkdir(exist_ok=True)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         cap = cv2.VideoCapture(str(video_path))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         stride = max(1, total // max_frames)
@@ -278,8 +292,10 @@ class SplatTrainer:
 
         return means_vx_init, quats_vx_init, log_s_vx_init, logit_o_vx_init, f_dc_vx_init
 
-    def refine_gaussians(self, steps, means_init, quats_init, log_s_init, logit_o_init, f_dc_init):
-        #refinement: L1 loss only, SH deg 0. Quick baseline.
+    def setup_refine(self, means_init, quats_init, log_s_init, logit_o_init, f_dc_init):
+        """Build the trainable tensors + optimizer. Shared by the blocking
+        CLI path (`refine_gaussians`) and the live-viewer path, which lets
+        a `BackgroundTrainingThread` drive `step()` directly."""
         torch.set_grad_enabled(True)
 
         self.means_t   = means_init.clone().requires_grad_(True)
@@ -295,6 +311,11 @@ class SplatTrainer:
             {"params": self.logit_o_t, "lr": 5e-2},
             {"params": self.sh0_t,     "lr": 2.5e-3},
         ])
+        self._initialized = True
+
+    def refine_gaussians(self, steps, means_init, quats_init, log_s_init, logit_o_init, f_dc_init):
+        #refinement: L1 loss only, SH deg 0. Quick baseline.
+        self.setup_refine(means_init, quats_init, log_s_init, logit_o_init, f_dc_init)
 
         pbar = tqdm(range(steps), desc="L1 Loss gaussians", unit="step")
         for step in pbar:
@@ -305,23 +326,94 @@ class SplatTrainer:
         self.save_inria_ply("splats_v1_l1.ply", self.means_t, self.sh0_t, self.log_s_t, self.logit_o_t, self.quats_t)
         print(f"Saved splats_v1_l1.ply")
         self.render_and_show(self.means_t, self.quats_t, self.log_s_t, self.logit_o_t, self.sh0_t, tag="v1 L1 1k")
+
+    def _publish_to_scene(self) -> None:
+        """Push current splat params into the shared SceneState. Activates
+        pre-activation working tensors to match the post-activation
+        convention the renderer expects (see PlyLoader at viewer.py:284-291)."""
+        if self.scene is None:
+            return
+        with torch.no_grad():
+            means = self.means_t.detach()
+            quats = F.normalize(self.quats_t.detach(), dim=-1)
+            scales = torch.exp(self.log_s_t.detach())
+            opacities = torch.sigmoid(self.logit_o_t.detach())
+            sh = self.sh0_t.detach()                          # (M, 1, 3)
+        with self.scene.write() as s:
+            s.means, s.quats, s.scales = means, quats, scales
+            s.opacities, s.sh = opacities, sh
+            s.sh_degree = 0
+            s.num_splats = int(means.shape[0])
+            s.splat_version += 1
         
+    def prepare_and_init(self, video: Path, max_frames: int,
+                         confidence: float, remove_sky: bool,
+                         name: str | None = None) -> None:
+        """One-call init: process video (skipped if same video already
+        processed), run DA3 if needed, build initial gaussians + optimizer
+        + train-mask, and publish to the scene."""
+        signature = (Path(video), int(max_frames))
+        if self._last_video != signature:
+            self.process_video(video, name=name, max_frames=max_frames)
+            self._last_video = signature
+        init = self.initialize_gaussians(confidence=confidence, remove_sky=remove_sky)
+        self.setup_refine(*init)
+        self._publish_to_scene()
+        self._initialized = True
+
+    def reset(self) -> None:
+        """Tear down trainable state and clear the scene. Caller is
+        responsible for pausing any running BackgroundTrainingThread
+        before calling this so step() can't fire mid-tear-down."""
+        self._initialized = False
+        self._step_count = 0
+        for attr in ("means_t", "log_s_t", "quats_t", "logit_o_t", "sh0_t",
+                     "opt", "train_mask"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+        if self.scene is not None:
+            with self.scene.write() as s:
+                s.means = s.quats = s.scales = None
+                s.opacities = s.sh = None
+                s.num_splats = 0
+                s.step = 0
+                s.loss_history = []
+                s.splat_version += 1
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def step(self) -> float:
+        if not self._initialized:
+            time.sleep(0.05)   # avoid busy-spin if thread is resumed early
+            return 0.0
         idx = int(torch.randint(0, self.N, (1,)).item())
         out, _, _ = rasterization(
             self.means_t, self.quats_t, torch.exp(self.log_s_t), torch.sigmoid(self.logit_o_t),
             self.sh0_t, self.w2c[idx:idx+1], self.K[idx:idx+1], self.W, self.H,
             sh_degree=0, packed=False)
-        
+
         diff = (out[0] - self.rgb[idx]).abs()              # (H,W,3)
         mask = self.train_mask[idx].unsqueeze(-1)          # (H,W,1) bool
         n_kept = int(mask.sum().item())
         if n_kept == 0:
-            return 0.0                                     # nothing to supervise — skip step
+            # nothing to supervise — count the iteration but skip optimizer.
+            self._step_count += 1
+            if self.scene is not None:
+                self.scene.record_step(self._step_count, 0.0)
+            return 0.0
         loss = (diff * mask).sum() / (n_kept * 3)
-        # loss = (out[0] - self.rgb[idx]).abs().mean()
         self.opt.zero_grad(); loss.backward(); self.opt.step()
-        return loss.item()
+
+        loss_f = float(loss.item())
+        self._step_count += 1
+        if self.scene is not None:
+            self.scene.record_step(self._step_count, loss_f)
+            if self._step_count % self.publish_every == 0:
+                self._publish_to_scene()
+        return loss_f
     
     def save_inria_ply(self, path, means, sh_all, log_s, logit_o, quats):
         """sh_all: (M, K, 3) where K = (sh_deg+1)**2. Writes Inria 3DGS PLY with matching f_rest fields."""
