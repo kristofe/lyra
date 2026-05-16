@@ -1130,9 +1130,27 @@ class ViewerApp:
                     tex_size=tex_size, out_path=out_path,
                 )
 
-            res["uv"] = baked["uv"]
-            res["tex_image"] = baked["tex_image"]
-            self._push_mesh_to_viser(res)
+            # If bake returned an unwrapped mesh (per-vertex UV), use that layout
+            # directly to avoid 3x vertex duplication in the GLB.
+            if baked.get("per_vertex_uv"):
+                push_res = {
+                    "verts": baked["verts"],
+                    "faces": baked["faces"],
+                    "uv": baked["uv"],
+                    "tex_image": baked["tex_image"],
+                    "per_vertex_uv": True,
+                }
+            else:
+                res["uv"] = baked["uv"]
+                res["tex_image"] = baked["tex_image"]
+                push_res = res
+
+            import sys, time
+            t_push = time.perf_counter()
+            print(f"  bake: pushing mesh to viser…", file=sys.stderr, flush=True)
+            self._push_mesh_to_viser(push_res)
+            print(f"  bake: viser push done in {time.perf_counter() - t_push:.1f}s",
+                  file=sys.stderr, flush=True)
             self.gui_mesh_status.content = f"_Baked {mode} ({tex_size}px)_"
 
         except Exception as e:
@@ -1155,11 +1173,18 @@ class ViewerApp:
         colors = result.get("colors", None)
 
         if uv is not None and tex_image is not None:
-            # Textured mesh — duplicate vertices per face corner so UVs are per-corner
+            # Textured mesh — emissive material so PBR lighting doesn't darken it
             import trimesh
-            tri_verts = verts[faces].reshape(-1, 3)             # (F*3, 3)
-            tri_faces = np.arange(len(tri_verts)).reshape(-1, 3)
-            tri_uv = uv.reshape(-1, 2)                          # (F*3, 2)
+            if result.get("per_vertex_uv"):
+                # Compact layout: one UV per vertex (xatlas-unwrapped), no inflation
+                tri_verts = verts
+                tri_faces = faces
+                tri_uv = uv
+            else:
+                # Legacy per-corner layout: duplicate vertices per face corner
+                tri_verts = verts[faces].reshape(-1, 3)
+                tri_faces = np.arange(len(tri_verts)).reshape(-1, 3)
+                tri_uv = uv.reshape(-1, 2)
             mesh = trimesh.Trimesh(vertices=tri_verts, faces=tri_faces, process=False)
             from trimesh.visual.material import PBRMaterial
             material = PBRMaterial(

@@ -398,9 +398,11 @@ def bake_texture_from_splats(
                      device=device, dtype=torch.float32).expand(n_cams, 3, 3).contiguous()
 
     # 3) Render RGB + depth from each camera (linear RGB)
+    import sys, time
+    from tqdm import tqdm
     cam_rgb = torch.zeros(n_cams, image_size, image_size, 3, dtype=torch.float32, device=device)
     cam_depth = torch.zeros(n_cams, image_size, image_size, dtype=torch.float32, device=device)
-    for i in range(n_cams):
+    for i in tqdm(range(n_cams), desc="bake: render cameras", file=sys.stderr):
         feat_depth, alpha = model.render_images_and_depths(
             world_to_camera_matrices=w2c[i:i+1], projection_matrices=K[i:i+1],
             image_width=image_size, image_height=image_size, near=0.0, far=1e10,
@@ -408,12 +410,16 @@ def bake_texture_from_splats(
         a = alpha[0, ..., 0].clamp_min(1e-10)
         cam_rgb[i] = (feat_depth[0, ..., :3] / a.unsqueeze(-1)).float()
         cam_depth[i] = (feat_depth[0, ..., -1] / a).float()
+        torch.cuda.synchronize()
         if progress_cb:
             progress_cb(i + 1, n_cams + 3)
 
     # 4) UV unwrap the mesh
+    t_uv = time.perf_counter()
+    print(f"  bake: starting xatlas UV unwrap for {faces.shape[0]} faces…", file=sys.stderr, flush=True)
     vmap, F_uv, uvs = xatlas.parametrize(verts.astype(np.float32), faces.astype(np.uint32))
     uvs = uvs.astype(np.float32)
+    print(f"  bake: xatlas done in {time.perf_counter() - t_uv:.1f}s", file=sys.stderr, flush=True)
 
     # 5) For each face, find best camera (highest face_normal · view_to_face)
     verts_t = torch.from_numpy(verts.astype(np.float32)).to(device)
@@ -432,6 +438,7 @@ def bake_texture_from_splats(
     # Dot with face normal — higher = camera looks more head-on at the face
     score = (view_vec_n * tri_normal[:, None, :]).sum(-1)  # (F, C)
     best_cam = score.argmax(dim=1).cpu().numpy()           # (F,)
+    print(f"  bake: best-camera selection done ({faces.shape[0]} faces)", file=sys.stderr, flush=True)
     if progress_cb:
         progress_cb(n_cams + 1, n_cams + 3)
 
@@ -451,7 +458,9 @@ def bake_texture_from_splats(
     # so the heavy ops are vectorized per chunk.
     CHUNK = 2048
     n_chunks = (F + CHUNK - 1) // CHUNK
-    for c in range(n_chunks):
+    print(f"  bake: rasterizing {F} faces in {n_chunks} chunks of up to {CHUNK}…", file=sys.stderr, flush=True)
+    chunk_iter = tqdm(range(n_chunks), desc="bake: rasterize chunks", file=sys.stderr)
+    for c in chunk_iter:
         s, e = c * CHUNK, min(F, (c + 1) * CHUNK)
         ch_size = e - s
         ch_uv = tri_uv_t[s:e]                            # (B, 3, 2)
@@ -471,6 +480,8 @@ def bake_texture_from_splats(
         H_pad = int(bh.max().item()) if ch_size > 0 else 0
         if W_pad == 0 or H_pad == 0:
             continue
+        mem_est_mb = ch_size * H_pad * W_pad * (3 + 1 + 2 + 3) * 4 / (1024 * 1024)
+        chunk_iter.set_postfix(pad=f"{H_pad}x{W_pad}", mem_mb=f"{mem_est_mb:.0f}")
 
         # Build padded pixel grid per face: (B, H_pad, W_pad, 2) of pixel xy
         dx = torch.arange(W_pad, device=device).view(1, 1, W_pad)
@@ -538,6 +549,7 @@ def bake_texture_from_splats(
         tex_t[flat_py, flat_px] = rgb
         mask_t[flat_py, flat_px] = True
 
+        torch.cuda.synchronize()
         if progress_cb:
             progress_cb(n_cams + 1 + c, n_cams + n_chunks + 2)
 
@@ -550,24 +562,46 @@ def bake_texture_from_splats(
         progress_cb(total - 1, total)
 
     if not mask.all():
+        t_fill = time.perf_counter()
+        print(f"  bake: filling UV gaps ({(~mask).sum()} pixels)…", file=sys.stderr, flush=True)
         _, indices = ndimage.distance_transform_edt(~mask, return_indices=True)
         for ch in range(3):
             tex[..., ch] = tex[..., ch][indices[0], indices[1]]
+        print(f"  bake: gap fill done in {time.perf_counter() - t_fill:.1f}s", file=sys.stderr, flush=True)
 
+    t_enc = time.perf_counter()
     tex_srgb = _linear_to_srgb(tex)
     tex_u8 = np.clip(tex_srgb * 255, 0, 255).astype(np.uint8)
     img = Image.fromarray(tex_u8)
-    per_corner_uvs = uvs[F_uv].astype(np.float32)
+    print(f"  bake: sRGB encode + PIL image in {time.perf_counter() - t_enc:.2f}s", file=sys.stderr, flush=True)
+
+    # Return the xatlas-unwrapped mesh directly (one UV per vertex, no duplication)
+    # The viewer can build a trimesh with these without 3x vertex inflation.
+    unwrapped_verts = verts[vmap].astype(np.float32)
+    unwrapped_faces = F_uv.astype(np.int32)
 
     if out_path is not None:
+        t_save = time.perf_counter()
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_textured_obj(out_path.with_stem("mesh_splat_tex"), verts, faces, per_corner_uvs, img)
+        _save_textured_obj_simple(
+            out_path.with_stem("mesh_splat_tex"),
+            unwrapped_verts, unwrapped_faces, uvs, img,
+        )
+        print(f"  bake: OBJ/MTL/PNG save in {time.perf_counter() - t_save:.1f}s", file=sys.stderr, flush=True)
 
     if progress_cb:
         progress_cb(total, total)
 
-    return {"uv": per_corner_uvs, "tex_image": img, "verts": verts, "faces": faces}
+    # NOTE: returns the xatlas-unwrapped mesh (one UV per vertex). The viewer
+    # should use these `verts`/`faces`/`uv` directly to avoid 3x vertex inflation.
+    return {
+        "uv": uvs.astype(np.float32),       # (V_uv, 2)
+        "tex_image": img,
+        "verts": unwrapped_verts,           # (V_uv, 3)
+        "faces": unwrapped_faces,           # (F, 3)
+        "per_vertex_uv": True,              # signals new layout to _push_mesh_to_viser
+    }
 
 
 def bake_mesh_texture(
@@ -706,6 +740,55 @@ def _save_textured_obj(base_path: Path, verts: np.ndarray, faces: np.ndarray,
 
     with open(str(base_path.with_suffix(".obj")), "w") as f:
         f.write("\n".join(obj_lines) + "\n")
+
+    mtl_str = (
+        "newmtl material_0\n"
+        "Ka 1.0 1.0 1.0\n"
+        "Kd 1.0 1.0 1.0\n"
+        "Ks 0.0 0.0 0.0\n"
+        f"map_Kd {base_path.name}.png\n"
+    )
+    with open(str(base_path.with_suffix(".mtl")), "w") as f:
+        f.write(mtl_str)
+
+
+def _save_textured_obj_simple(base_path: Path, verts: np.ndarray, faces: np.ndarray,
+                              uv_per_vertex: np.ndarray, image):
+    """Fast OBJ writer for meshes with one UV per vertex (xatlas-unwrapped)."""
+    import sys
+    print(f"  bake: saving PNG ({image.size[0]}x{image.size[1]})…", file=sys.stderr, flush=True)
+    image.save(str(base_path.with_suffix(".png")))
+
+    print(f"  bake: writing OBJ ({len(verts)} verts, {len(faces)} faces)…",
+          file=sys.stderr, flush=True)
+
+    # Vectorized string assembly — much faster than per-row f-strings
+    v_lines = np.char.add(np.char.add(np.char.add(
+        np.array(["v "] * len(verts)),
+        np.char.add(np.char.add(
+            verts[:, 0].astype("U16"), " "),
+            verts[:, 1].astype("U16"))), " "),
+        verts[:, 2].astype("U16"))
+    vt_lines = np.char.add(np.char.add(
+        np.array(["vt "] * len(uv_per_vertex)),
+        np.char.add(uv_per_vertex[:, 0].astype("U16"), " ")),
+        uv_per_vertex[:, 1].astype("U16"))
+    f1 = (faces + 1).astype("U10")
+    f_lines = np.array(["f "] * len(faces))
+    for col in range(3):
+        f_lines = np.char.add(f_lines,
+                              np.char.add(np.char.add(f1[:, col], "/"), f1[:, col]))
+        if col < 2:
+            f_lines = np.char.add(f_lines, " ")
+
+    with open(str(base_path.with_suffix(".obj")), "w") as f:
+        f.write(f"mtllib {base_path.name}.mtl\n")
+        f.write("\n".join(v_lines))
+        f.write("\n")
+        f.write("\n".join(vt_lines))
+        f.write("\nusemtl material_0\n")
+        f.write("\n".join(f_lines))
+        f.write("\n")
 
     mtl_str = (
         "newmtl material_0\n"
