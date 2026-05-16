@@ -15,6 +15,31 @@ PY=/home/kristofe/miniconda3/envs/lyra2/bin/python
 
 (or `conda activate lyra2 && PY=python` — same result)
 
+### viser version
+
+**Pin viser to 1.0.24.** Versions 1.0.25 → 1.0.27 (current latest) ship a
+broken point-cloud shader: `point_shading_enabled` is declared in both
+vertex and fragment shaders, but the fragment shader has no `precision`
+qualifier so the two shaders disagree on the uniform's precision. The
+browser's WebGL implementation rejects the shader program at link time
+and `add_point_cloud(...)` silently renders nothing — frustums, meshes,
+and background images still draw, only point clouds are invisible.
+
+Symptom in the browser console:
+```
+THREE.WebGLProgram: Shader Error 0 - VALIDATE_STATUS false
+error: precision mismatch between shaders for uniform (named _upoint_shading_enabled)
+```
+
+Fix:
+```bash
+$PY -m pip install "viser==1.0.24"
+```
+
+1.0.24 has no overlapping uniforms between vertex and fragment, so the
+precision mismatch can't arise. The only cosmetic loss is the
+center-to-edge `point_shading` gradient added in 1.0.25 — not used here.
+
 ## Three ways to run
 
 ### 1. Static viewer (just inspect a .ply)

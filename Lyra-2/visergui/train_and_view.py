@@ -47,6 +47,16 @@ def main() -> None:
     p.add_argument("--remove-sky", type=int, default=1)
     p.add_argument("--publish-every", type=int, default=25,
                    help="Push trainer state into the scene every N steps.")
+    p.add_argument("--sh-max-deg", type=int, default=2,
+                   help="Default for the Setup→sh_max_deg field. 0 = L1-only (v1).")
+    p.add_argument("--lpips-weight", type=float, default=0.05,
+                   help="Default for the Setup→lpips_weight field. 0 disables (v1).")
+    p.add_argument("--max-scale-voxels", type=float, default=2.0,
+                   help="Default for the Setup→max_scale_voxels slider (live-adjustable).")
+    p.add_argument("--densify", type=int, default=1,
+                   help="Default for the Setup→densify checkbox (1 = on, 0 = off).")
+    p.add_argument("--densify-total-steps", type=int, default=7000,
+                   help="Total steps the densify schedule plans for.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     args = p.parse_args()
@@ -57,6 +67,9 @@ def main() -> None:
         scene=scene,
         publish_every=args.publish_every,
     )
+    # Sync the trainer's scale-clamp default with the CLI flag so the GUI
+    # slider's initial value matches the trainer's stored value.
+    trainer.set_scale_clamp(args.max_scale_voxels)
     # Start the daemon thread early so resume is responsive once init lands.
     # `step()` is guarded: it short-circuits until `setup_refine` runs.
     control = BackgroundTrainingThread(trainer.step)
@@ -72,11 +85,29 @@ def main() -> None:
             confidence=float(opts["confidence_quantile"]),
             remove_sky=bool(opts["remove_sky"]),
             name=args.name,
+            sh_max_deg=int(opts.get("sh_max_deg", 0)),
+            lpips_weight=float(opts.get("lpips_weight", 0.0)),
+            use_densify=bool(opts.get("use_densify", False)),
+            densify_total_steps=int(args.densify_total_steps),
+        )
+        d = trainer.data
+        if d is None:
+            return
+        app.publish_training_cameras(
+            c2w=d.c2w.detach().cpu().numpy(),
+            K=d.K.detach().cpu().numpy(),
+            images=d.rgb.detach().cpu().numpy(),
+            H=int(d.H), W=int(d.W),
         )
 
     def resetter() -> None:
+        import numpy as _np
         control.pause()
         trainer.reset()
+        app.publish_training_cameras(
+            c2w=_np.zeros((0, 4, 4)), K=_np.zeros((0, 3, 3)),
+            images=None, H=1, W=1,
+        )
 
     app = ViewerApp(
         ply_path=None,
@@ -86,11 +117,16 @@ def main() -> None:
         training_control=control,
         initializer=initializer,
         resetter=resetter,
+        on_scale_mult_change=trainer.set_scale_clamp,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,
             confidence_quantile=args.confidence_quantile,
             remove_sky=bool(args.remove_sky),
+            sh_max_deg=args.sh_max_deg,
+            lpips_weight=args.lpips_weight,
+            scale_clamp_voxel_mult=args.max_scale_voxels,
+            use_densify=bool(args.densify),
         ),
         derive_splat_points=False,  # live splats invalidate the derived layer
     )
@@ -101,12 +137,8 @@ def main() -> None:
         # actually ran any training.
         if getattr(trainer, "_initialized", False):
             try:
-                trainer.save_inria_ply(
-                    "splats_live_final.ply",
-                    trainer.means_t, trainer.sh0_t,
-                    trainer.log_s_t, trainer.logit_o_t, trainer.quats_t,
-                )
-                print("saved splats_live_final.ply")
+                trainer.save_current("splats.ply")
+                print("saved splats.ply")
             except Exception as e:
                 print(f"final-save skipped: {e}")
 

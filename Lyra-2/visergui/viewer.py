@@ -101,6 +101,42 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
+def _rotmat_to_wxyz(R: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix → (w, x, y, z) quaternion. Shepperd-style branch
+    on the largest diagonal element to avoid sqrt of a negative."""
+    R = np.asarray(R, dtype=np.float64)
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    return q / max(float(np.linalg.norm(q)), 1e-12)
+
+
 # --------------------------------------------------------------------------- #
 # Color utilities for point clouds
 # --------------------------------------------------------------------------- #
@@ -240,7 +276,9 @@ class PointCloudLoader:
         return points, colors, {}
 
 
-def derive_splat_centers_layer(scene: "SceneState") -> PointCloudLayer | None:
+def derive_splat_centers_layer(
+    scene: "SceneState", max_display_points: int = 200_000,
+) -> PointCloudLayer | None:
     with scene.read() as s:
         if s.means is None or s.num_splats == 0:
             return None
@@ -248,11 +286,26 @@ def derive_splat_centers_layer(scene: "SceneState") -> PointCloudLayer | None:
         dc_sh = s.sh[:, 0, :].detach().cpu().numpy()
         rgb01 = (SH_C0 * dc_sh + 0.5).clip(0.0, 1.0)
         colors_u8 = (rgb01 * 255.0).astype(np.uint8)
+    # Cap displayed points: a 1M+ splat scene blows out the websocket on every
+    # pump publish and tanks three.js Points performance. A uniform random
+    # sample is plenty for orientation/setup work.
+    if means_np.shape[0] > max_display_points:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(means_np.shape[0], size=max_display_points, replace=False)
+        means_np = means_np[idx]
+        colors_u8 = colors_u8[idx]
+    # Default point size scaled to the scene's bbox diagonal so the layer is
+    # visible at whatever world scale the splats live in. DA3 / COLMAP scenes
+    # can be sub-unit or hundreds of units; a fixed 0.0005 vanishes in either.
+    mn = means_np.min(axis=0)
+    mx = means_np.max(axis=0)
+    diag = float(np.linalg.norm(mx - mn))
+    size = max(diag * 5e-3, 1e-4)
     return PointCloudLayer(
         name="splat_centers",
         points=means_np,
         colors_rgb=colors_u8,
-        point_size=0.0005,
+        point_size=size,
     )
 
 
@@ -571,15 +624,16 @@ def _compute_home_pose(means_np: np.ndarray) -> tuple[tuple[float, float, float]
     diag = float(np.linalg.norm(extent))
     if diag <= 1e-9:
         diag = 1.0
-    # Pull back along world +Z (viser default up) and slightly along +X for a
-    # 3/4-ish view. Adjust empirically once you've seen your scene.
-    offset = np.array([0.6, -0.6, 0.6], dtype=np.float64)
+    # Scene is -Y-up after the flip_x .ply transform (Inria convention with
+    # COLMAP-Y-down source), so offset along -Y for elevation and along
+    # +X/-Z for a 3/4-ish view.
+    offset = np.array([0.6, -0.6, -0.6], dtype=np.float64)
     offset = offset / np.linalg.norm(offset) * diag * 1.2
     pos = center + offset
     return (
         (float(pos[0]), float(pos[1]), float(pos[2])),
         (float(center[0]), float(center[1]), float(center[2])),
-        (0.0, 0.0, 1.0),
+        (0.0, -1.0, 0.0),
     )
 
 
@@ -600,6 +654,7 @@ class ViewerApp:
         initializer: "Callable[[dict], None] | None" = None,
         resetter: "Callable[[], None] | None" = None,
         default_init_args: dict | None = None,
+        on_scale_mult_change: "Callable[[float], None] | None" = None,
     ) -> None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_str)
@@ -613,6 +668,7 @@ class ViewerApp:
         self._initializer = initializer
         self._resetter = resetter
         self._default_init_args = default_init_args or {}
+        self._on_scale_mult_change = on_scale_mult_change
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -673,6 +729,11 @@ class ViewerApp:
         self._pump_stop_event: threading.Event = threading.Event()
         self._pump_thread: threading.Thread | None = None
 
+        # Training-camera frustums: cached so toggles can re-publish without
+        # re-passing the data, and so we can clear/rebuild on each new init.
+        self._train_cam_payload: dict | None = None
+        self._train_cam_names: list[str] = []
+
         self._build_gui()
         # The pump watches splat_version (live training publishes) AND drives
         # the training-control readouts. Start it whenever either reason exists.
@@ -720,6 +781,31 @@ class ViewerApp:
                 "remove_sky",
                 initial_value=bool(d.get("remove_sky", True)),
             )
+            self.gui_init_sh_max_deg = self.server.gui.add_number(
+                "sh_max_deg",
+                initial_value=int(d.get("sh_max_deg", 0)),
+                min=0, max=3, step=1,
+                hint="0 = L1-only (v1). >0 enables SH-band progression 0→N.",
+            )
+            self.gui_init_lpips_weight = self.server.gui.add_slider(
+                "lpips_weight",
+                min=0.0, max=1.0, step=0.01,
+                initial_value=float(d.get("lpips_weight", 0.0)),
+                hint="LPIPS perceptual loss weight added to L1 (0 disables).",
+            )
+            self.gui_init_scale_mult = self.server.gui.add_slider(
+                "max_scale_voxels",
+                min=0.5, max=10.0, step=0.1,
+                initial_value=float(d.get("scale_clamp_voxel_mult", 2.0)),
+                hint="Cap on each gaussian's per-axis scale, as a multiple of "
+                     "the init voxel edge. Live — applies on the next training step.",
+            )
+            self.gui_init_densify = self.server.gui.add_checkbox(
+                "densify",
+                initial_value=bool(d.get("use_densify", False)),
+                hint="Enable gsplat clone/split/prune (v3). Splat count "
+                     "evolves during training.",
+            )
             self.gui_init_btn = self.server.gui.add_button("Initialize")
             self.gui_init_reset_btn = self.server.gui.add_button("Reset")
             self.gui_init_status = self.server.gui.add_markdown(
@@ -727,6 +813,12 @@ class ViewerApp:
             )
         self.gui_init_btn.on_click(lambda _ev: self._on_init_click())
         self.gui_init_reset_btn.on_click(lambda _ev: self._on_reset_click())
+        if self._on_scale_mult_change is not None:
+            self.gui_init_scale_mult.on_update(
+                lambda _ev: self._on_scale_mult_change(
+                    float(self.gui_init_scale_mult.value)
+                )
+            )
 
     def _build_inspect_panel(self) -> None:
         # Top-level: Display toggle (splats vs point clouds).
@@ -738,13 +830,16 @@ class ViewerApp:
         )
         self.gui_display.on_update(lambda _ev: self._apply_display_mode())
 
-        sh_options = tuple(str(d) for d in range(self.scene.sh_degree + 1))
+        # Always offer 0..3 — the renderer clamps via min(gui, scene.sh_degree),
+        # so picking 3 on a degree-0 scene just renders at 0 (no harm), and
+        # live-training mode can ramp sh_degree up without rebuilding the dropdown.
+        sh_options = tuple(str(d) for d in range(4))
         with self.server.gui.add_folder("Render"):
             self.gui_sh_degree = self.server.gui.add_dropdown(
                 "sh_degree",
                 options=sh_options,
-                initial_value=str(self.scene.sh_degree),
-                hint="SH degree used by the rasterizer. Capped at the loaded .ply's degree.",
+                initial_value=str(min(3, max(0, self.scene.sh_degree))),
+                hint="SH degree used by the rasterizer. Clamped to the scene's available bands.",
             )
             self.gui_render_mode = self.server.gui.add_dropdown(
                 "render_mode", options=("RGB", "Depth"), initial_value="RGB"
@@ -807,9 +902,37 @@ class ViewerApp:
             )
             self.gui_reset_camera = self.server.gui.add_button("reset camera")
 
-        with self.server.gui.add_folder("Point Clouds"):
+        with self.server.gui.add_folder("Training Cameras"):
+            self.gui_show_train_cams = self.server.gui.add_checkbox(
+                "show", initial_value=True,
+                hint="Render a frustum for every training-frame camera.",
+            )
+            self.gui_train_cam_scale = self.server.gui.add_slider(
+                "scale", min=0.01, max=2.0, step=0.01, initial_value=0.15,
+                hint="Frustum size in world units.",
+            )
+            self.gui_train_cam_images = self.server.gui.add_checkbox(
+                "show images", initial_value=True,
+                hint="Display each training frame inside its frustum.",
+            )
+            self.gui_train_cam_count = self.server.gui.add_markdown(
+                "**cameras:** 0"
+            )
+        self.gui_show_train_cams.on_update(lambda _ev: self._republish_train_cams())
+        self.gui_train_cam_scale.on_update(lambda _ev: self._republish_train_cams())
+        self.gui_train_cam_images.on_update(lambda _ev: self._republish_train_cams())
+
+        # Debug: push a hard-coded magenta point cloud to test whether viser's
+        # point rendering works at all in this scene/coord-frame.
+        self.gui_debug_test_pc = self.server.gui.add_button("debug: test point cloud")
+        self.gui_debug_test_pc.on_click(lambda _ev: self._push_debug_test_pc())
+
+        # Save the folder handle so lazy layer-GUI builds (from the training
+        # pump) can nest under it instead of landing at the top level.
+        self._point_clouds_folder = self.server.gui.add_folder("Point Clouds")
+        with self._point_clouds_folder:
             self.global_size_mult_handle = self.server.gui.add_slider(
-                "global_size_mult", min=0.1, max=10.0, step=0.1, initial_value=1.0
+                "global_size_mult", min=0.01, max=100.0, step=0.01, initial_value=1.0
             )
             self.global_size_mult_handle.on_update(
                 lambda _ev: self._push_all_visible_layers()
@@ -858,11 +981,17 @@ class ViewerApp:
 
     def _build_layer_gui(self, name: str) -> None:
         layer = self.scene.point_clouds[name]
+        # Range slider relative to the layer's derived size — for DA3 scenes
+        # this lands in a useful neighborhood instead of capping at 0.1.
+        base = max(float(layer.point_size), 1e-4)
+        size_min = max(base * 0.01, 1e-5)
+        size_max = base * 100.0
+        size_step = max(base * 0.01, 1e-5)
         with self.server.gui.add_folder(name):
             visible = self.server.gui.add_checkbox("visible", initial_value=layer.visible)
             size = self.server.gui.add_slider(
-                "point_size", min=0.0005, max=0.1, step=0.0005,
-                initial_value=layer.point_size,
+                "point_size", min=size_min, max=size_max, step=size_step,
+                initial_value=base,
             )
             color_mode = self.server.gui.add_dropdown(
                 "color_mode", options=("rgb", "axis", "confidence", "uniform"),
@@ -890,13 +1019,184 @@ class ViewerApp:
         for name in list(self.scene.point_clouds.keys()):
             self._push_layer(name)
 
+    def _push_debug_test_pc(self) -> None:
+        """Hard-coded sanity-check: try a few variants to isolate why
+        add_point_cloud isn't rendering. Also drops a known-good `add_box`
+        and `add_icosphere` at the same spot as a sentinel — those use
+        completely different three.js paths."""
+        if self.scene.means is not None and int(self.scene.num_splats) > 0:
+            mn = self.scene.means.detach().cpu().numpy().min(axis=0)
+            mx = self.scene.means.detach().cpu().numpy().max(axis=0)
+            center = ((mn + mx) * 0.5).astype(np.float32)
+        else:
+            center = np.zeros(3, dtype=np.float32)
+
+        # 1) Sentinel: a 1-unit magenta box at the center. Uses add_box.
+        try:
+            self.server.scene.add_box(
+                name="debug_box",
+                dimensions=(1.0, 1.0, 1.0),
+                color=(255, 0, 255),
+                position=tuple(center.tolist()),
+            )
+            print(f"[debug] add_box OK at {center.tolist()}")
+        except Exception as e:
+            print(f"[debug] add_box raised: {e}")
+
+        # 2) Default precision (float16) + uint8 colors — original path.
+        rng = np.random.default_rng(0)
+        pts = (rng.standard_normal((1000, 3)).astype(np.float32) * 0.5 + center)
+        cols = np.tile(np.array([255, 0, 255], dtype=np.uint8), (1000, 1))
+        try:
+            self.server.scene.add_point_cloud(
+                name="debug_pc_default",
+                points=pts, colors=cols, point_size=0.3,
+            )
+            print("[debug] add_point_cloud (default) OK")
+        except Exception as e:
+            print(f"[debug] add_point_cloud (default) raised: {e}")
+
+        # 3) Same data but precision='float32' explicitly.
+        try:
+            self.server.scene.add_point_cloud(
+                name="debug_pc_f32",
+                points=pts, colors=cols, point_size=0.3,
+                precision="float32",
+            )
+            print("[debug] add_point_cloud (precision=float32) OK")
+        except Exception as e:
+            print(f"[debug] add_point_cloud (precision=float32) raised: {e}")
+
+        # 4) Tiny: just 3 points way bigger to see if size is the only issue.
+        big_pts = np.array(
+            [center, center + 1.0, center + 2.0], dtype=np.float32,
+        )
+        big_cols = np.array(
+            [[255, 0, 255], [0, 255, 255], [255, 255, 0]], dtype=np.uint8,
+        )
+        try:
+            self.server.scene.add_point_cloud(
+                name="debug_pc_huge",
+                points=big_pts, colors=big_cols, point_size=2.0,
+            )
+            print("[debug] add_point_cloud (3 huge points) OK")
+        except Exception as e:
+            print(f"[debug] add_point_cloud (3 huge points) raised: {e}")
+
+    # ---- Training-camera frustums ------------------------------------ #
+
+    def publish_training_cameras(
+        self,
+        c2w: np.ndarray,
+        K: np.ndarray,
+        images: np.ndarray | None,
+        H: int,
+        W: int,
+    ) -> None:
+        """Cache the per-frame camera payload and push frustums into the
+        scene. Pass an empty c2w (shape (0, ...)) to clear."""
+        c2w_np = np.asarray(c2w, dtype=np.float64)
+        if c2w_np.shape[0] == 0:
+            self._train_cam_payload = None
+            self._republish_train_cams()
+            return
+        K_np = np.asarray(K, dtype=np.float64)
+        imgs_np: np.ndarray | None
+        if images is None:
+            imgs_np = None
+        else:
+            imgs = np.asarray(images)
+            if imgs.dtype != np.uint8:
+                imgs_np = np.clip(imgs * 255.0, 0.0, 255.0).astype(np.uint8) \
+                    if imgs.dtype.kind == "f" else imgs.astype(np.uint8)
+            else:
+                imgs_np = imgs
+        self._train_cam_payload = {
+            "c2w": c2w_np, "K": K_np, "images": imgs_np,
+            "H": int(H), "W": int(W),
+        }
+        self._republish_train_cams()
+
+    def _republish_train_cams(self) -> None:
+        for n in self._train_cam_names:
+            try:
+                self.server.scene.remove_by_name(n)
+            except Exception:
+                pass
+        self._train_cam_names.clear()
+
+        payload = self._train_cam_payload
+        try:
+            self.gui_train_cam_count.content = (
+                f"**cameras:** {int(payload['c2w'].shape[0]) if payload else 0}"
+            )
+        except Exception:
+            pass
+
+        if payload is None or not bool(self.gui_show_train_cams.value):
+            return
+
+        c2w = payload["c2w"]
+        K = payload["K"]
+        imgs = payload["images"]
+        H, W = payload["H"], payload["W"]
+        scale = float(self.gui_train_cam_scale.value)
+        with_images = bool(self.gui_train_cam_images.value) and imgs is not None
+        aspect = W / max(H, 1)
+        for i in range(c2w.shape[0]):
+            R = c2w[i, :3, :3]
+            t = c2w[i, :3, 3]
+            wxyz = _rotmat_to_wxyz(R)
+            fy = float(K[i, 1, 1])
+            fov_y = 2.0 * math.atan(0.5 * H / max(fy, 1e-9))
+            name = f"train_cams/{i:04d}"
+            self.server.scene.add_camera_frustum(
+                name=name,
+                fov=fov_y,
+                aspect=aspect,
+                scale=scale,
+                color=(255, 153, 51),
+                wxyz=tuple(float(x) for x in wxyz),
+                position=tuple(float(x) for x in t),
+                image=imgs[i] if with_images else None,
+            )
+            self._train_cam_names.append(name)
+
+    def _refresh_splat_centers_layer(self) -> None:
+        """Re-derive the 'splat_centers' point cloud from the live splats.
+        Called from the training pump on every splat_version bump so the
+        layer reflects the current optimizer state instead of going stale."""
+        derived = derive_splat_centers_layer(self.scene)
+        if derived is None:
+            print("[refresh splat_centers] derive returned None")
+            return
+        print(
+            f"[refresh splat_centers] N={len(derived.points)} "
+            f"layer.point_size={derived.point_size:.5f}"
+        )
+        self.scene.add_point_cloud(derived)
+        # First-time appearance: build the per-layer GUI controls under the
+        # existing "Point Clouds" folder context. After that we just push.
+        if "splat_centers" not in self._handles:
+            try:
+                with self._point_clouds_folder:
+                    self._build_layer_gui("splat_centers")
+                print("[refresh splat_centers] built layer GUI")
+            except Exception as e:
+                print(f"[refresh splat_centers] GUI build failed: {e}")
+                return
+        if self.display_mode == "points":
+            self._push_layer("splat_centers")
+
     def _push_layer(self, name: str) -> None:
         layer = self.scene.point_clouds.get(name)
         handles = self._handles.get(name)
         if layer is None or handles is None:
+            print(f"[push_layer {name}] skip: layer={layer is not None} handles={handles is not None}")
             self._remove_pushed(name)
             return
         if self.display_mode != "points" or not bool(handles["visible"].value):
+            print(f"[push_layer {name}] skip: mode={self.display_mode} visible={bool(handles['visible'].value)}")
             self._remove_pushed(name)
             return
         resolved = replace(
@@ -909,10 +1209,23 @@ class ViewerApp:
         colors = compute_colors(resolved)
         size = resolved.point_size * float(self.global_size_mult_handle.value)
         viser_name = _viser_pc_name(name)
+        try:
+            bbox_min = resolved.points.min(axis=0)
+            bbox_max = resolved.points.max(axis=0)
+            print(
+                f"[push_layer {name}] N={len(resolved.points)} "
+                f"size={size:.5f} (layer={resolved.point_size:.5f} mult={float(self.global_size_mult_handle.value):.3f}) "
+                f"color_mode={resolved.color_mode} "
+                f"bbox_min={bbox_min} bbox_max={bbox_max} "
+                f"colors[0]={colors[0].tolist()}"
+            )
+        except Exception as _e:
+            print(f"[push_layer {name}] diag print failed: {_e}")
         self.server.scene.add_point_cloud(
             name=viser_name, points=resolved.points, colors=colors, point_size=size,
         )
         self._pushed.add(viser_name)
+        print(f"[push_layer {name}] add_point_cloud OK as '{viser_name}'")
 
     def _remove_pushed(self, name: str) -> None:
         viser_name = _viser_pc_name(name)
@@ -951,6 +1264,14 @@ class ViewerApp:
         # Apply current FOV to this client.
         try:
             client.camera.fov = math.radians(float(self.gui_fov.value))
+        except Exception:
+            pass
+        # Seed the orbit-up axis and home pose so a fresh page load yaws
+        # around the right axis without needing the user to click reset.
+        try:
+            client.camera.up_direction = self.home_up
+            client.camera.position = self.home_position
+            client.camera.look_at = self.home_look_at
         except Exception:
             pass
         if self.display_mode == "splats":
@@ -1142,14 +1463,27 @@ class ViewerApp:
                 max_frames=int(self.gui_init_max_frames.value),
                 confidence_quantile=float(self.gui_init_conf_q.value),
                 remove_sky=bool(self.gui_init_remove_sky.value),
+                sh_max_deg=int(self.gui_init_sh_max_deg.value),
+                lpips_weight=float(self.gui_init_lpips_weight.value),
+                use_densify=bool(self.gui_init_densify.value),
             )
             # viser runs on_click in a thread pool, so blocking here is fine.
             self._initializer(opts)
             # Recompute home pose from the newly-populated scene so the
-            # camera-reset button lands somewhere sensible.
+            # camera-reset button lands somewhere sensible. Push the new
+            # up/position/look_at to every connected client — otherwise the
+            # orbit controls keep the empty-boot up axis and splats appear
+            # upside down until the page is refreshed.
             if self.scene.means is not None:
                 means_np = self.scene.means.detach().cpu().numpy()
                 self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+                for client in self.server.get_clients().values():
+                    try:
+                        client.camera.up_direction = self.home_up
+                        client.camera.position = self.home_position
+                        client.camera.look_at = self.home_look_at
+                    except Exception:
+                        pass
             self.gui_init_status.content = (
                 f"**init:** ready ({self.scene.num_splats:,} splats) — click resume"
             )
@@ -1224,12 +1558,19 @@ class ViewerApp:
                     self._render_all_clients()
                 except Exception:
                     pass
+                try:
+                    self._refresh_splat_centers_layer()
+                except Exception:
+                    pass
             latest_loss = history_snapshot[-1][1] if history_snapshot else 0.0
             try:
                 self.gui_train_status.content = f"**status:** {ctl.status()}"
                 self.gui_train_step.content = f"**step:** {int(step):,}"
                 self.gui_train_loss.content = f"**loss:** {float(latest_loss):.6f}"
                 self.gui_train_splat_count.content = f"**splats:** {int(splats):,}"
+                self.gui_splat_count_readout.content = (
+                    f"**splat_count:** {int(splats):,}"
+                )
             except Exception:
                 # Server may have shut down; tolerate races on exit.
                 continue

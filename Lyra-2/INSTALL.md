@@ -40,6 +40,15 @@ MAX_JOBS=16 pip install --no-build-isolation --no-binary :all: flash-attn==2.6.3
 # 7. Build vendored CUDA extensions
 USE_SYSTEM_EIGEN=1 pip install --no-build-isolation -e 'lyra_2/_src/inference/vipe'
 pip install --no-build-isolation -e 'lyra_2/_src/inference/depth_anything_3[gs]'
+
+# 7a. viser (optional — required for visergui/ viewer). Pin to 1.0.24.
+#     1.0.25 → 1.0.27 ship a broken point-cloud shader: the fragment shader
+#     has no `precision` qualifier but declares the same `point_shading_enabled`
+#     uniform as the vertex shader's `precision mediump float;` — WebGL
+#     rejects the linked program, so add_point_cloud() silently renders
+#     nothing while frustums/meshes still draw. 1.0.24 has no overlapping
+#     uniforms between the two shaders so the mismatch can't arise.
+pip install "viser==1.0.24"
 ```
 
 Add the following to your shell profile (e.g. `~/.bashrc`) to persist `LD_LIBRARY_PATH` across sessions:

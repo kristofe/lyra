@@ -172,6 +172,26 @@ pip install --no-build-isolation -e 'lyra_2/_src/inference/depth_anything_3[gs]'
 #     pins numpy<2 (overly conservative — it imports cleanly with 2.x). Push
 #     numpy back up to satisfy requirements.txt and rerun-sdk.
 pip install 'numpy>=2.0'
+
+# 7b. LPIPS (optional — perceptual loss for visergui/splat_trainer.py).
+#     MUST install with --no-deps on Blackwell. lpips declares torch>=0.4.0,
+#     and pip's resolver then walks torch 2.7.1's metadata and re-pins
+#     `nvidia-cudnn-cu12==9.7.1.26` — directly undoing step 3a's 9.21.1.3
+#     upgrade and reintroducing the Blackwell unfused-attention OOM. lpips
+#     ships as a `py3-none-any` wheel (pure Python, no compiled bits) so
+#     --no-deps is safe: at runtime it only imports torch/torchvision/
+#     numpy/scipy/tqdm, all of which are already present.
+pip install --no-deps lpips
+
+# 7c. viser (optional — required for visergui/ viewer). Pin to 1.0.24.
+#     1.0.25 → 1.0.27 ship a broken point-cloud shader: the fragment
+#     shader has no precision qualifier but declares the same uniform
+#     (`point_shading_enabled`) as the vertex shader's `precision mediump`,
+#     so WebGL rejects the linked program. Frustums/meshes still draw but
+#     add_point_cloud() silently renders nothing. 1.0.24 has no overlapping
+#     uniforms between vertex and fragment so the mismatch can't arise; we
+#     don't use the gradient `point_shading` feature added in 1.0.25.
+pip install "viser==1.0.24"
 ```
 
 Add the following to your shell profile (e.g. `~/.bashrc`) to persist `LD_LIBRARY_PATH` across sessions:
@@ -188,8 +208,10 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$SITE/torch/lib:$SITE/nvidia/cuda_runt
 
 PYTHONPATH=. python -c "
 import torch, flash_attn, transformer_engine.pytorch, vipe_ext, depth_anything_3.api, moge.model.v1
+import lpips  # optional — installed via step 7b for visergui/splat_trainer.py
 print('torch:', torch.__version__, '| cuda:', torch.cuda.is_available())
 print('device cc:', torch.cuda.get_device_capability(0))
+print('cudnn:', torch.backends.cudnn.version())
 print('all imports OK')
 "
 # Expected on Blackwell: torch 2.7.1+cu128, cuda True, device cc (12, 0), all imports OK.

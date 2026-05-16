@@ -18,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from depth_anything_3.api import DepthAnything3
 
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-#import lpips
+import lpips
 from tqdm.auto import tqdm
 from plyfile import PlyData, PlyElement
 from gsplat import rasterization, DefaultStrategy
@@ -71,17 +72,25 @@ class GaussianInit:
     train_mask:  torch.Tensor        # (N,H,W) bool — per-pixel supervision mask
     scene_scale: float
     conf_thresh: float | None
+    voxel: float                     # voxel edge length used for init downsampling
 
 
 @dataclass
 class TrainState:
-    """Output of `_make_train_state`: trainable tensors + optimizer."""
-    means_t:   torch.Tensor
-    log_s_t:   torch.Tensor
-    quats_t:   torch.Tensor
-    logit_o_t: torch.Tensor
-    sh0_t:     torch.Tensor
-    opt:       torch.optim.Optimizer
+    """Trainable splat parameters + per-key optimizers + optional densify
+    strategy.
+
+    `params` keys: means, scales, quats, opacities, sh0, shN. shN has
+    shape (M, K_REST, 3) with K_REST=0 when sh_max_deg=0 — torch.cat with
+    a zero-band tensor is a no-op so `step()` doesn't need to branch.
+
+    One Adam per parameter is required by `gsplat.DefaultStrategy`, which
+    needs to rebuild per-param state when M changes during clone/split/prune.
+    When `strategy is None` the per-key dict still works identically."""
+    params:          torch.nn.ParameterDict
+    opts:            dict
+    strategy:        object | None = None
+    strategy_state:  dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -143,8 +152,10 @@ def _preprocess_video(video_path: Path, out_dir: Path, device: torch.device,
     rgb = imgs.float() / 255.0
 
     del model, imgs
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print(f"N={N} H={H} W={W}; depth range [{depth.min():.3f}, {depth.max():.3f}]")
+
     return VideoData(rgb=rgb, depth=depth, K=K, w2c=w2c, c2w=c2w,
                      conf=conf, sky=sky, N=N, H=H, W=W)
 
@@ -278,6 +289,7 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
         means=means_vx, quats=quats_vx, log_s=log_s_vx, logit_o=logit_o_vx,
         sh=sh_vx, train_mask=train_mask,
         scene_scale=scene_scale, conf_thresh=conf_thresh,
+        voxel=voxel,
     )
 
 
@@ -286,23 +298,65 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
 # --------------------------------------------------------------------------- #
 
 
-def _make_train_state(init: GaussianInit) -> TrainState:
-    """Build trainable tensors + Adam optimizer from initial gaussians."""
+def _make_train_state(init: GaussianInit, sh_max_deg: int = 0,
+                      use_densify: bool = False,
+                      densify_total_steps: int = 7000) -> TrainState:
+    """Build the ParameterDict + per-key Adam optimizers + (optional)
+    DefaultStrategy.
+
+    `sh_max_deg > 0` allocates shN of shape (M, (sh_max_deg+1)²−1, 3) with
+    its own Adam at 1/20 of the sh0 LR. `use_densify=True` wires up the
+    gsplat clone/split/prune strategy; `means` LR is scaled by scene_scale
+    to match the v3 notebook recipe."""
     torch.set_grad_enabled(True)
-    means_t   = init.means.clone().requires_grad_(True)
-    log_s_t   = init.log_s.clone().requires_grad_(True)
-    quats_t   = init.quats.clone().requires_grad_(True)
-    logit_o_t = init.logit_o.clone().requires_grad_(True)
-    sh0_t     = init.sh.clone().requires_grad_(True)
-    opt = torch.optim.Adam([
-        {"params": means_t,   "lr": 1.6e-4},
-        {"params": log_s_t,   "lr": 5e-3},
-        {"params": quats_t,   "lr": 1e-3},
-        {"params": logit_o_t, "lr": 5e-2},
-        {"params": sh0_t,     "lr": 2.5e-3},
-    ])
-    return TrainState(means_t=means_t, log_s_t=log_s_t, quats_t=quats_t,
-                      logit_o_t=logit_o_t, sh0_t=sh0_t, opt=opt)
+    device = init.means.device
+    M = init.means.shape[0]
+    K_rest = max(0, (sh_max_deg + 1) ** 2 - 1)
+
+    params = torch.nn.ParameterDict({
+        "means":     torch.nn.Parameter(init.means.clone()),
+        "scales":    torch.nn.Parameter(init.log_s.clone()),
+        "quats":     torch.nn.Parameter(init.quats.clone()),
+        "opacities": torch.nn.Parameter(init.logit_o.clone()),
+        "sh0":       torch.nn.Parameter(init.sh.clone()),
+        "shN":       torch.nn.Parameter(
+            torch.zeros((M, K_rest, 3), device=device, dtype=init.means.dtype)
+        ),
+    }).to(device)
+
+    # One Adam per parameter — required by DefaultStrategy so it can rebuild
+    # per-param Adam state when M changes during clone/split/prune.
+    means_lr = 1.6e-4 * init.scene_scale if use_densify else 1.6e-4
+    lr_table = {
+        "means":     means_lr,
+        "scales":    5e-3,
+        "quats":     1e-3,
+        "opacities": 5e-2,
+        "sh0":       2.5e-3,
+        "shN":       2.5e-3 / 20.0,
+    }
+    opts = {
+        k: torch.optim.Adam([{"params": [params[k]], "lr": lr}])
+        for k, lr in lr_table.items()
+    }
+
+    strategy = None
+    strategy_state = None
+    if use_densify:
+        # Aggressive schedule: start ~2.5x sooner, densify 2x more often,
+        # reset opacity 2x more often, and keep refining longer at the tail.
+        strategy = DefaultStrategy(
+            refine_start_iter=200,                                  # was 500
+            refine_stop_iter=max(500, densify_total_steps - 200),   # was -500
+            reset_every=1500,                                       # was 3000
+            refine_every=50,                                        # was 100
+            verbose=False,
+        )
+        strategy.check_sanity(params, opts)
+        strategy_state = strategy.initialize_state(scene_scale=init.scene_scale)
+
+    return TrainState(params=params, opts=opts,
+                      strategy=strategy, strategy_state=strategy_state)
 
 
 def render_view(data: VideoData, means, quats, log_s, logit_o, sh_all, cam_idx):
@@ -393,36 +447,49 @@ class SplatTrainer:
         self._step_count = 0
         self._initialized = False
         self._last_video: tuple[Path, int] | None = None
-        self._lpips_net = None
+        self._lpips_net: torch.nn.Module | None = None
+
+        # Loss / SH config. Defaults reproduce v1 behavior (sh=0, L1-only,
+        # static splat count). Live tunables set via `prepare_and_init`.
+        self.sh_max_deg: int = 0
+        self.sh_ramp_steps_per_band: int = 1000
+        self.l1_weight: float = 1.0
+        self.lpips_weight: float = 0.0
+        self.use_densify: bool = False
+        self.densify_total_steps: int = 7000
+        # Max gaussian axis-scale as a multiple of the init voxel edge. The
+        # log-space cap is recomputed in prepare_and_init from init.voxel.
+        self.scale_clamp_voxel_mult: float = 2.0
+        self._log_scale_max: float | None = None
 
         self.data:  VideoData    | None = None
         self.init:  GaussianInit | None = None
         self.train: TrainState   | None = None
 
     # ---- External-compat forwarders ------------------------------------- #
-    # train_and_view.py reads these names at shutdown to call save_inria_ply.
-    # Raising AttributeError (not returning None) preserves hasattr/getattr
-    # semantics that the old `delattr` in reset() relied on.
+    # Returned references stay valid across densify swaps because they go
+    # through `self.train.params[...]` on each access — DefaultStrategy
+    # replaces the Parameter object in the dict in-place.
     @property
     def means_t(self) -> torch.Tensor:
         if self.train is None: raise AttributeError("means_t")
-        return self.train.means_t
+        return self.train.params["means"]
     @property
     def log_s_t(self) -> torch.Tensor:
         if self.train is None: raise AttributeError("log_s_t")
-        return self.train.log_s_t
+        return self.train.params["scales"]
     @property
     def quats_t(self) -> torch.Tensor:
         if self.train is None: raise AttributeError("quats_t")
-        return self.train.quats_t
+        return self.train.params["quats"]
     @property
     def logit_o_t(self) -> torch.Tensor:
         if self.train is None: raise AttributeError("logit_o_t")
-        return self.train.logit_o_t
+        return self.train.params["opacities"]
     @property
     def sh0_t(self) -> torch.Tensor:
         if self.train is None: raise AttributeError("sh0_t")
-        return self.train.sh0_t
+        return self.train.params["sh0"]
 
     # save_inria_ply stays callable as a method for train_and_view.py.
     save_inria_ply = staticmethod(save_inria_ply)
@@ -431,10 +498,29 @@ class SplatTrainer:
 
     def prepare_and_init(self, video: Path, max_frames: int,
                          confidence: float, remove_sky: bool,
-                         name: str | None = None) -> None:
+                         name: str | None = None,
+                         sh_max_deg: int = 0,
+                         lpips_weight: float = 0.0,
+                         l1_weight: float = 1.0,
+                         sh_ramp_steps_per_band: int = 1000,
+                         use_densify: bool = False,
+                         densify_total_steps: int = 7000) -> None:
         """One-call init: preprocess video (skipped if same video already
         processed), build initial gaussians, build train state, and publish
-        to the scene."""
+        to the scene.
+
+        `sh_max_deg` > 0 enables SH-band progression (0→sh_max_deg) ramped
+        every `sh_ramp_steps_per_band` steps. `lpips_weight` > 0 adds an
+        LPIPS perceptual term to the L1 loss. `use_densify` wires up the
+        gsplat clone/split/prune strategy; `densify_total_steps` sets when
+        the strategy stops refining (refine_stop_iter = total - 500)."""
+        self.sh_max_deg = int(sh_max_deg)
+        self.lpips_weight = float(lpips_weight)
+        self.l1_weight = float(l1_weight)
+        self.sh_ramp_steps_per_band = max(1, int(sh_ramp_steps_per_band))
+        self.use_densify = bool(use_densify)
+        self.densify_total_steps = int(densify_total_steps)
+
         video = Path(video)
         signature = (video, int(max_frames))
         out_dir = self.output_root / (name or video.stem)
@@ -445,26 +531,79 @@ class SplatTrainer:
             self.data, self.max_points,
             confidence=confidence, remove_sky=remove_sky,
         )
-        self.train = _make_train_state(self.init)
+        self.train = _make_train_state(
+            self.init, sh_max_deg=self.sh_max_deg,
+            use_densify=self.use_densify,
+            densify_total_steps=self.densify_total_steps,
+        )
+        # Cap each gaussian axis-scale at `scale_clamp_voxel_mult * voxel`.
+        # Clamping is applied after each optimizer step in log-space.
+        self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
         self._publish_to_scene()
         self._initialized = True
+
+    def _current_sh_degree(self) -> int:
+        """SH band currently being optimized. Ramps 0→sh_max_deg, one band
+        every `sh_ramp_steps_per_band` steps."""
+        if self.sh_max_deg <= 0:
+            return 0
+        return min(self.sh_max_deg, self._step_count // self.sh_ramp_steps_per_band)
+
+    def _get_lpips_net(self) -> torch.nn.Module:
+        """Lazy-construct the LPIPS net the first time it's needed. Params
+        are frozen — we only use it as a fixed perceptual metric."""
+        if self._lpips_net is None:
+            import lpips as _lpips_pkg
+            net = _lpips_pkg.LPIPS(net="vgg", verbose=False).to(self.device).eval()
+            for p in net.parameters():
+                p.requires_grad_(False)
+            self._lpips_net = net
+        return self._lpips_net
+
+    def set_scale_clamp(self, voxel_mult: float) -> None:
+        """Update the per-axis scale cap as a multiple of the init voxel edge.
+        Takes effect on the next `step()`. Safe to call before init (the cap
+        will be re-derived from `init.voxel` once prepare_and_init runs)."""
+        self.scale_clamp_voxel_mult = float(voxel_mult)
+        if self.init is not None:
+            self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
+
+    def save_current(self, path: str) -> None:
+        """Save the current splats as an Inria-format PLY. Concatenates
+        sh0 + shN automatically when higher SH bands are trained."""
+        if self.train is None:
+            return
+        p = self.train.params
+        sh_all = (p["sh0"] if p["shN"].shape[1] == 0
+                  else torch.cat([p["sh0"], p["shN"]], dim=1))
+        save_inria_ply(path, p["means"], sh_all,
+                       p["scales"], p["opacities"], p["quats"])
 
     def refine_gaussians(self, steps: int) -> None:
         """Headless CLI training loop. Requires `prepare_and_init` first."""
         if self.train is None or self.data is None:
             raise RuntimeError("call prepare_and_init() before refine_gaussians()")
 
-        pbar = tqdm(range(steps), desc="L1 Loss gaussians", unit="step")
+        tag, desc = "splats", "training"
+        pbar = tqdm(range(steps), desc=desc, unit="step")
         for s in pbar:
             loss = self.step()
             if s % 100 == 0:
-                pbar.set_postfix(loss=f"{loss:.4f}")
+                pbar.set_postfix(
+                    loss=f"{loss:.4f}",
+                    M=int(self.train.params["means"].shape[0]),
+                    sh=self._current_sh_degree(),
+                )
 
         torch.set_grad_enabled(False)
-        t = self.train
-        save_inria_ply("splats_v1_l1.ply", t.means_t, t.sh0_t, t.log_s_t, t.logit_o_t, t.quats_t)
-        print("Saved splats_v1_l1.ply")
-        render_and_show(self.data, t.means_t, t.quats_t, t.log_s_t, t.logit_o_t, t.sh0_t, tag="v1 L1 1k")
+        self.save_current(f"{tag}.ply")
+        print(f"Saved {tag}.ply")
+        # Snapshot for render_and_show — mirrors save_current's sh-cat logic.
+        p = self.train.params
+        sh_all = (p["sh0"] if p["shN"].shape[1] == 0
+                  else torch.cat([p["sh0"], p["shN"]], dim=1))
+        render_and_show(self.data, p["means"], p["quats"],
+                        p["scales"], p["opacities"], sh_all, tag=tag)
 
     def reset(self) -> None:
         """Tear down trainable state and clear the scene. Caller is
@@ -493,13 +632,27 @@ class SplatTrainer:
             time.sleep(0.05)   # avoid busy-spin if thread is resumed early
             return 0.0
         t, d, i = self.train, self.data, self.init
+        p = t.params
         idx = int(torch.randint(0, d.N, (1,)).item())
-        out, _, _ = rasterization(
-            t.means_t, t.quats_t, torch.exp(t.log_s_t), torch.sigmoid(t.logit_o_t),
-            t.sh0_t, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
-            sh_degree=0, packed=False)
 
-        diff = (out[0] - d.rgb[idx]).abs()                  # (H,W,3)
+        # SH degree ramps 0→sh_max_deg. `cat` with a (M,0,3) shN is a no-op,
+        # so the same path covers sh_max_deg=0.
+        cur_sh = self._current_sh_degree()
+        sh_all = torch.cat([p["sh0"], p["shN"]], dim=1)
+
+        out, _, info = rasterization(
+            p["means"], p["quats"],
+            torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
+            sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
+            sh_degree=cur_sh, packed=False)
+        pred = out[0]                                       # (H,W,3) float
+
+        if t.strategy is not None:
+            t.strategy.step_pre_backward(p, t.opts, t.strategy_state,
+                                         self._step_count, info)
+
+        # Masked L1. The mask excludes sky / low-confidence-depth pixels.
+        diff = (pred - d.rgb[idx]).abs()
         mask = i.train_mask[idx].unsqueeze(-1)              # (H,W,1) bool
         n_kept = int(mask.sum().item())
         if n_kept == 0:
@@ -508,8 +661,33 @@ class SplatTrainer:
             if self.scene is not None:
                 self.scene.record_step(self._step_count, 0.0)
             return 0.0
-        loss = (diff * mask).sum() / (n_kept * 3)
-        t.opt.zero_grad(); loss.backward(); t.opt.step()
+        l1 = (diff * mask).sum() / (n_kept * 3)
+        loss = self.l1_weight * l1
+
+        # LPIPS over the full frame (the mask only weights L1; lpips wants a
+        # spatially-contiguous image and per-pixel masking it makes no sense).
+        if self.lpips_weight > 0.0:
+            net = self._get_lpips_net()
+            pred_bchw = pred.permute(2, 0, 1)[None]
+            gt_bchw   = d.rgb[idx].permute(2, 0, 1)[None]
+            lp = net(pred_bchw * 2 - 1, gt_bchw * 2 - 1).mean()
+            loss = loss + self.lpips_weight * lp
+
+        loss.backward()
+        for o in t.opts.values():
+            o.step()
+            o.zero_grad(set_to_none=True)
+
+        if t.strategy is not None:
+            t.strategy.step_post_backward(p, t.opts, t.strategy_state,
+                                          self._step_count, info, packed=False)
+
+        # Cap gaussian scales at `scale_clamp_voxel_mult * voxel`. In-place
+        # clamp under no_grad. After densify the Parameter object may be a
+        # fresh tensor with new M; the dict lookup picks up the latest.
+        if self._log_scale_max is not None:
+            with torch.no_grad():
+                p["scales"].clamp_(max=self._log_scale_max)
 
         loss_f = float(loss.item())
         self._step_count += 1
@@ -522,20 +700,26 @@ class SplatTrainer:
     def _publish_to_scene(self) -> None:
         """Push current splat params into the shared SceneState. Activates
         pre-activation working tensors to match the post-activation
-        convention the renderer expects (see PlyLoader at viewer.py:284-291)."""
+        convention the renderer expects (see PlyLoader at viewer.py:284-291).
+
+        Publishes the full SH tensor. `scene.sh_degree` is set to the trained
+        capacity `sh_max_deg`; unfilled bands are zero so the renderer using
+        them has no visual effect until the ramp catches up. `num_splats`
+        reflects the current count even after densify changes M."""
         if self.scene is None or self.train is None:
             return
-        t = self.train
+        p = self.train.params
         with torch.no_grad():
-            means = t.means_t.detach()
-            quats = F.normalize(t.quats_t.detach(), dim=-1)
-            scales = torch.exp(t.log_s_t.detach())
-            opacities = torch.sigmoid(t.logit_o_t.detach())
-            sh = t.sh0_t.detach()                            # (M, 1, 3)
+            means = p["means"].detach()
+            quats = F.normalize(p["quats"].detach(), dim=-1)
+            scales = torch.exp(p["scales"].detach())
+            opacities = torch.sigmoid(p["opacities"].detach())
+            sh = (p["sh0"].detach() if p["shN"].shape[1] == 0
+                  else torch.cat([p["sh0"].detach(), p["shN"].detach()], dim=1))
         with self.scene.write() as s:
             s.means, s.quats, s.scales = means, quats, scales
             s.opacities, s.sh = opacities, sh
-            s.sh_degree = 0
+            s.sh_degree = int(self.sh_max_deg)
             s.num_splats = int(means.shape[0])
             s.splat_version += 1
 
@@ -560,6 +744,14 @@ def main() -> None:
     p.add_argument("--confidence_quantile", type=float, default=0.6,
                    help="Percentile to keep in depth confidence")
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--sh-max-deg", type=int, default=0,
+                   help="0 = L1-only (v1). >0 enables SH-band progression 0→N.")
+    p.add_argument("--lpips-weight", type=float, default=0.0,
+                   help="LPIPS perceptual weight added to L1 (0 disables).")
+    p.add_argument("--densify", type=int, default=0,
+                   help="1 enables gsplat DefaultStrategy clone/split/prune (v3).")
+    p.add_argument("--densify-total-steps", type=int, default=7000,
+                   help="Total steps the densify schedule plans for (sets refine_stop_iter).")
     args = p.parse_args()
 
     #DEBUGGING
@@ -578,6 +770,10 @@ def main() -> None:
         confidence=args.confidence_quantile,
         remove_sky=(args.remove_sky != 0),
         name=args.name,
+        sh_max_deg=args.sh_max_deg,
+        lpips_weight=args.lpips_weight,
+        use_densify=(args.densify != 0),
+        densify_total_steps=args.densify_total_steps,
     )
     trainer.refine_gaussians(args.steps)
 
