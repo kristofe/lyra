@@ -22,6 +22,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+vipe_outputs/
+*.pdf
+*.ply
+
 
 # claude api
 .claude/settings.json

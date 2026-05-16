@@ -20,6 +20,7 @@ Remote use:
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import threading
 import time
@@ -42,6 +43,100 @@ from training import TrainingControl  # noqa: E402
 
 
 SH_C0 = 0.28209479177387814  # band-0 SH normalization (gsplat / Inria convention)
+
+
+# --------------------------------------------------------------------------- #
+# Log buffer (stdout/stderr → GUI mirror)
+# --------------------------------------------------------------------------- #
+
+
+class LogBuffer:
+    """Tee sys.stdout/sys.stderr to the real terminal *and* a ring buffer.
+
+    Drained from the pump loop into a viser HTML widget so users see training
+    output in the browser without watching the terminal.
+    """
+
+    def __init__(self, maxlines: int = 200) -> None:
+        self._lines: "collections.deque[str]" = collections.deque(maxlen=maxlines)
+        self._lock = threading.Lock()
+        self._dirty = True  # force one initial push so the widget shows boot lines
+        self._orig_stdout = _sys.stdout
+        self._orig_stderr = _sys.stderr
+        self._partial = ""  # carry-over for writes that don't end in '\n'
+
+    def install(self) -> None:
+        _sys.stdout = self  # type: ignore[assignment]
+        _sys.stderr = self  # type: ignore[assignment]
+
+    def uninstall(self) -> None:
+        _sys.stdout = self._orig_stdout
+        _sys.stderr = self._orig_stderr
+
+    def write(self, text: str) -> int:
+        try:
+            self._orig_stdout.write(text)
+        except Exception:
+            pass
+        if not text:
+            return 0
+        with self._lock:
+            buf = self._partial + text
+            if buf.endswith("\n"):
+                complete, self._partial = buf, ""
+            else:
+                last_nl = buf.rfind("\n")
+                if last_nl == -1:
+                    self._partial = buf
+                    return len(text)
+                complete = buf[: last_nl + 1]
+                self._partial = buf[last_nl + 1 :]
+            for line in complete.splitlines():
+                if line:
+                    self._lines.append(line)
+            self._dirty = True
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._orig_stdout.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def drain_html(self) -> str | None:
+        """Returns new HTML if dirty since last drain, else None."""
+        with self._lock:
+            if not self._dirty:
+                return None
+            self._dirty = False
+            lines = list(self._lines)
+        escaped = "\n".join(
+            line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            for line in lines
+        )
+        if not escaped:
+            escaped = "(no output yet)"
+        # viser inserts our string with React's dangerouslySetInnerHTML, so
+        # standard HTML event attributes on parsed elements still fire. A 1x1
+        # transparent <img> with onload scrolls the wrapper to the bottom on
+        # every content update — keeps the newest line visible without JS.
+        scroll_pixel = (
+            '<img src="data:image/gif;base64,'
+            'R0lGODlhAQABAAAAACw=" '
+            'style="display:block;width:0;height:0;" '
+            'onload="this.parentElement&&'
+            '(this.parentElement.scrollTop=this.parentElement.scrollHeight)">'
+        )
+        return (
+            '<div style="height:200px;overflow-y:auto;background:#111;'
+            'color:#ccc;font-family:monospace;font-size:11px;line-height:1.3;'
+            'padding:6px;border-radius:4px;white-space:pre-wrap;'
+            'word-break:break-all;">'
+            f"{escaped}{scroll_pixel}</div>"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +501,11 @@ class SceneState:
         # Bumped by anything that swaps the splat tensors; the GUI pump
         # watches this so live-training publishes trigger a re-render.
         self.splat_version: int = 0
+        # Mesh tensors (populated by mesher.generate_mesh)
+        self.mesh_verts: np.ndarray | None = None     # (V, 3) float32
+        self.mesh_faces: np.ndarray | None = None     # (F, 3) int32
+        self.mesh_normals: np.ndarray | None = None   # (V, 3) float32
+        self.mesh_colors: np.ndarray | None = None    # (V, 3) float32 RGB or None
 
     @contextmanager
     def read(self):
@@ -655,7 +755,13 @@ class ViewerApp:
         resetter: "Callable[[], None] | None" = None,
         default_init_args: dict | None = None,
         on_scale_mult_change: "Callable[[float], None] | None" = None,
+        trainer: "object | None" = None,
     ) -> None:
+        # Install the stdout/stderr mirror before anything in __init__ prints,
+        # so the GUI log captures the full boot sequence.
+        self._log_buf = LogBuffer()
+        self._log_buf.install()
+
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_str)
 
@@ -733,6 +839,12 @@ class ViewerApp:
         # re-passing the data, and so we can clear/rebuild on each new init.
         self._train_cam_payload: dict | None = None
         self._train_cam_names: list[str] = []
+
+        # Mesh generation state (Phase 4+)
+        self._mesh_thread: threading.Thread | None = None
+        self._mesh_handle = None
+        self._mesh_wire_handle = None
+        self._trainer_ref = trainer
 
         self._build_gui()
         # The pump watches splat_version (live training publishes) AND drives
@@ -819,14 +931,322 @@ class ViewerApp:
                     float(self.gui_init_scale_mult.value)
                 )
             )
+        # Add mesh panel after init controls
+        self._build_mesh_panel()
+
+    def _build_mesh_panel(self) -> None:
+        """Mesh generation controls (Phase 4)."""
+        with self.server.gui.add_folder("Mesh"):
+            self.gui_mesh_mode = self.server.gui.add_dropdown(
+                "mode",
+                options=["tsdf", "dlnr"],
+                initial_value="dlnr",
+                hint="TSDF (soft alpha) or DLNR (stereo depth, colored)",
+            )
+            self.gui_mesh_ncams = self.server.gui.add_number(
+                "cameras",
+                initial_value=96,
+                min=8, max=192, step=1,
+                hint="Fibonacci dome camera count (more = better coverage)",
+            )
+            self.gui_mesh_density = self.server.gui.add_slider(
+                "density",
+                initial_value=0.02,
+                min=0.005, max=0.05, step=0.001,
+                hint="Truncation margin = density * scene_diag (smaller = denser mesh)",
+            )
+            self.gui_mesh_shell = self.server.gui.add_slider(
+                "shell_thickness",
+                initial_value=6.0,
+                min=3.0, max=10.0, step=0.5,
+                hint="voxel_size = truncation_margin / shell (higher = finer voxels)",
+            )
+            self.gui_mesh_alpha = self.server.gui.add_slider(
+                "alpha_thresh",
+                initial_value=0.5,
+                min=0.1, max=0.9, step=0.1,
+                hint="Drop pixels with alpha below this threshold",
+            )
+            self.gui_mesh_btn = self.server.gui.add_button("Generate Mesh")
+            self.gui_mesh_bake_size = self.server.gui.add_dropdown(
+                "tex_size",
+                options=["512", "1024", "2048", "4096"],
+                initial_value="2048",
+                hint="Resolution of baked texture (PNG side length)",
+            )
+            self.gui_mesh_bake_mode = self.server.gui.add_dropdown(
+                "bake_mode",
+                options=["splats", "vertex_colors"],
+                initial_value="splats",
+                hint="splats = photogrammetric (high detail); vertex_colors = fast smooth",
+            )
+            self.gui_mesh_bake_btn = self.server.gui.add_button("Bake Texture")
+            self.gui_mesh_lighting = self.server.gui.add_checkbox(
+                "lighting",
+                initial_value=False,
+                hint="Toggle scene lighting (off = unlit, matches splat colors)",
+            )
+            self.gui_mesh_wireframe = self.server.gui.add_checkbox(
+                "wireframe",
+                initial_value=False,
+                hint="Render mesh as wireframe instead of solid",
+            )
+            self.gui_mesh_status = self.server.gui.add_markdown("_No mesh_")
+        self.gui_mesh_btn.on_click(lambda _ev: self._on_mesh_click())
+        self.gui_mesh_bake_btn.on_click(lambda _ev: self._on_bake_click())
+        self.gui_mesh_wireframe.on_update(lambda _ev: self._on_wireframe_toggle())
+        self.gui_mesh_lighting.on_update(lambda _ev: self._on_lighting_toggle())
+        # Apply initial lighting state
+        self._on_lighting_toggle()
+
+    def _on_mesh_click(self) -> None:
+        """Run mesh generation on main thread (required for DLNR signal handling)."""
+        if self._trainer_ref is None or self._trainer_ref.data is None:
+            self.gui_mesh_status.content = "_Init first_"
+            return
+        self.gui_mesh_status.content = "_Running…_"
+        self._run_mesh()
+
+    def _run_mesh(self) -> None:
+        """Generate mesh from current trainer state."""
+        try:
+            from mesher import generate_mesh
+            import torch.nn.functional as F
+
+            t = self._trainer_ref
+            if t is None or t.data is None:
+                self.gui_mesh_status.content = "_Error: trainer not ready_"
+                return
+
+            with torch.no_grad():
+                means = t.means_t.detach()
+                quats = F.normalize(t.quats_t.detach(), dim=-1)
+                scales = torch.exp(t.log_s_t.detach())
+                opacities = torch.sigmoid(t.logit_o_t.detach())
+                # Get full SH: DC + higher-order bands
+                p = t.train.params
+                sh = torch.cat([p["sh0"], p["shN"]], dim=1).detach()
+
+            def progress(i, n):
+                self.gui_mesh_status.content = f"_Cam {i}/{n}_"
+
+            # Determine output path for mesh files (PLY/OBJ/MTL/PNG)
+            out_path = None
+            if hasattr(t, 'output_root') and hasattr(t, 'name'):
+                out_dir = Path(t.output_root) / t.name
+                out_path = out_dir / "mesh"
+
+            result = generate_mesh(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                sh=sh,
+                device=str(means.device),
+                mode=self.gui_mesh_mode.value,
+                n_cams=int(self.gui_mesh_ncams.value),
+                density=float(self.gui_mesh_density.value),
+                shell_thickness=float(self.gui_mesh_shell.value),
+                alpha_thresh=float(self.gui_mesh_alpha.value),
+                bake_texture=False,
+                out_path=out_path,
+                progress_cb=progress,
+            )
+
+            # Persist the raw mesh so we can bake textures later
+            self._last_mesh_result = result
+            self._last_mesh_out_path = out_path
+
+            # Store in scene under lock
+            with self.scene._lock:
+                self.scene.mesh_verts = result["verts"]
+                self.scene.mesh_faces = result["faces"]
+                self.scene.mesh_normals = result["normals"]
+                self.scene.mesh_colors = result.get("colors", None)
+
+            # Push to viser (calls add_mesh_simple or updates existing)
+            self._push_mesh_to_viser(result)
+
+            v, f = result["verts"].shape[0], result["faces"].shape[0]
+            self.gui_mesh_status.content = f"_Done: {v:,}v {f:,}f_"
+
+        except Exception as e:
+            import traceback
+            self.gui_mesh_status.content = f"_Error: {str(e)}_"
+            traceback.print_exc()
+
+    def _on_bake_click(self) -> None:
+        """Bake the last mesh into a texture and re-display the textured mesh."""
+        try:
+            res = getattr(self, "_last_mesh_result", None)
+            if res is None:
+                self.gui_mesh_status.content = "_Generate a mesh first_"
+                return
+
+            tex_size = int(self.gui_mesh_bake_size.value)
+            mode = self.gui_mesh_bake_mode.value
+            out_path = getattr(self, "_last_mesh_out_path", None)
+
+            def progress(i, n):
+                self.gui_mesh_status.content = f"_Baking {mode} {i}/{n}…_"
+
+            if mode == "splats":
+                from mesher import bake_texture_from_splats
+                import torch.nn.functional as F
+
+                t = self._trainer_ref
+                if t is None or t.data is None:
+                    self.gui_mesh_status.content = "_Splat bake needs a trainer_"
+                    return
+
+                with torch.no_grad():
+                    means = t.means_t.detach()
+                    quats = F.normalize(t.quats_t.detach(), dim=-1)
+                    scales = torch.exp(t.log_s_t.detach())
+                    opacities = torch.sigmoid(t.logit_o_t.detach())
+                    p = t.train.params
+                    sh = torch.cat([p["sh0"], p["shN"]], dim=1).detach()
+
+                self.gui_mesh_status.content = f"_Baking splats → {tex_size}px texture…_"
+                baked = bake_texture_from_splats(
+                    means=means, quats=quats, scales=scales, opacities=opacities, sh=sh,
+                    verts=res["verts"], faces=res["faces"],
+                    tex_size=tex_size,
+                    n_cams=int(self.gui_mesh_ncams.value),
+                    image_size=1024,  # per-camera render resolution
+                    device=str(means.device),
+                    out_path=out_path,
+                    progress_cb=progress,
+                )
+            else:
+                # Per-vertex color bake (only works if colors present)
+                from mesher import bake_mesh_texture
+                if res.get("colors") is None:
+                    self.gui_mesh_status.content = "_vertex_colors bake needs a DLNR mesh_"
+                    return
+                self.gui_mesh_status.content = f"_Baking vertex colors → {tex_size}px texture…_"
+                baked = bake_mesh_texture(
+                    verts=res["verts"], faces=res["faces"], colors=res["colors"],
+                    tex_size=tex_size, out_path=out_path,
+                )
+
+            res["uv"] = baked["uv"]
+            res["tex_image"] = baked["tex_image"]
+            self._push_mesh_to_viser(res)
+            self.gui_mesh_status.content = f"_Baked {mode} ({tex_size}px)_"
+
+        except Exception as e:
+            import traceback
+            self.gui_mesh_status.content = f"_Bake error: {str(e)}_"
+            traceback.print_exc()
+
+    def _push_mesh_to_viser(self, result: dict) -> None:
+        """Add or update mesh in viser scene."""
+        if self._mesh_handle is not None:
+            self._mesh_handle.remove()
+        if self._mesh_wire_handle is not None:
+            self._mesh_wire_handle.remove()
+            self._mesh_wire_handle = None
+
+        verts = result["verts"]
+        faces = result["faces"]
+        uv = result.get("uv", None)
+        tex_image = result.get("tex_image", None)
+        colors = result.get("colors", None)
+
+        if uv is not None and tex_image is not None:
+            # Textured mesh — duplicate vertices per face corner so UVs are per-corner
+            import trimesh
+            tri_verts = verts[faces].reshape(-1, 3)             # (F*3, 3)
+            tri_faces = np.arange(len(tri_verts)).reshape(-1, 3)
+            tri_uv = uv.reshape(-1, 2)                          # (F*3, 2)
+            mesh = trimesh.Trimesh(vertices=tri_verts, faces=tri_faces, process=False)
+            from trimesh.visual.material import PBRMaterial
+            material = PBRMaterial(
+                baseColorFactor=[0.0, 0.0, 0.0, 1.0],
+                emissiveTexture=tex_image,
+                emissiveFactor=[1.0, 1.0, 1.0],
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                doubleSided=True,
+            )
+            mesh.visual = trimesh.visual.TextureVisuals(
+                uv=tri_uv, image=tex_image, material=material,
+            )
+            self._mesh_handle = self.server.scene.add_mesh_trimesh(
+                name="/mesh", mesh=mesh,
+                visible=(self.display_mode == "mesh"),
+            )
+        elif colors is not None:
+            # DLNR mesh with per-vertex colors (no texture baked yet)
+            import trimesh
+            rgba = np.column_stack([
+                (colors.clip(0, 1) * 255).astype(np.uint8),
+                np.full(len(colors), 255, dtype=np.uint8),
+            ])
+            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            mesh.visual.vertex_colors = rgba
+            self._mesh_handle = self.server.scene.add_mesh_trimesh(
+                name="/mesh", mesh=mesh,
+                visible=(self.display_mode == "mesh"),
+            )
+        else:
+            # TSDF mesh — grey
+            self._mesh_handle = self.server.scene.add_mesh_simple(
+                name="/mesh",
+                vertices=verts, faces=faces,
+                color=(200, 200, 200),
+                visible=(self.display_mode == "mesh"),
+            )
+
+        # Optional wireframe overlay on top of the colored mesh
+        if getattr(self, "gui_mesh_wireframe", None) is not None and self.gui_mesh_wireframe.value:
+            self._mesh_wire_handle = self.server.scene.add_mesh_simple(
+                name="/mesh_wire",
+                vertices=verts, faces=faces,
+                color=(0, 0, 0),
+                wireframe=True,
+                visible=(self.display_mode == "mesh"),
+            )
+
+    def _on_lighting_toggle(self) -> None:
+        """Enable or disable the scene's default lights."""
+        try:
+            self.server.scene.configure_default_lights(
+                enabled=bool(self.gui_mesh_lighting.value),
+                cast_shadow=False,
+            )
+        except Exception as e:
+            print(f"lighting toggle failed: {e}")
+
+    def _on_wireframe_toggle(self) -> None:
+        """Add/remove wireframe overlay on the currently-displayed mesh."""
+        res = getattr(self, "_last_mesh_result", None)
+        if res is None or self._mesh_handle is None:
+            return
+
+        if self.gui_mesh_wireframe.value:
+            if self._mesh_wire_handle is not None:
+                self._mesh_wire_handle.remove()
+            self._mesh_wire_handle = self.server.scene.add_mesh_simple(
+                name="/mesh_wire",
+                vertices=res["verts"], faces=res["faces"],
+                color=(0, 0, 0),
+                wireframe=True,
+                visible=(self.display_mode == "mesh"),
+            )
+        else:
+            if self._mesh_wire_handle is not None:
+                self._mesh_wire_handle.remove()
+                self._mesh_wire_handle = None
 
     def _build_inspect_panel(self) -> None:
-        # Top-level: Display toggle (splats vs point clouds).
+        # Top-level: Display toggle (splats vs point clouds vs mesh).
         self.gui_display = self.server.gui.add_dropdown(
             "Display",
-            options=("splats", "points"),
+            options=("splats", "points", "mesh"),
             initial_value="splats",
-            hint="Switch the whole scene between splat rasterization and point clouds.",
+            hint="Switch the whole scene between splat rasterization, point clouds, and mesh.",
         )
         self.gui_display.on_update(lambda _ev: self._apply_display_mode())
 
@@ -931,12 +1351,6 @@ class ViewerApp:
         # pump) can nest under it instead of landing at the top level.
         self._point_clouds_folder = self.server.gui.add_folder("Point Clouds")
         with self._point_clouds_folder:
-            self.global_size_mult_handle = self.server.gui.add_slider(
-                "global_size_mult", min=0.01, max=100.0, step=0.01, initial_value=1.0
-            )
-            self.global_size_mult_handle.on_update(
-                lambda _ev: self._push_all_visible_layers()
-            )
             for name in list(self.scene.point_clouds.keys()):
                 self._build_layer_gui(name)
 
@@ -967,15 +1381,32 @@ class ViewerApp:
         return str(self.gui_display.value)
 
     def _apply_display_mode(self) -> None:
-        if self.display_mode == "splats":
-            for name in list(self.scene.point_clouds.keys()):
-                self._remove_pushed(name)
-            for client in self.server.get_clients().values():
-                self._render_for(client)
-        else:
+        mode = self.display_mode
+        if mode == "mesh":
+            # Hide splats background, hide point clouds, show mesh
             for client in self.server.get_clients().values():
                 client.scene.set_background_image(None)
-            self._push_all_visible_layers()
+            for name in list(self.scene.point_clouds.keys()):
+                self._remove_pushed(name)
+            if self._mesh_handle is not None:
+                self._mesh_handle.visible = True
+            if self._mesh_wire_handle is not None:
+                self._mesh_wire_handle.visible = True
+        else:
+            # Hide mesh in non-mesh modes
+            if self._mesh_handle is not None:
+                self._mesh_handle.visible = False
+            if self._mesh_wire_handle is not None:
+                self._mesh_wire_handle.visible = False
+            if mode == "splats":
+                for name in list(self.scene.point_clouds.keys()):
+                    self._remove_pushed(name)
+                for client in self.server.get_clients().values():
+                    self._render_for(client)
+            else:  # "points"
+                for client in self.server.get_clients().values():
+                    client.scene.set_background_image(None)
+                self._push_all_visible_layers()
 
     # ---- Per-layer GUI ----------------------------------------------- #
 
@@ -984,8 +1415,8 @@ class ViewerApp:
         # Range slider relative to the layer's derived size — for DA3 scenes
         # this lands in a useful neighborhood instead of capping at 0.1.
         base = max(float(layer.point_size), 1e-4)
-        size_min = max(base * 0.01, 1e-5)
-        size_max = base * 100.0
+        size_min = max(base * 0.1, 1e-5)
+        size_max = base * 2.0
         size_step = max(base * 0.01, 1e-5)
         with self.server.gui.add_folder(name):
             visible = self.server.gui.add_checkbox("visible", initial_value=layer.visible)
@@ -1207,15 +1638,14 @@ class ViewerApp:
             uniform_color=tuple(int(c) for c in handles["uniform_color"].value),
         )
         colors = compute_colors(resolved)
-        size = resolved.point_size * float(self.global_size_mult_handle.value)
+        size = resolved.point_size
         viser_name = _viser_pc_name(name)
         try:
             bbox_min = resolved.points.min(axis=0)
             bbox_max = resolved.points.max(axis=0)
             print(
                 f"[push_layer {name}] N={len(resolved.points)} "
-                f"size={size:.5f} (layer={resolved.point_size:.5f} mult={float(self.global_size_mult_handle.value):.3f}) "
-                f"color_mode={resolved.color_mode} "
+                f"size={size:.5f} color_mode={resolved.color_mode} "
                 f"bbox_min={bbox_min} bbox_max={bbox_max} "
                 f"colors[0]={colors[0].tolist()}"
             )
@@ -1431,6 +1861,13 @@ class ViewerApp:
             self.gui_train_loss_plot = self.server.gui.add_plotly(
                 self._make_loss_figure([]), aspect=2.0
             )
+            with self.server.gui.add_folder("Log"):
+                self.gui_log = self.server.gui.add_html(
+                    self._log_buf.drain_html() or
+                    '<div style="height:200px;background:#111;color:#ccc;'
+                    'font-family:monospace;font-size:11px;padding:6px;'
+                    'border-radius:4px;">(waiting for output...)</div>'
+                )
 
         self.gui_train_resume.on_click(lambda _ev: self._on_resume_training())
         self.gui_train_pause.on_click(lambda _ev: self._on_pause_training())
@@ -1541,10 +1978,22 @@ class ViewerApp:
 
     def _pump_loop(self) -> None:
         last_plot_t = 0.0
+        last_log_t = 0.0
         last_splat_version = -1
         ctl = self.training_control
         while not self._pump_stop_event.is_set():
             time.sleep(0.1)  # 10 Hz readouts
+            # Log drain runs even before training is wired so the user sees
+            # boot/init output while just sitting on the Setup panel.
+            now = time.perf_counter()
+            if now - last_log_t >= 0.5:  # 2 Hz log push
+                last_log_t = now
+                try:
+                    html = self._log_buf.drain_html()
+                    if html is not None and hasattr(self, "gui_log"):
+                        self.gui_log.content = html
+                except Exception:
+                    pass
             if ctl is None:
                 continue
             with self.scene.read() as s:
@@ -1574,7 +2023,6 @@ class ViewerApp:
             except Exception:
                 # Server may have shut down; tolerate races on exit.
                 continue
-            now = time.perf_counter()
             if now - last_plot_t >= 0.5:  # 2 Hz plot
                 try:
                     self.gui_train_loss_plot.figure = self._make_loss_figure(history_snapshot)
@@ -1600,6 +2048,10 @@ class ViewerApp:
                     self.training_control.stop()
                 except Exception:
                     pass
+            try:
+                self._log_buf.uninstall()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #

@@ -118,6 +118,7 @@ def main() -> None:
         initializer=initializer,
         resetter=resetter,
         on_scale_mult_change=trainer.set_scale_clamp,
+        trainer=trainer,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,
