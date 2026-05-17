@@ -53,85 +53,15 @@ def generate_mesh(
         dict with "verts", "faces", "normals" (TSDF) or "normals"=None (DLNR)
         and "colors" (None for TSDF, (V,3) float for DLNR)
     """
-    import fvdb
-    from fvdb import Grid
-
     # Scene bounds
     bbmin = means.min(0).values
     bbmax = means.max(0).values
     scene_diag = float((bbmax - bbmin).norm())
     scene_center = 0.5 * (bbmin + bbmax)
 
-    # Invert activations to pre-activation form for fvdb.GaussianSplat3d
-    eps = 1e-6
-    opac_clamped = opacities.clamp(eps, 1 - eps)
-    logit_opacities = torch.log(opac_clamped / (1 - opac_clamped))
-    log_scales = torch.log(scales.clamp_min(eps))
-
-    # Extract DC and higher-order SH bands
-    sh0 = sh[:, :1, :].contiguous()
-    shN = sh[:, 1:, :].contiguous()
-
-    # Create fvdb model
-    model = fvdb.GaussianSplat3d.from_tensors(
-        means=means,
-        quats=quats,
-        log_scales=log_scales,
-        logit_opacities=logit_opacities,
-        sh0=sh0,
-        shN=shN,
-    )
-
-    # Fibonacci dome: N cameras on a hemisphere, y-down COLMAP convention
-    i = torch.arange(n_cams, device=device, dtype=torch.float32)
-    golden_ang = np.pi * (3 - np.sqrt(5))
-    elev_min_deg, elev_max_deg = 5.0, 70.0
-    s_min = float(np.sin(np.deg2rad(elev_min_deg)))
-    s_max = float(np.sin(np.deg2rad(elev_max_deg)))
-    sin_elev = s_min + (s_max - s_min) * (i + 0.5) / n_cams
-    cos_elev = torch.sqrt(torch.clamp(1 - sin_elev**2, min=0))
-    az = i * golden_ang
-    ring_radius = scene_diag * 0.8
-    offset = torch.stack(
-        [
-            cos_elev * torch.cos(az),
-            -sin_elev,
-            cos_elev * torch.sin(az),
-        ],
-        dim=-1,
-    )
-    cam_centers = scene_center + ring_radius * offset
-
-    # Poses: camera-to-world matrices
-    def look_at(eyes, target, world_up=torch.tensor([0., -1., 0.], device=device)):
-        fwd = target - eyes
-        fwd = fwd / fwd.norm(dim=-1, keepdim=True)
-        up_ref = world_up.expand_as(fwd).clone()
-        parallel = (fwd * up_ref).sum(-1, keepdim=True).abs() > 0.98
-        fallback = torch.tensor([1., 0., 0.], device=fwd.device).expand_as(fwd)
-        up_ref = torch.where(parallel, fallback, up_ref)
-        right = torch.cross(fwd, up_ref, dim=-1)
-        right = right / right.norm(dim=-1, keepdim=True)
-        up = torch.cross(right, fwd, dim=-1)
-        R_c2w = torch.stack([right, -up, fwd], dim=-1)
-        c2w = torch.eye(4, device=device).expand(len(eyes), 4, 4).clone()
-        c2w[:, :3, :3] = R_c2w
-        c2w[:, :3, 3] = eyes
-        return c2w
-
-    c2w = look_at(cam_centers, scene_center.expand_as(cam_centers))
-    w2c = torch.linalg.inv(c2w).contiguous()
-
-    # Intrinsics
-    fov = 60.0
-    fx = fy = 0.5 * W / np.tan(np.deg2rad(fov) * 0.5)
-    K = (
-        torch.tensor(
-            [[fx, 0, W / 2], [0, fy, H / 2], [0, 0, 1]], device=device, dtype=torch.float32
-        )
-        .expand(n_cams, 3, 3)
-        .contiguous()
-    )
+    # Build splat model + dome cameras via shared helpers
+    model = _build_splat_model(means, quats, scales, opacities, sh)
+    c2w, w2c, K = _build_dome_cameras(scene_center, scene_diag, n_cams, W, device)
 
     if mode == "tsdf":
         return _mesh_tsdf(
@@ -299,6 +229,92 @@ def _mesh_dlnr(model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
         # Restore original FileLock methods
         sfm_cache.FileLock.__enter__ = original_enter
         sfm_cache.FileLock.__exit__ = original_exit
+
+
+# -----------------------------------------------------------------------------
+# Shared helpers — used by generate_mesh AND bake_texture_from_splat_projection
+# -----------------------------------------------------------------------------
+
+def _build_splat_model(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    sh: torch.Tensor,
+):
+    """Invert activations + split SH, return fvdb.GaussianSplat3d."""
+    import fvdb
+    eps = 1e-6
+    opac_clamped = opacities.clamp(eps, 1 - eps)
+    logit_opacities = torch.log(opac_clamped / (1 - opac_clamped))
+    log_scales = torch.log(scales.clamp_min(eps))
+    sh0 = sh[:, :1, :].contiguous()
+    shN = sh[:, 1:, :].contiguous()
+    return fvdb.GaussianSplat3d.from_tensors(
+        means=means, quats=quats,
+        log_scales=log_scales, logit_opacities=logit_opacities,
+        sh0=sh0, shN=shN,
+    )
+
+
+def _build_dome_cameras(
+    scene_center: torch.Tensor,
+    scene_diag: float,
+    n_cams: int,
+    image_size: int,
+    device: str,
+    fov_deg: float = 60.0,
+    elev_min_deg: float = 5.0,
+    elev_max_deg: float = 70.0,
+    ring_radius_frac: float = 0.8,
+):
+    """Fibonacci hemisphere of cameras aimed at the scene center.
+
+    Returns (c2w, w2c, K) all torch.float32 on `device`.
+    `c2w`: (C, 4, 4); `w2c`: (C, 4, 4); `K`: (C, 3, 3).
+    """
+    i = torch.arange(n_cams, device=device, dtype=torch.float32)
+    golden_ang = np.pi * (3 - np.sqrt(5))
+    s_min = float(np.sin(np.deg2rad(elev_min_deg)))
+    s_max = float(np.sin(np.deg2rad(elev_max_deg)))
+    sin_elev = s_min + (s_max - s_min) * (i + 0.5) / n_cams
+    cos_elev = torch.sqrt(torch.clamp(1 - sin_elev**2, min=0))
+    az = i * golden_ang
+    ring_radius = scene_diag * ring_radius_frac
+    offset = torch.stack(
+        [cos_elev * torch.cos(az), -sin_elev, cos_elev * torch.sin(az)],
+        dim=-1,
+    )
+    cam_centers = scene_center + ring_radius * offset
+
+    def look_at(eyes, target, world_up=torch.tensor([0., -1., 0.], device=device)):
+        fwd = target - eyes
+        fwd = fwd / fwd.norm(dim=-1, keepdim=True)
+        up_ref = world_up.expand_as(fwd).clone()
+        parallel = (fwd * up_ref).sum(-1, keepdim=True).abs() > 0.98
+        fallback = torch.tensor([1., 0., 0.], device=fwd.device).expand_as(fwd)
+        up_ref = torch.where(parallel, fallback, up_ref)
+        right = torch.cross(fwd, up_ref, dim=-1)
+        right = right / right.norm(dim=-1, keepdim=True)
+        up = torch.cross(right, fwd, dim=-1)
+        R_c2w = torch.stack([right, -up, fwd], dim=-1)
+        c2w = torch.eye(4, device=device).expand(len(eyes), 4, 4).clone()
+        c2w[:, :3, :3] = R_c2w
+        c2w[:, :3, 3] = eyes
+        return c2w
+
+    c2w = look_at(cam_centers, scene_center.expand_as(cam_centers))
+    w2c = torch.linalg.inv(c2w).contiguous()
+    fx = fy = 0.5 * image_size / np.tan(np.deg2rad(fov_deg) * 0.5)
+    K = (
+        torch.tensor(
+            [[fx, 0, image_size / 2], [0, fy, image_size / 2], [0, 0, 1]],
+            device=device, dtype=torch.float32,
+        )
+        .expand(n_cams, 3, 3)
+        .contiguous()
+    )
+    return c2w, w2c, K
 
 
 def _save_ply(path: Path, verts: np.ndarray, faces: np.ndarray, normals: np.ndarray | None = None, colors: np.ndarray | None = None):
@@ -510,6 +526,311 @@ def bake_texture_from_splats(
         "uv": uvs,
         "tex_image": img_for_viser,
         "uv_verts": V_uv,                    # xatlas-unwrapped (for textured GLB)
+        "uv_faces": F_uv.astype(np.int32),
+        "per_vertex_uv": True,
+    }
+
+
+def bake_texture_from_splat_projection(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    sh: torch.Tensor,
+    tex_size: int = 2048,
+    target_faces: int = 100_000,
+    n_cams: int = 96,
+    image_size: int = 1024,
+    depth_tol_frac: float = 0.02,
+    device: str = "cuda",
+    out_path: Path | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> dict:
+    """Photogrammetric bake: per-texel multi-camera weighted average of splat RGB.
+
+    Same shell as bake_texture_from_splats (decimate → xatlas → gap-fill → save)
+    but replaces the barycentric vertex-color step with per-texel reprojection
+    into all dome cameras, weighted by face-normal alignment AND visibility
+    (rendered depth ≈ projected depth).
+
+    No silent fallback — texels not seen by any camera get gap-filled.
+    """
+    import sys, time
+    import xatlas
+    from scipy.ndimage import distance_transform_edt
+    from PIL import Image
+    from tqdm import tqdm
+
+    def _log(msg):
+        print(f"  splat-bake: {msg}", file=sys.stderr, flush=True)
+
+    def _stage(step, total, msg):
+        _log(msg)
+        if progress_cb:
+            progress_cb(step, total)
+
+    TOTAL = 100
+    t_total = time.perf_counter()
+    _stage(1, TOTAL,
+           f"[1/7] input: {len(verts):,} verts, {len(faces):,} faces, "
+           f"target={target_faces:,}, tex={tex_size}, n_cams={n_cams}, image_size={image_size}")
+
+    # ----- 1) Decimate (preserves vertex_colors via interp, but we don't use colors here) -----
+    _stage(3, TOTAL, f"[2/7] decimate to ~{target_faces:,} faces…")
+    t0 = time.perf_counter()
+    m = o3d.geometry.TriangleMesh()
+    m.vertices  = o3d.utility.Vector3dVector(verts.astype(np.float64))
+    m.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    n_in = len(faces)
+    if n_in > target_faces:
+        m = m.simplify_quadric_decimation(target_number_of_triangles=target_faces)
+    V = np.asarray(m.vertices, dtype=np.float32)
+    Faces = np.asarray(m.triangles, dtype=np.uint32)
+    _stage(8, TOTAL, f"      done in {time.perf_counter()-t0:.1f}s → "
+                     f"{len(Faces):,} faces, {len(V):,} verts")
+
+    # ----- 2) xatlas UV unwrap -----
+    _stage(10, TOTAL, f"[3/7] xatlas UV unwrap ({len(Faces):,} faces, CPU)…")
+    t0 = time.perf_counter()
+    vmap, F_uv, uvs = xatlas.parametrize(V, Faces)
+    V_uv = V[vmap]
+    uvs = uvs.astype(np.float32)
+    uv_min, uv_max = uvs.min(axis=0), uvs.max(axis=0)
+    if (uv_min < 0).any() or (uv_max > 1).any():
+        uvs = (uvs - uv_min) / np.maximum(uv_max - uv_min, 1e-8)
+    _stage(28, TOTAL, f"      done in {time.perf_counter()-t0:.1f}s → "
+                      f"{len(V):,} → {len(V_uv):,} verts after seam splits")
+
+    # ----- 3) Build splat model + dome cameras -----
+    _stage(30, TOTAL, f"[4/7] build splat model + dome cameras…")
+    bbmin = means.min(0).values
+    bbmax = means.max(0).values
+    scene_diag = float((bbmax - bbmin).norm())
+    scene_center = 0.5 * (bbmin + bbmax)
+    DEPTH_TOL = depth_tol_frac * scene_diag
+    _log(f"      scene_diag={scene_diag:.3f}  depth_tol={DEPTH_TOL:.4f}")
+    model = _build_splat_model(means, quats, scales, opacities, sh)
+    c2w, w2c, K = _build_dome_cameras(scene_center, scene_diag, n_cams, image_size, device)
+    cam_centers = c2w[:, :3, 3]                                       # (C, 3)
+    cam_fwd_world = c2w[:, :3, 2]                                     # (C, 3) — camera +Z in world
+
+    # ----- 4) Render dome RGB + depth -----
+    _stage(35, TOTAL, f"[5/7] render dome ({n_cams} cams × {image_size}²)…")
+    t0 = time.perf_counter()
+    cam_rgb = torch.zeros(n_cams, image_size, image_size, 3, dtype=torch.float32, device=device)
+    cam_depth = torch.zeros(n_cams, image_size, image_size, dtype=torch.float32, device=device)
+    for i in tqdm(range(n_cams), desc="  splat-bake: render", file=sys.stderr):
+        feat_depth, alpha = model.render_images_and_depths(
+            world_to_camera_matrices=w2c[i:i+1], projection_matrices=K[i:i+1],
+            image_width=image_size, image_height=image_size, near=0.0, far=1e10,
+        )
+        a = alpha[0, ..., 0].clamp_min(1e-10)
+        cam_rgb[i] = (feat_depth[0, ..., :3] / a.unsqueeze(-1)).float()
+        cam_depth[i] = (feat_depth[0, ..., -1] / a).float()
+    torch.cuda.synchronize()
+    _stage(50, TOTAL, f"      done in {time.perf_counter()-t0:.1f}s")
+
+    # ----- 5) Per-face chunked GPU rasterization with multi-camera weighted avg -----
+    _stage(52, TOTAL, f"[6/7] per-texel multi-cam projection ({len(F_uv):,} faces)…")
+    t0 = time.perf_counter()
+    F = len(F_uv)
+    V_uv_t = torch.from_numpy(V_uv.astype(np.float32)).to(device)
+    F_uv_t = torch.from_numpy(F_uv.astype(np.int64)).to(device)
+    tri_uv_t = torch.from_numpy((uvs[F_uv] * (tex_size - 1)).astype(np.float32)).to(device)  # (F,3,2) pixel coords
+    tri_verts = V_uv_t[F_uv_t]                                           # (F,3,3) 3D positions per corner
+
+    # Per-face normals (in world frame), normalized
+    e1 = tri_verts[:, 1] - tri_verts[:, 0]
+    e2 = tri_verts[:, 2] - tri_verts[:, 0]
+    tri_normal = torch.cross(e1, e2, dim=-1)
+    tri_normal = tri_normal / tri_normal.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    uv_min_t = tri_uv_t.min(dim=1).values
+    uv_max_t = tri_uv_t.max(dim=1).values
+
+    tex_t  = torch.zeros((tex_size, tex_size, 3), dtype=torch.float32, device=device)
+    mask_t = torch.zeros((tex_size, tex_size), dtype=torch.bool, device=device)
+
+    CHUNK = 1024  # smaller than vertex bake because each texel does C-camera work
+    n_chunks = (F + CHUNK - 1) // CHUNK
+    pbar = tqdm(range(n_chunks), desc="  splat-bake: chunks", file=sys.stderr)
+    for c_idx in pbar:
+        s, e = c_idx * CHUNK, min(F, (c_idx + 1) * CHUNK)
+        ch_size = e - s
+        ch_uv     = tri_uv_t[s:e]                       # (B, 3, 2)
+        ch_verts  = tri_verts[s:e]                      # (B, 3, 3)
+        ch_normal = tri_normal[s:e]                     # (B, 3)
+        ch_min    = uv_min_t[s:e]
+        ch_max    = uv_max_t[s:e]
+
+        xmin = ch_min[:, 0].clamp(0, tex_size - 1).floor().long()
+        xmax = ch_max[:, 0].clamp(0, tex_size - 1).ceil().long()
+        ymin = ch_min[:, 1].clamp(0, tex_size - 1).floor().long()
+        ymax = ch_max[:, 1].clamp(0, tex_size - 1).ceil().long()
+        bw = (xmax - xmin + 1).clamp_min(0)
+        bh = (ymax - ymin + 1).clamp_min(0)
+        W_pad = int(bw.max().item()) if ch_size > 0 else 0
+        H_pad = int(bh.max().item()) if ch_size > 0 else 0
+        if W_pad == 0 or H_pad == 0:
+            continue
+        pbar.set_postfix(pad=f"{H_pad}x{W_pad}", faces=f"{s}-{e}")
+
+        dx = torch.arange(W_pad, device=device).view(1, 1, W_pad)
+        dy = torch.arange(H_pad, device=device).view(1, H_pad, 1)
+        px_x = (xmin.view(ch_size, 1, 1) + dx).expand(ch_size, H_pad, W_pad).contiguous()
+        px_y = (ymin.view(ch_size, 1, 1) + dy).expand(ch_size, H_pad, W_pad).contiguous()
+        valid_pad = (dx < bw.view(ch_size, 1, 1)) & (dy < bh.view(ch_size, 1, 1))
+
+        # UV-space barycentric → (u_b, v_b, w_b)
+        uv0 = ch_uv[:, 0].view(ch_size, 1, 1, 2)
+        uv1 = ch_uv[:, 1].view(ch_size, 1, 1, 2)
+        uv2 = ch_uv[:, 2].view(ch_size, 1, 1, 2)
+        p = torch.stack([px_x.float(), px_y.float()], dim=-1)
+        v0v1 = uv1 - uv0
+        v0v2 = uv2 - uv0
+        v0p  = p - uv0
+        d00 = (v0v1 * v0v1).sum(-1)
+        d01 = (v0v1 * v0v2).sum(-1)
+        d11 = (v0v2 * v0v2).sum(-1)
+        d20 = (v0p * v0v1).sum(-1)
+        d21 = (v0p * v0v2).sum(-1)
+        denom = d00 * d11 - d01 * d01
+        denom_safe = torch.where(denom.abs() < 1e-12, torch.ones_like(denom), denom)
+        v_b = (d11 * d20 - d01 * d21) / denom_safe
+        w_b = (d00 * d21 - d01 * d20) / denom_safe
+        u_b = 1 - v_b - w_b
+        inside = (u_b >= -1e-5) & (v_b >= -1e-5) & (w_b >= -1e-5) & valid_pad & (denom.abs() >= 1e-12)
+        if not inside.any():
+            continue
+
+        # 3D position via barycentric of face vertices
+        vv0 = ch_verts[:, 0].view(ch_size, 1, 1, 3)
+        vv1 = ch_verts[:, 1].view(ch_size, 1, 1, 3)
+        vv2 = ch_verts[:, 2].view(ch_size, 1, 1, 3)
+        pos3d = u_b.unsqueeze(-1) * vv0 + v_b.unsqueeze(-1) * vv1 + w_b.unsqueeze(-1) * vv2
+        # → (B, H_pad, W_pad, 3)
+
+        # Project to ALL cameras at once. Output shape will be (B, H_pad, W_pad, C, ...)
+        # Memory: ch_size * H_pad * W_pad * n_cams * (3 + 2) * 4 bytes
+        pos_h = torch.cat([pos3d, torch.ones_like(pos3d[..., :1])], dim=-1)   # (B, H, W, 4)
+        # Reshape for batched matmul against (C, 4, 4) w2c
+        pos_h_flat = pos_h.unsqueeze(-2)                                       # (B, H, W, 1, 4)
+        # w2c: (C, 4, 4) — we want (B, H, W, C, 3) after projection
+        # Use einsum for clarity
+        # pos_cam = w2c @ pos_h, then take xyz: pos_cam[..., :3]
+        # einsum: "C i j, B H W j -> B H W C i"
+        pos_cam_all = torch.einsum("cij,bhwj->bhwci", w2c, pos_h)              # (B, H, W, C, 4)
+        pos_cam = pos_cam_all[..., :3]                                          # (B, H, W, C, 3)
+        z = pos_cam[..., 2]                                                     # (B, H, W, C)
+        ok_z = z > 1e-6
+        z_safe = z.clamp_min(1e-6).unsqueeze(-1)                                # (B, H, W, C, 1)
+        # Project via K (shared, take K[0] since all cameras have same intrinsics)
+        K0 = K[0]                                                                # (3, 3)
+        proj = torch.einsum("ij,bhwcj->bhwci", K0, (pos_cam / z_safe))           # (B, H, W, C, 3)
+        ix = proj[..., 0].round().long()
+        iy = proj[..., 1].round().long()
+        ok_xy = ok_z & (ix >= 0) & (ix < image_size) & (iy >= 0) & (iy < image_size)
+
+        # Depth visibility: rendered cam_depth at (cam, iy, ix) ≈ projected z
+        # We need cam_depth indexed by (cam, iy, ix). Build flat index.
+        # cam_depth shape: (C, H_img, W_img) → flat indexable
+        ix_c = ix.clamp(0, image_size - 1)
+        iy_c = iy.clamp(0, image_size - 1)
+        # cam index for each (b, h, w, c) is just c
+        c_idx_tensor = torch.arange(n_cams, device=device).view(1, 1, 1, n_cams).expand_as(ix_c)
+        rendered_z = cam_depth[c_idx_tensor, iy_c, ix_c]                         # (B, H, W, C)
+        visible = (rendered_z - z).abs() < DEPTH_TOL
+
+        # Per-camera weight: max(0, normal · (camera_center - pos3d).normalized())
+        # = max(0, dot(normal, view_vec_to_camera))
+        view_vec = cam_centers.view(1, 1, 1, n_cams, 3) - pos3d.unsqueeze(-2)    # (B, H, W, C, 3)
+        view_vec_n = view_vec / view_vec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        normal_b = ch_normal.view(ch_size, 1, 1, 1, 3)                           # (B, 1, 1, 1, 3)
+        weight = (view_vec_n * normal_b).sum(-1).clamp_min(0)                    # (B, H, W, C)
+        weight = weight * visible.float() * ok_xy.float() * inside.unsqueeze(-1).float()
+
+        # Sample RGB at (cam, iy_c, ix_c)
+        rgb_all = cam_rgb[c_idx_tensor, iy_c, ix_c]                              # (B, H, W, C, 3)
+        # Weighted average
+        wsum  = weight.sum(dim=-1)                                                # (B, H, W)
+        rgbsum = (rgb_all * weight.unsqueeze(-1)).sum(dim=-2)                    # (B, H, W, 3)
+        valid_texel = wsum > 1e-6
+        rgb_avg = torch.zeros_like(rgbsum)
+        rgb_avg[valid_texel] = rgbsum[valid_texel] / wsum[valid_texel].unsqueeze(-1)
+
+        # Scatter into texture (first-write-wins across chunks)
+        write_mask = inside & valid_texel
+        if write_mask.any():
+            flat_py = px_y[write_mask].clamp(0, tex_size - 1)
+            flat_px = px_x[write_mask].clamp(0, tex_size - 1)
+            already = mask_t[flat_py, flat_px]
+            to_write = ~already
+            if to_write.any():
+                rgb_to_write = rgb_avg[write_mask]
+                tex_t[flat_py[to_write], flat_px[to_write]] = rgb_to_write[to_write]
+                mask_t[flat_py[to_write], flat_px[to_write]] = True
+
+        torch.cuda.synchronize()
+        if progress_cb:
+            frac = 52 + int(28 * (c_idx + 1) / n_chunks)
+            progress_cb(frac, TOTAL)
+
+    tex = tex_t.cpu().numpy()
+    mask = mask_t.cpu().numpy()
+    cov = mask.mean()
+    _stage(82, TOTAL, f"      done in {time.perf_counter()-t0:.1f}s "
+                      f"({cov*100:.1f}% of texels covered by visible cameras)")
+
+    # ----- 6) Gap fill + sRGB encode -----
+    _stage(85, TOTAL, f"      gap-fill {(~mask).sum():,} unfilled texels…")
+    t0 = time.perf_counter()
+    if not mask.all():
+        _, inds = distance_transform_edt(~mask, return_indices=True)
+        tex = tex[inds[0], inds[1]]
+    _stage(88, TOTAL, f"      gap fill done in {time.perf_counter()-t0:.1f}s")
+
+    tex_srgb = _linear_to_srgb(tex)
+    tex_u8 = (np.clip(tex_srgb, 0, 1) * 255).astype(np.uint8)
+    img_for_obj   = Image.fromarray(tex_u8[::-1])
+    img_for_viser = Image.fromarray(tex_u8)
+
+    # ----- 7) Save OBJ + MTL + PNG -----
+    if out_path is not None:
+        _stage(92, TOTAL, f"[7/7] saving OBJ + MTL + PNG…")
+        t0 = time.perf_counter()
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        base = out_path.with_stem("mesh_splat_tex")
+        png_path = base.with_suffix(".png")
+        obj_path = base.with_suffix(".obj")
+        mtl_path = base.with_suffix(".mtl")
+        img_for_obj.save(str(png_path))
+        with open(obj_path, "w") as fh:
+            fh.write(f"mtllib {mtl_path.name}\n")
+            for vx in V_uv:
+                fh.write(f"v {vx[0]:.6f} {vx[1]:.6f} {vx[2]:.6f}\n")
+            for uv in uvs:
+                fh.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+            fh.write("usemtl mat0\n")
+            for tri in F_uv:
+                a, b, cc = int(tri[0]) + 1, int(tri[1]) + 1, int(tri[2]) + 1
+                fh.write(f"f {a}/{a} {b}/{b} {cc}/{cc}\n")
+        with open(mtl_path, "w") as fh:
+            fh.write(f"newmtl mat0\nKa 1 1 1\nKd 1 1 1\nmap_Kd {png_path.name}\n")
+        _log(f"      saved in {time.perf_counter()-t0:.1f}s")
+        _log(f"      TEXTURE → {png_path.resolve()}")
+        _log(f"      MESH    → {obj_path.resolve()}")
+
+    _stage(100, TOTAL, f"DONE: total bake time {time.perf_counter()-t_total:.1f}s")
+
+    return {
+        "verts": V,
+        "faces": Faces.astype(np.int32),
+        "uv": uvs,
+        "tex_image": img_for_viser,
+        "uv_verts": V_uv,
         "uv_faces": F_uv.astype(np.int32),
         "per_vertex_uv": True,
     }

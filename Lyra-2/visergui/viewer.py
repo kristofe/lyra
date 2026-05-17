@@ -954,6 +954,12 @@ class ViewerApp:
                 min=10_000, max=500_000, step=10_000,
                 hint="Decimate mesh to this many faces before UV unwrap & bake (notebook default 100k)",
             )
+            self.gui_mesh_bake_mode = self.server.gui.add_dropdown(
+                "bake_mode",
+                options=["vertex_colors", "splat_projection"],
+                initial_value="vertex_colors",
+                hint="vertex_colors = fast DLNR-color interp; splat_projection = high quality, samples splat RGB per texel from dome cameras",
+            )
             self.gui_mesh_bake_btn = self.server.gui.add_button("Bake Texture")
             self.gui_mesh_lighting = self.server.gui.add_checkbox(
                 "lighting",
@@ -1063,25 +1069,56 @@ class ViewerApp:
                 self.gui_mesh_status.content = "_Generate a mesh first_"
                 return
 
-            # Need a DLNR mesh with per-vertex colors
-            if res.get("colors") is None:
-                self.gui_mesh_status.content = "_Bake needs a DLNR mesh first_"
-                return
-
-            from mesher import bake_texture_from_splats
             tex_size = int(self.gui_mesh_bake_size.value)
             target_faces = int(self.gui_mesh_target_faces.value)
+            mode = self.gui_mesh_bake_mode.value
             out_path = getattr(self, "_last_mesh_out_path", None)
 
             def progress(i, n):
-                self.gui_mesh_status.content = f"_Baking {i}/{n}…_"
+                self.gui_mesh_status.content = f"_Baking ({mode}) {i}/{n}…_"
 
-            self.gui_mesh_status.content = f"_Baking → {tex_size}px texture, {target_faces:,} faces…_"
-            baked = bake_texture_from_splats(
-                verts=res["verts"], faces=res["faces"], colors=res["colors"],
-                tex_size=tex_size, target_faces=target_faces,
-                out_path=out_path, progress_cb=progress,
-            )
+            if mode == "splat_projection":
+                # Photogrammetric: pull splat tensors from the trainer (same as _run_mesh)
+                from mesher import bake_texture_from_splat_projection
+                import torch.nn.functional as F
+                t = self._trainer_ref
+                if t is None or t.data is None:
+                    self.gui_mesh_status.content = "_splat_projection needs a trainer_"
+                    return
+                with torch.no_grad():
+                    means = t.means_t.detach()
+                    quats = F.normalize(t.quats_t.detach(), dim=-1)
+                    scales = torch.exp(t.log_s_t.detach())
+                    opacities = torch.sigmoid(t.logit_o_t.detach())
+                    p = t.train.params
+                    sh = torch.cat([p["sh0"], p["shN"]], dim=1).detach()
+
+                self.gui_mesh_status.content = (
+                    f"_Baking (splat_projection) → {tex_size}px texture, {target_faces:,} faces…_"
+                )
+                baked = bake_texture_from_splat_projection(
+                    verts=res["verts"], faces=res["faces"],
+                    means=means, quats=quats, scales=scales, opacities=opacities, sh=sh,
+                    tex_size=tex_size, target_faces=target_faces,
+                    n_cams=int(self.gui_mesh_ncams.value),
+                    image_size=1024,
+                    device=str(means.device),
+                    out_path=out_path, progress_cb=progress,
+                )
+            else:
+                # vertex_colors: fast DLNR-color interpolation
+                from mesher import bake_texture_from_splats
+                if res.get("colors") is None:
+                    self.gui_mesh_status.content = "_vertex_colors bake needs a DLNR mesh_"
+                    return
+                self.gui_mesh_status.content = (
+                    f"_Baking (vertex_colors) → {tex_size}px texture, {target_faces:,} faces…_"
+                )
+                baked = bake_texture_from_splats(
+                    verts=res["verts"], faces=res["faces"], colors=res["colors"],
+                    tex_size=tex_size, target_faces=target_faces,
+                    out_path=out_path, progress_cb=progress,
+                )
 
             import sys, time
 
