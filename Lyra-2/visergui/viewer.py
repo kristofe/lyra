@@ -20,7 +20,6 @@ Remote use:
 from __future__ import annotations
 
 import argparse
-import collections
 import math
 import threading
 import time
@@ -51,16 +50,14 @@ SH_C0 = 0.28209479177387814  # band-0 SH normalization (gsplat / Inria conventio
 
 
 class LogBuffer:
-    """Tee sys.stdout/sys.stderr to the real terminal *and* a ring buffer.
-
-    Drained from the pump loop into a viser HTML widget so users see training
-    output in the browser without watching the terminal.
+    """Tee sys.stdout/sys.stderr to the real terminal *and* remember the
+    most recent line, drained by the pump loop into a single-line GUI readout.
     """
 
-    def __init__(self, maxlines: int = 200) -> None:
-        self._lines: "collections.deque[str]" = collections.deque(maxlen=maxlines)
+    def __init__(self) -> None:
+        self._last_line: str = ""
         self._lock = threading.Lock()
-        self._dirty = True  # force one initial push so the widget shows boot lines
+        self._dirty = True
         self._orig_stdout = _sys.stdout
         self._orig_stderr = _sys.stderr
         self._partial = ""  # carry-over for writes that don't end in '\n'
@@ -82,18 +79,15 @@ class LogBuffer:
             return 0
         with self._lock:
             buf = self._partial + text
-            if buf.endswith("\n"):
-                complete, self._partial = buf, ""
-            else:
-                last_nl = buf.rfind("\n")
-                if last_nl == -1:
-                    self._partial = buf
-                    return len(text)
-                complete = buf[: last_nl + 1]
-                self._partial = buf[last_nl + 1 :]
-            for line in complete.splitlines():
-                if line:
-                    self._lines.append(line)
+            last_nl = buf.rfind("\n")
+            if last_nl == -1:
+                self._partial = buf
+                return len(text)
+            self._partial = buf[last_nl + 1 :]
+            # Newest non-empty complete line wins.
+            for line in buf[:last_nl].splitlines():
+                if line.strip():
+                    self._last_line = line
             self._dirty = True
         return len(text)
 
@@ -106,37 +100,13 @@ class LogBuffer:
     def isatty(self) -> bool:
         return False
 
-    def drain_html(self) -> str | None:
-        """Returns new HTML if dirty since last drain, else None."""
+    def drain_text(self) -> str | None:
+        """Returns the most recent line if dirty since last drain, else None."""
         with self._lock:
             if not self._dirty:
                 return None
             self._dirty = False
-            lines = list(self._lines)
-        escaped = "\n".join(
-            line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            for line in lines
-        )
-        if not escaped:
-            escaped = "(no output yet)"
-        # viser inserts our string with React's dangerouslySetInnerHTML, so
-        # standard HTML event attributes on parsed elements still fire. A 1x1
-        # transparent <img> with onload scrolls the wrapper to the bottom on
-        # every content update — keeps the newest line visible without JS.
-        scroll_pixel = (
-            '<img src="data:image/gif;base64,'
-            'R0lGODlhAQABAAAAACw=" '
-            'style="display:block;width:0;height:0;" '
-            'onload="this.parentElement&&'
-            '(this.parentElement.scrollTop=this.parentElement.scrollHeight)">'
-        )
-        return (
-            '<div style="height:200px;overflow-y:auto;background:#111;'
-            'color:#ccc;font-family:monospace;font-size:11px;line-height:1.3;'
-            'padding:6px;border-radius:4px;white-space:pre-wrap;'
-            'word-break:break-all;">'
-            f"{escaped}{scroll_pixel}</div>"
-        )
+            return self._last_line
 
 
 # --------------------------------------------------------------------------- #
@@ -856,6 +826,10 @@ class ViewerApp:
     # ---- GUI construction -------------------------------------------- #
 
     def _build_gui(self) -> None:
+        # Pinned at the very top of the panel — outside any tab — so the
+        # latest stdout/stderr line is visible regardless of which tab is
+        # active. Updated by `_pump_loop` from the LogBuffer.
+        self.gui_log = self.server.gui.add_markdown("`(waiting for output...)`")
         # If training is attached or runtime-init is wired, split the right
         # panel into two tabs so the inspection controls and the training
         # controls don't fight for vertical space. Static viewer keeps the
@@ -971,20 +945,20 @@ class ViewerApp:
             self.gui_mesh_bake_size = self.server.gui.add_dropdown(
                 "tex_size",
                 options=["512", "1024", "2048", "4096"],
-                initial_value="2048",
+                initial_value="1024",
                 hint="Resolution of baked texture (PNG side length)",
             )
-            self.gui_mesh_bake_mode = self.server.gui.add_dropdown(
-                "bake_mode",
-                options=["splats", "vertex_colors"],
-                initial_value="splats",
-                hint="splats = photogrammetric (high detail); vertex_colors = fast smooth",
+            self.gui_mesh_target_faces = self.server.gui.add_number(
+                "target_faces",
+                initial_value=100_000,
+                min=10_000, max=500_000, step=10_000,
+                hint="Decimate mesh to this many faces before UV unwrap & bake (notebook default 100k)",
             )
             self.gui_mesh_bake_btn = self.server.gui.add_button("Bake Texture")
             self.gui_mesh_lighting = self.server.gui.add_checkbox(
                 "lighting",
-                initial_value=False,
-                hint="Toggle scene lighting (off = unlit, matches splat colors)",
+                initial_value=True,
+                hint="Toggle scene lighting (on = lit baseColor; off = emissive only)",
             )
             self.gui_mesh_wireframe = self.server.gui.add_checkbox(
                 "wireframe",
@@ -1031,10 +1005,16 @@ class ViewerApp:
                 self.gui_mesh_status.content = f"_Cam {i}/{n}_"
 
             # Determine output path for mesh files (PLY/OBJ/MTL/PNG)
-            out_path = None
-            if hasattr(t, 'output_root') and hasattr(t, 'name'):
-                out_dir = Path(t.output_root) / t.name
-                out_path = out_dir / "mesh"
+            # Fall back to a debug dir if trainer didn't set a name.
+            name = getattr(t, 'name', None)
+            output_root = getattr(t, 'output_root', None) or Path("vipe_outputs")
+            if not name:
+                import time as _t
+                name = f"debug_{int(_t.time())}"
+            out_dir = Path(output_root) / name
+            out_path = out_dir / "mesh"
+            import sys
+            print(f"  mesh: output dir = {out_dir.resolve()}", file=sys.stderr, flush=True)
 
             result = generate_mesh(
                 means=means,
@@ -1083,75 +1063,60 @@ class ViewerApp:
                 self.gui_mesh_status.content = "_Generate a mesh first_"
                 return
 
+            # Need a DLNR mesh with per-vertex colors
+            if res.get("colors") is None:
+                self.gui_mesh_status.content = "_Bake needs a DLNR mesh first_"
+                return
+
+            from mesher import bake_texture_from_splats
             tex_size = int(self.gui_mesh_bake_size.value)
-            mode = self.gui_mesh_bake_mode.value
+            target_faces = int(self.gui_mesh_target_faces.value)
             out_path = getattr(self, "_last_mesh_out_path", None)
 
             def progress(i, n):
-                self.gui_mesh_status.content = f"_Baking {mode} {i}/{n}…_"
+                self.gui_mesh_status.content = f"_Baking {i}/{n}…_"
 
-            if mode == "splats":
-                from mesher import bake_texture_from_splats
-                import torch.nn.functional as F
+            self.gui_mesh_status.content = f"_Baking → {tex_size}px texture, {target_faces:,} faces…_"
+            baked = bake_texture_from_splats(
+                verts=res["verts"], faces=res["faces"], colors=res["colors"],
+                tex_size=tex_size, target_faces=target_faces,
+                out_path=out_path, progress_cb=progress,
+            )
 
-                t = self._trainer_ref
-                if t is None or t.data is None:
-                    self.gui_mesh_status.content = "_Splat bake needs a trainer_"
-                    return
+            import sys, time
 
-                with torch.no_grad():
-                    means = t.means_t.detach()
-                    quats = F.normalize(t.quats_t.detach(), dim=-1)
-                    scales = torch.exp(t.log_s_t.detach())
-                    opacities = torch.sigmoid(t.logit_o_t.detach())
-                    p = t.train.params
-                    sh = torch.cat([p["sh0"], p["shN"]], dim=1).detach()
+            # Try to load the just-saved OBJ via trimesh — it's the same file
+            # MeshLab renders correctly. If trimesh loads it cleanly, we hand
+            # the resulting Trimesh to viser. If anything goes wrong, fall back
+            # to the vertex-colored decimated mesh.
+            push_res = None
+            if out_path is not None:
+                try:
+                    import trimesh
+                    obj_path = Path(out_path).with_stem("mesh_splat_tex").with_suffix(".obj")
+                    if obj_path.exists():
+                        loaded = trimesh.load(str(obj_path), process=False, force="mesh")
+                        push_res = {"_trimesh_direct": loaded}
+                        print(f"  bake: loaded OBJ from disk → trimesh ({len(loaded.vertices)} verts, {len(loaded.faces)} faces)",
+                              file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"  bake: OBJ-load fallback failed: {e}", file=sys.stderr, flush=True)
+                    push_res = None
 
-                self.gui_mesh_status.content = f"_Baking splats → {tex_size}px texture…_"
-                baked = bake_texture_from_splats(
-                    means=means, quats=quats, scales=scales, opacities=opacities, sh=sh,
-                    verts=res["verts"], faces=res["faces"],
-                    tex_size=tex_size,
-                    n_cams=int(self.gui_mesh_ncams.value),
-                    image_size=1024,  # per-camera render resolution
-                    device=str(means.device),
-                    out_path=out_path,
-                    progress_cb=progress,
-                )
-            else:
-                # Per-vertex color bake (only works if colors present)
-                from mesher import bake_mesh_texture
-                if res.get("colors") is None:
-                    self.gui_mesh_status.content = "_vertex_colors bake needs a DLNR mesh_"
-                    return
-                self.gui_mesh_status.content = f"_Baking vertex colors → {tex_size}px texture…_"
-                baked = bake_mesh_texture(
-                    verts=res["verts"], faces=res["faces"], colors=res["colors"],
-                    tex_size=tex_size, out_path=out_path,
-                )
-
-            # If bake returned an unwrapped mesh (per-vertex UV), use that layout
-            # directly to avoid 3x vertex duplication in the GLB.
-            if baked.get("per_vertex_uv"):
+            if push_res is None:
+                # Fallback: vertex-colored decimated mesh
                 push_res = {
                     "verts": baked["verts"],
                     "faces": baked["faces"],
-                    "uv": baked["uv"],
-                    "tex_image": baked["tex_image"],
-                    "per_vertex_uv": True,
+                    "colors": baked["colors"],
                 }
-            else:
-                res["uv"] = baked["uv"]
-                res["tex_image"] = baked["tex_image"]
-                push_res = res
 
-            import sys, time
             t_push = time.perf_counter()
             print(f"  bake: pushing mesh to viser…", file=sys.stderr, flush=True)
             self._push_mesh_to_viser(push_res)
             print(f"  bake: viser push done in {time.perf_counter() - t_push:.1f}s",
                   file=sys.stderr, flush=True)
-            self.gui_mesh_status.content = f"_Baked {mode} ({tex_size}px)_"
+            self.gui_mesh_status.content = f"_Baked ({tex_size}px, {target_faces:,} faces)_"
 
         except Exception as e:
             import traceback
@@ -1166,6 +1131,16 @@ class ViewerApp:
             self._mesh_wire_handle.remove()
             self._mesh_wire_handle = None
 
+        # Shortcut: a pre-built trimesh.Trimesh (e.g., loaded from the saved OBJ)
+        # gets pushed straight to viser without any rebuilding.
+        direct = result.get("_trimesh_direct", None)
+        if direct is not None:
+            self._mesh_handle = self.server.scene.add_mesh_trimesh(
+                name="/mesh", mesh=direct,
+                visible=(self.display_mode == "mesh"),
+            )
+            return
+
         verts = result["verts"]
         faces = result["faces"]
         uv = result.get("uv", None)
@@ -1173,30 +1148,29 @@ class ViewerApp:
         colors = result.get("colors", None)
 
         if uv is not None and tex_image is not None:
-            # Textured mesh — emissive material so PBR lighting doesn't darken it
+            # Textured mesh — emissive material so PBR lighting doesn't darken it.
+            # ALWAYS use per-corner (duplicated-vertex) layout. Each face has its
+            # own 3 unique vertices with their own UVs. This avoids any
+            # per-vertex-UV interpretation differences in trimesh/three.js when
+            # neighboring faces would share a vertex (and thus a single UV) at
+            # a UV seam.
             import trimesh
             if result.get("per_vertex_uv"):
-                # Compact layout: one UV per vertex (xatlas-unwrapped), no inflation
-                tri_verts = verts
-                tri_faces = faces
-                tri_uv = uv
-            else:
-                # Legacy per-corner layout: duplicate vertices per face corner
+                # bake returned (verts, faces=F_uv, uv per vertex). Expand to per-corner.
                 tri_verts = verts[faces].reshape(-1, 3)
-                tri_faces = np.arange(len(tri_verts)).reshape(-1, 3)
+                tri_uv    = uv[faces].reshape(-1, 2)
+            else:
+                # Legacy per-corner layout: uv already (F, 3, 2)
+                tri_verts = verts[faces].reshape(-1, 3)
                 tri_uv = uv.reshape(-1, 2)
+            tri_faces = np.arange(len(tri_verts)).reshape(-1, 3)
             mesh = trimesh.Trimesh(vertices=tri_verts, faces=tri_faces, process=False)
-            from trimesh.visual.material import PBRMaterial
-            material = PBRMaterial(
-                baseColorFactor=[0.0, 0.0, 0.0, 1.0],
-                emissiveTexture=tex_image,
-                emissiveFactor=[1.0, 1.0, 1.0],
-                metallicFactor=0.0,
-                roughnessFactor=1.0,
-                doubleSided=True,
-            )
+            # Use the simplest possible TextureVisuals: only uv + image, no custom
+            # material. trimesh will build a default PBRMaterial with baseColorTexture
+            # pointing to `image`. This avoids any double-texture / sampler-mismatch
+            # issues we were hitting with the custom PBRMaterial.
             mesh.visual = trimesh.visual.TextureVisuals(
-                uv=tri_uv, image=tex_image, material=material,
+                uv=tri_uv, image=tex_image,
             )
             self._mesh_handle = self.server.scene.add_mesh_trimesh(
                 name="/mesh", mesh=mesh,
@@ -1886,13 +1860,6 @@ class ViewerApp:
             self.gui_train_loss_plot = self.server.gui.add_plotly(
                 self._make_loss_figure([]), aspect=2.0
             )
-            with self.server.gui.add_folder("Log"):
-                self.gui_log = self.server.gui.add_html(
-                    self._log_buf.drain_html() or
-                    '<div style="height:200px;background:#111;color:#ccc;'
-                    'font-family:monospace;font-size:11px;padding:6px;'
-                    'border-radius:4px;">(waiting for output...)</div>'
-                )
 
         self.gui_train_resume.on_click(lambda _ev: self._on_resume_training())
         self.gui_train_pause.on_click(lambda _ev: self._on_pause_training())
@@ -2014,9 +1981,10 @@ class ViewerApp:
             if now - last_log_t >= 0.5:  # 2 Hz log push
                 last_log_t = now
                 try:
-                    html = self._log_buf.drain_html()
-                    if html is not None and hasattr(self, "gui_log"):
-                        self.gui_log.content = html
+                    line = self._log_buf.drain_text()
+                    if line is not None and hasattr(self, "gui_log"):
+                        safe = line.replace("`", "'") if line else "(idle)"
+                        self.gui_log.content = f"`{safe}`"
                 except Exception:
                     pass
             if ctl is None:

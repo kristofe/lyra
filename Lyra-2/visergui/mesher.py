@@ -235,7 +235,17 @@ def _mesh_dlnr(model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
     sfm_cache.FileLock.__exit__ = patched_exit
 
     try:
+        import sys
         TRUNC = density * scene_diag
+        vox = TRUNC / shell_thickness
+        print(f"  _mesh_dlnr: scene_diag={scene_diag:.4f}  density={density}  "
+              f"TRUNC={TRUNC:.4f}  voxel={vox:.4f}  shell={shell_thickness}",
+              file=sys.stderr, flush=True)
+        if TRUNC > 0.05:
+            print(f"  _mesh_dlnr: WARNING — TRUNC={TRUNC*100:.1f}cm is large; "
+                  f"colors will be averaged across a wide spatial band. "
+                  f"Lower 'density' slider for finer color resolution.",
+                  file=sys.stderr, flush=True)
         image_sizes = torch.tensor([[H, W]] * n_cams, dtype=torch.int32, device=device)
 
         verts_d, faces_d, colors_d = mesh_from_splats_dlnr(
@@ -320,393 +330,189 @@ def _save_ply(path: Path, verts: np.ndarray, faces: np.ndarray, normals: np.ndar
     ).write(str(path.with_suffix(".ply")))
 
 
+
 def bake_texture_from_splats(
-    means: torch.Tensor,
-    quats: torch.Tensor,
-    scales: torch.Tensor,
-    opacities: torch.Tensor,
-    sh: torch.Tensor,
-    verts: np.ndarray,
-    faces: np.ndarray,
-    tex_size: int = 2048,
-    n_cams: int = 96,
-    image_size: int = 1024,
-    device: str = "cuda",
-    out_path: Path | None = None,
-    progress_cb: Callable[[int, int], None] | None = None,
-) -> dict:
-    """Photogrammetric texture bake — re-renders splats and projects each texel
-    onto the best-visible camera. Returns dict with uv, tex_image, verts, faces."""
-    import fvdb
-    import xatlas
-    from scipy import ndimage
-    from PIL import Image
-
-    # 1) Build splat model (invert activations)
-    eps = 1e-6
-    opac_clamped = opacities.clamp(eps, 1 - eps)
-    logit_opacities = torch.log(opac_clamped / (1 - opac_clamped))
-    log_scales = torch.log(scales.clamp_min(eps))
-    sh0 = sh[:, :1, :].contiguous()
-    shN = sh[:, 1:, :].contiguous()
-    model = fvdb.GaussianSplat3d.from_tensors(
-        means=means, quats=quats,
-        log_scales=log_scales, logit_opacities=logit_opacities,
-        sh0=sh0, shN=shN,
-    )
-
-    # 2) Build dome cameras (same geometry as generate_mesh)
-    bbmin = means.min(0).values
-    bbmax = means.max(0).values
-    scene_diag = float((bbmax - bbmin).norm())
-    scene_center = 0.5 * (bbmin + bbmax)
-
-    i_t = torch.arange(n_cams, device=device, dtype=torch.float32)
-    golden_ang = np.pi * (3 - np.sqrt(5))
-    elev_min_deg, elev_max_deg = 5.0, 70.0
-    s_min = float(np.sin(np.deg2rad(elev_min_deg)))
-    s_max = float(np.sin(np.deg2rad(elev_max_deg)))
-    sin_elev = s_min + (s_max - s_min) * (i_t + 0.5) / n_cams
-    cos_elev = torch.sqrt(torch.clamp(1 - sin_elev**2, min=0))
-    az = i_t * golden_ang
-    ring_radius = scene_diag * 0.8
-    offset = torch.stack([cos_elev * torch.cos(az), -sin_elev, cos_elev * torch.sin(az)], dim=-1)
-    cam_centers = scene_center + ring_radius * offset
-
-    def look_at(eyes, target):
-        world_up = torch.tensor([0., -1., 0.], device=device)
-        fwd = target - eyes
-        fwd = fwd / fwd.norm(dim=-1, keepdim=True)
-        up_ref = world_up.expand_as(fwd).clone()
-        parallel = (fwd * up_ref).sum(-1, keepdim=True).abs() > 0.98
-        fallback = torch.tensor([1., 0., 0.], device=device).expand_as(fwd)
-        up_ref = torch.where(parallel, fallback, up_ref)
-        right = torch.cross(fwd, up_ref, dim=-1)
-        right = right / right.norm(dim=-1, keepdim=True)
-        up = torch.cross(right, fwd, dim=-1)
-        R_c2w = torch.stack([right, -up, fwd], dim=-1)
-        c2w = torch.eye(4, device=device).expand(len(eyes), 4, 4).clone()
-        c2w[:, :3, :3] = R_c2w
-        c2w[:, :3, 3] = eyes
-        return c2w
-
-    c2w = look_at(cam_centers, scene_center.expand_as(cam_centers))
-    w2c = torch.linalg.inv(c2w).contiguous()
-    fov = 60.0
-    fx = fy = 0.5 * image_size / np.tan(np.deg2rad(fov) * 0.5)
-    K = torch.tensor([[fx, 0, image_size/2], [0, fy, image_size/2], [0, 0, 1]],
-                     device=device, dtype=torch.float32).expand(n_cams, 3, 3).contiguous()
-
-    # 3) Render RGB + depth from each camera (linear RGB)
-    import sys, time
-    from tqdm import tqdm
-    cam_rgb = torch.zeros(n_cams, image_size, image_size, 3, dtype=torch.float32, device=device)
-    cam_depth = torch.zeros(n_cams, image_size, image_size, dtype=torch.float32, device=device)
-    for i in tqdm(range(n_cams), desc="bake: render cameras", file=sys.stderr):
-        feat_depth, alpha = model.render_images_and_depths(
-            world_to_camera_matrices=w2c[i:i+1], projection_matrices=K[i:i+1],
-            image_width=image_size, image_height=image_size, near=0.0, far=1e10,
-        )
-        a = alpha[0, ..., 0].clamp_min(1e-10)
-        cam_rgb[i] = (feat_depth[0, ..., :3] / a.unsqueeze(-1)).float()
-        cam_depth[i] = (feat_depth[0, ..., -1] / a).float()
-        torch.cuda.synchronize()
-        if progress_cb:
-            progress_cb(i + 1, n_cams + 3)
-
-    # 4) UV unwrap the mesh
-    t_uv = time.perf_counter()
-    print(f"  bake: starting xatlas UV unwrap for {faces.shape[0]} faces…", file=sys.stderr, flush=True)
-    vmap, F_uv, uvs = xatlas.parametrize(verts.astype(np.float32), faces.astype(np.uint32))
-    uvs = uvs.astype(np.float32)
-    print(f"  bake: xatlas done in {time.perf_counter() - t_uv:.1f}s", file=sys.stderr, flush=True)
-
-    # 5) For each face, find best camera (highest face_normal · view_to_face)
-    verts_t = torch.from_numpy(verts.astype(np.float32)).to(device)
-    faces_t = torch.from_numpy(faces.astype(np.int64)).to(device)
-    tri_verts = verts_t[faces_t]                          # (F, 3, 3)
-    tri_centroid = tri_verts.mean(dim=1)                  # (F, 3)
-    e1 = tri_verts[:, 1] - tri_verts[:, 0]
-    e2 = tri_verts[:, 2] - tri_verts[:, 0]
-    tri_normal = torch.cross(e1, e2, dim=-1)
-    tri_normal = tri_normal / tri_normal.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    cam_centers_dev = c2w[:, :3, 3]                       # (C, 3)
-    # (F, C, 3): vector from face centroid to each camera
-    view_vec = cam_centers_dev[None, :, :] - tri_centroid[:, None, :]
-    view_vec_n = view_vec / view_vec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    # Dot with face normal — higher = camera looks more head-on at the face
-    score = (view_vec_n * tri_normal[:, None, :]).sum(-1)  # (F, C)
-    best_cam = score.argmax(dim=1).cpu().numpy()           # (F,)
-    print(f"  bake: best-camera selection done ({faces.shape[0]} faces)", file=sys.stderr, flush=True)
-    if progress_cb:
-        progress_cb(n_cams + 1, n_cams + 3)
-
-    # 6) GPU-batched per-texel rasterization
-    F = faces.shape[0]
-    tri_uv_t = torch.from_numpy((uvs[F_uv] * (tex_size - 1)).astype(np.float32)).to(device)  # (F, 3, 2)
-    best_cam_t = torch.from_numpy(best_cam).long().to(device)                                 # (F,)
-
-    # Precompute per-face UV bbox & barycentric basis (vectorized once)
-    uv_min = tri_uv_t.min(dim=1).values                  # (F, 2)
-    uv_max = tri_uv_t.max(dim=1).values                  # (F, 2)
-
-    tex_t = torch.zeros((tex_size, tex_size, 3), dtype=torch.float32, device=device)
-    mask_t = torch.zeros((tex_size, tex_size), dtype=torch.bool, device=device)
-
-    # Process faces in chunks. We pad each chunk's pixel-grid to the max bbox size
-    # so the heavy ops are vectorized per chunk.
-    CHUNK = 2048
-    n_chunks = (F + CHUNK - 1) // CHUNK
-    print(f"  bake: rasterizing {F} faces in {n_chunks} chunks of up to {CHUNK}…", file=sys.stderr, flush=True)
-    chunk_iter = tqdm(range(n_chunks), desc="bake: rasterize chunks", file=sys.stderr)
-    for c in chunk_iter:
-        s, e = c * CHUNK, min(F, (c + 1) * CHUNK)
-        ch_size = e - s
-        ch_uv = tri_uv_t[s:e]                            # (B, 3, 2)
-        ch_verts = tri_verts[s:e]                        # (B, 3, 3) GPU tensor
-        ch_cam = best_cam_t[s:e]                         # (B,)
-        ch_min = uv_min[s:e]                             # (B, 2)
-        ch_max = uv_max[s:e]                             # (B, 2)
-
-        # Bbox dims, clipped to texture
-        xmin = ch_min[:, 0].clamp(0, tex_size - 1).floor().long()
-        xmax = ch_max[:, 0].clamp(0, tex_size - 1).ceil().long()
-        ymin = ch_min[:, 1].clamp(0, tex_size - 1).floor().long()
-        ymax = ch_max[:, 1].clamp(0, tex_size - 1).ceil().long()
-        bw = (xmax - xmin + 1).clamp_min(0)
-        bh = (ymax - ymin + 1).clamp_min(0)
-        W_pad = int(bw.max().item()) if ch_size > 0 else 0
-        H_pad = int(bh.max().item()) if ch_size > 0 else 0
-        if W_pad == 0 or H_pad == 0:
-            continue
-        mem_est_mb = ch_size * H_pad * W_pad * (3 + 1 + 2 + 3) * 4 / (1024 * 1024)
-        chunk_iter.set_postfix(pad=f"{H_pad}x{W_pad}", mem_mb=f"{mem_est_mb:.0f}")
-
-        # Build padded pixel grid per face: (B, H_pad, W_pad, 2) of pixel xy
-        dx = torch.arange(W_pad, device=device).view(1, 1, W_pad)
-        dy = torch.arange(H_pad, device=device).view(1, H_pad, 1)
-        px_x = xmin.view(ch_size, 1, 1) + dx              # (B, 1, W_pad)
-        px_y = ymin.view(ch_size, 1, 1) + dy              # (B, H_pad, 1)
-        # Broadcast to (B, H_pad, W_pad)
-        px_x = px_x.expand(ch_size, H_pad, W_pad).contiguous()
-        px_y = px_y.expand(ch_size, H_pad, W_pad).contiguous()
-        valid_pad = (dx < bw.view(ch_size, 1, 1)) & (dy < bh.view(ch_size, 1, 1))
-
-        # Barycentric in UV (vectorized over chunk)
-        uv0 = ch_uv[:, 0].view(ch_size, 1, 1, 2)
-        uv1 = ch_uv[:, 1].view(ch_size, 1, 1, 2)
-        uv2 = ch_uv[:, 2].view(ch_size, 1, 1, 2)
-        p = torch.stack([px_x.float(), px_y.float()], dim=-1)  # (B, H_pad, W_pad, 2)
-        v0v1 = uv1 - uv0
-        v0v2 = uv2 - uv0
-        v0p  = p - uv0
-        d00 = (v0v1 * v0v1).sum(-1)
-        d01 = (v0v1 * v0v2).sum(-1)
-        d11 = (v0v2 * v0v2).sum(-1)
-        d20 = (v0p * v0v1).sum(-1)
-        d21 = (v0p * v0v2).sum(-1)
-        denom = d00 * d11 - d01 * d01
-        denom_safe = torch.where(denom.abs() < 1e-12, torch.ones_like(denom), denom)
-        v_b = (d11 * d20 - d01 * d21) / denom_safe
-        w_b = (d00 * d21 - d01 * d20) / denom_safe
-        u_b = 1 - v_b - w_b
-        inside = (u_b >= -1e-5) & (v_b >= -1e-5) & (w_b >= -1e-5) & valid_pad & (denom.abs() >= 1e-12)
-        if not inside.any():
-            continue
-
-        # 3D positions via barycentric of face vertices
-        v0 = ch_verts[:, 0].view(ch_size, 1, 1, 3)
-        v1 = ch_verts[:, 1].view(ch_size, 1, 1, 3)
-        v2 = ch_verts[:, 2].view(ch_size, 1, 1, 3)
-        pos3d = u_b.unsqueeze(-1) * v0 + v_b.unsqueeze(-1) * v1 + w_b.unsqueeze(-1) * v2
-
-        # Project to each face's best camera
-        cam_idx = ch_cam.view(ch_size, 1, 1).expand(ch_size, H_pad, W_pad)
-        W_mats = w2c[cam_idx]                            # (B, H, W, 4, 4)
-        Ks = K[cam_idx]                                  # (B, H, W, 3, 3)
-        ones = torch.ones_like(pos3d[..., :1])
-        pos_h = torch.cat([pos3d, ones], dim=-1).unsqueeze(-1)   # (..., 4, 1)
-        pos_cam = (W_mats @ pos_h).squeeze(-1)[..., :3]          # (..., 3)
-        z = pos_cam[..., 2]
-        ok_z = z > 1e-6
-        proj = (Ks @ (pos_cam / z.unsqueeze(-1)).unsqueeze(-1)).squeeze(-1)
-        ix = proj[..., 0].round().long()
-        iy = proj[..., 1].round().long()
-        ok_xy = ok_z & (ix >= 0) & (ix < image_size) & (iy >= 0) & (iy < image_size)
-        valid = inside & ok_xy
-        if not valid.any():
-            continue
-
-        # Gather RGB at the projected pixels (per-pixel best camera lookup)
-        flat_cam = cam_idx[valid]
-        flat_iy = iy[valid].clamp(0, image_size - 1)
-        flat_ix = ix[valid].clamp(0, image_size - 1)
-        rgb = cam_rgb[flat_cam, flat_iy, flat_ix]        # (M, 3)
-
-        flat_py = px_y[valid].clamp(0, tex_size - 1)
-        flat_px = px_x[valid].clamp(0, tex_size - 1)
-        tex_t[flat_py, flat_px] = rgb
-        mask_t[flat_py, flat_px] = True
-
-        torch.cuda.synchronize()
-        if progress_cb:
-            progress_cb(n_cams + 1 + c, n_cams + n_chunks + 2)
-
-    tex = tex_t.cpu().numpy()
-    mask = mask_t.cpu().numpy()
-
-    total = n_cams + n_chunks + 2
-
-    if progress_cb:
-        progress_cb(total - 1, total)
-
-    if not mask.all():
-        t_fill = time.perf_counter()
-        print(f"  bake: filling UV gaps ({(~mask).sum()} pixels)…", file=sys.stderr, flush=True)
-        _, indices = ndimage.distance_transform_edt(~mask, return_indices=True)
-        for ch in range(3):
-            tex[..., ch] = tex[..., ch][indices[0], indices[1]]
-        print(f"  bake: gap fill done in {time.perf_counter() - t_fill:.1f}s", file=sys.stderr, flush=True)
-
-    t_enc = time.perf_counter()
-    tex_srgb = _linear_to_srgb(tex)
-    tex_u8 = np.clip(tex_srgb * 255, 0, 255).astype(np.uint8)
-    img = Image.fromarray(tex_u8)
-    print(f"  bake: sRGB encode + PIL image in {time.perf_counter() - t_enc:.2f}s", file=sys.stderr, flush=True)
-
-    # Return the xatlas-unwrapped mesh directly (one UV per vertex, no duplication)
-    # The viewer can build a trimesh with these without 3x vertex inflation.
-    unwrapped_verts = verts[vmap].astype(np.float32)
-    unwrapped_faces = F_uv.astype(np.int32)
-
-    if out_path is not None:
-        t_save = time.perf_counter()
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_textured_obj_simple(
-            out_path.with_stem("mesh_splat_tex"),
-            unwrapped_verts, unwrapped_faces, uvs, img,
-        )
-        print(f"  bake: OBJ/MTL/PNG save in {time.perf_counter() - t_save:.1f}s", file=sys.stderr, flush=True)
-
-    if progress_cb:
-        progress_cb(total, total)
-
-    # NOTE: returns the xatlas-unwrapped mesh (one UV per vertex). The viewer
-    # should use these `verts`/`faces`/`uv` directly to avoid 3x vertex inflation.
-    return {
-        "uv": uvs.astype(np.float32),       # (V_uv, 2)
-        "tex_image": img,
-        "verts": unwrapped_verts,           # (V_uv, 3)
-        "faces": unwrapped_faces,           # (F, 3)
-        "per_vertex_uv": True,              # signals new layout to _push_mesh_to_viser
-    }
-
-
-def bake_mesh_texture(
     verts: np.ndarray,
     faces: np.ndarray,
     colors: np.ndarray,
     tex_size: int = 1024,
+    target_faces: int = 100_000,
     out_path: Path | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Public API: bake per-vertex colors into a texture; optionally write OBJ/MTL/PNG.
+    """Bake a textured mesh from DLNR per-vertex colors (matches notebook approach).
 
-    Returns dict with: "uv" (F, 3, 2), "tex_image" (PIL.Image), "verts", "faces".
+    Pipeline (no camera reprojection, no occlusion logic):
+    1. Decimate mesh to ~target_faces via quadric decimation. open3d interpolates
+       vertex_colors during decimation so colors stay aligned with the new sparser
+       vertex set.
+    2. UV-unwrap with xatlas.
+    3. Barycentrically interpolate vertex colors into a `tex_size`x`tex_size` PNG.
+    4. Gap-fill UV holes via scipy distance transform.
+    5. Save OBJ + MTL + PNG (V-flipped for OBJ Y-up convention).
+
+    Returns dict with: uv, tex_image (unflipped, for viser), verts, faces, per_vertex_uv=True.
     """
-    uv, tex_image = _bake_texture_fast(verts, faces, colors, tex_size)
+    import sys, time
+    import xatlas
+    from scipy.ndimage import distance_transform_edt
+    from PIL import Image
+    from tqdm import tqdm
+
+    def _log(msg):
+        print(f"  bake: {msg}", file=sys.stderr, flush=True)
+        if progress_cb:
+            progress_cb(_log.step, _log.total)
+    _log.step = 0
+    _log.total = 100
+
+    def _stage(step, msg):
+        _log.step = step
+        _log(msg)
+
+    t_total = time.perf_counter()
+    _stage(1, f"[1/6] input mesh: {len(verts):,} verts, {len(faces):,} faces, target_faces={target_faces:,}, tex_size={tex_size}")
+
+    # 1) Decimate (open3d interpolates vertex_colors during simplification)
+    _stage(5, f"[2/6] decimating to ~{target_faces:,} faces (open3d quadric)…")
+    t0 = time.perf_counter()
+    m = o3d.geometry.TriangleMesh()
+    m.vertices      = o3d.utility.Vector3dVector(verts.astype(np.float64))
+    m.triangles     = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    m.vertex_colors = o3d.utility.Vector3dVector(np.clip(colors, 0, 1).astype(np.float64))
+    n_in = len(faces)
+    if n_in > target_faces:
+        m = m.simplify_quadric_decimation(target_number_of_triangles=target_faces)
+        dec_ratio = len(m.triangles) / n_in
+        _log(f"      decimation ratio {dec_ratio:.3f} (kept {dec_ratio*100:.1f}% of faces)")
+    else:
+        _log(f"      input already under target ({n_in:,} ≤ {target_faces:,}) — skipping decimation")
+    V = np.asarray(m.vertices, dtype=np.float32)
+    Faces = np.asarray(m.triangles, dtype=np.uint32)
+    C = np.asarray(m.vertex_colors, dtype=np.float32)
+    _stage(10, f"      done in {time.perf_counter()-t0:.1f}s → {len(Faces):,} faces, {len(V):,} verts")
+
+    # 2) UV unwrap the decimated mesh
+    _stage(12, f"[3/6] xatlas UV unwrap of {len(Faces):,} faces (single-threaded CPU, can take 10–60s)…")
+    t0 = time.perf_counter()
+    vmap, F_uv, uvs = xatlas.parametrize(V, Faces)
+    V_uv = V[vmap]
+    C_uv = C[vmap]
+    uvs = uvs.astype(np.float32)
+    # Defensive: normalize if xatlas returned out-of-[0,1] UVs
+    uv_min, uv_max = uvs.min(axis=0), uvs.max(axis=0)
+    if (uv_min < 0).any() or (uv_max > 1).any():
+        _log(f"      WARNING: UVs out of [0,1] (x=[{uv_min[0]:.2f},{uv_max[0]:.2f}] "
+             f"y=[{uv_min[1]:.2f},{uv_max[1]:.2f}]) — normalizing")
+        uvs = (uvs - uv_min) / np.maximum(uv_max - uv_min, 1e-8)
+    _stage(30, f"      done in {time.perf_counter()-t0:.1f}s → "
+               f"{len(V):,} → {len(V_uv):,} verts (xatlas added {len(V_uv)-len(V):,} seam-split verts)")
+
+    # 3) Barycentric bake of per-vertex colors
+    _stage(32, f"[4/6] barycentric bake into {tex_size}x{tex_size} texture ({len(F_uv):,} triangles)…")
+    t0 = time.perf_counter()
+    tex  = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+    mask = np.zeros((tex_size, tex_size), dtype=bool)
+    uv_px = uvs * tex_size
+
+    # Tight per-face inner loop with tqdm — manual stride to surface progress to the GUI too.
+    n_faces = len(F_uv)
+    update_every = max(1, n_faces // 200)
+    pbar = tqdm(total=n_faces, desc="  bake: rasterize", file=sys.stderr,
+                bar_format="    {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+    for fi, tri in enumerate(F_uv):
+        p   = uv_px[tri]                       # (3, 2) UV in pixel space
+        col = C_uv[tri]                         # (3, 3) RGB per corner
+        u_min = max(0, int(np.floor(p[:, 0].min())))
+        u_max = min(tex_size - 1, int(np.ceil(p[:, 0].max())))
+        v_min = max(0, int(np.floor(p[:, 1].min())))
+        v_max = min(tex_size - 1, int(np.ceil(p[:, 1].max())))
+        if u_min >= u_max or v_min >= v_max:
+            pbar.update(1); continue
+        uu, vv = np.meshgrid(np.arange(u_min, u_max + 1),
+                             np.arange(v_min, v_max + 1))
+        pu, pv = uu + 0.5, vv + 0.5
+        denom = (p[1, 1] - p[2, 1]) * (p[0, 0] - p[2, 0]) + (p[2, 0] - p[1, 0]) * (p[0, 1] - p[2, 1])
+        if abs(denom) < 1e-10:
+            pbar.update(1); continue
+        a = ((p[1, 1] - p[2, 1]) * (pu - p[2, 0]) + (p[2, 0] - p[1, 0]) * (pv - p[2, 1])) / denom
+        b = ((p[2, 1] - p[0, 1]) * (pu - p[2, 0]) + (p[0, 0] - p[2, 0]) * (pv - p[2, 1])) / denom
+        c = 1.0 - a - b
+        inside = (a >= 0) & (b >= 0) & (c >= 0)
+        if not inside.any():
+            pbar.update(1); continue
+        col_interp = a[..., None] * col[0] + b[..., None] * col[1] + c[..., None] * col[2]
+        tex[vv[inside],  uu[inside]]  = col_interp[inside]
+        mask[vv[inside], uu[inside]]  = True
+        pbar.update(1)
+        # Mirror progress to GUI status periodically
+        if progress_cb and (fi % update_every == 0):
+            _log.step = 32 + int(50 * fi / n_faces)
+            progress_cb(_log.step, _log.total)
+    pbar.close()
+    _stage(82, f"      done in {time.perf_counter()-t0:.1f}s "
+               f"(covered {mask.mean()*100:.1f}% of UV space — {mask.sum():,}/{mask.size:,} texels)")
+
+    # 4) Gap fill outside UV islands so edge sampling doesn't bleed black
+    _stage(85, f"[5/6] gap-fill {(~mask).sum():,} empty texels (scipy distance transform)…")
+    t0 = time.perf_counter()
+    _, inds = distance_transform_edt(~mask, return_indices=True)
+    tex = tex[inds[0], inds[1]]
+    _stage(88, f"      done in {time.perf_counter()-t0:.1f}s")
+
+    # 5) Build images: V-flipped for OBJ disk save, NOT flipped for viser (glTF)
+    _stage(90, "      converting to uint8 + building PIL images…")
+    tex_u8 = (np.clip(tex, 0, 1) * 255).astype(np.uint8)
+    img_for_obj   = Image.fromarray(tex_u8[::-1])        # PNG/OBJ uses Y-up V
+    img_for_viser = Image.fromarray(tex_u8)              # glTF uses Y-down V
+
+    # 6) Save OBJ + MTL + PNG if out_path given
     if out_path is not None:
+        _stage(92, f"[6/6] saving PNG + OBJ + MTL to {Path(out_path).parent}…")
+        t0 = time.perf_counter()
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_textured_obj(out_path.with_stem("mesh_dlnr_tex"), verts, faces, uv, tex_image)
-    return {"uv": uv, "tex_image": tex_image, "verts": verts, "faces": faces}
+        base = out_path.with_stem("mesh_splat_tex")
+        png_path = base.with_suffix(".png")
+        obj_path = base.with_suffix(".obj")
+        mtl_path = base.with_suffix(".mtl")
+        img_for_obj.save(str(png_path))
+        _log(f"      saved PNG ({png_path.stat().st_size // 1024:,} KB)")
+        with open(obj_path, "w") as fh:
+            fh.write(f"mtllib {mtl_path.name}\n")
+            for vx in V_uv:
+                fh.write(f"v {vx[0]:.6f} {vx[1]:.6f} {vx[2]:.6f}\n")
+            for uv in uvs:
+                fh.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+            fh.write("usemtl mat0\n")
+            for tri in F_uv:
+                a, b, c = int(tri[0]) + 1, int(tri[1]) + 1, int(tri[2]) + 1
+                fh.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+        with open(mtl_path, "w") as fh:
+            fh.write(f"newmtl mat0\nKa 1 1 1\nKd 1 1 1\nmap_Kd {png_path.name}\n")
+        _log(f"      saved OBJ ({obj_path.stat().st_size // 1024:,} KB) + MTL in {time.perf_counter()-t0:.1f}s")
+        _log(f"      TEXTURE → {png_path.resolve()}")
+        _log(f"      MESH    → {obj_path.resolve()}")
+    else:
+        _stage(92, "[6/6] no out_path given — skipping disk save")
 
+    _stage(100, f"DONE: total bake time {time.perf_counter()-t_total:.1f}s")
 
-def _bake_texture_fast(verts: np.ndarray, faces: np.ndarray, colors: np.ndarray, tex_size: int = 1024):
-    """Vectorized texture baking. Returns (per_corner_uvs, PIL.Image).
-
-    `per_corner_uvs` has shape (F, 3, 2) — UV per face corner — used to build
-    the textured trimesh for viser. Image is RGB uint8.
-    """
-    import xatlas
-    from scipy import ndimage
-    from PIL import Image
-
-    # UV unwrap (xatlas returns vmap so vertex i in unwrapped mesh maps from verts[vmap[i]])
-    vmap, F_uv, uvs = xatlas.parametrize(verts.astype(np.float32), faces.astype(np.uint32))
-    uvs = uvs.astype(np.float32)  # (V_uv, 2) in [0,1]
-
-    # Colors on the unwrapped vertices (use vmap to look up original-vertex color)
-    uv_colors = colors[vmap].astype(np.float32)  # (V_uv, 3)
-
-    # Per-face UV triangle (image-space pixels). Use texel-center sampling.
-    # tex_size pixels indexed 0..tex_size-1; UV [0,1] maps via *(tex_size-1).
-    tri_uv = uvs[F_uv] * (tex_size - 1)         # (F, 3, 2)
-    tri_col = uv_colors[F_uv]                    # (F, 3, 3)
-
-    tex = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
-    mask = np.zeros((tex_size, tex_size), dtype=bool)
-
-    # Vectorized per-face rasterization
-    for fi in range(tri_uv.shape[0]):
-        uv0, uv1, uv2 = tri_uv[fi]
-        c0, c1, c2 = tri_col[fi]
-
-        xmin = max(0, int(np.floor(min(uv0[0], uv1[0], uv2[0]))))
-        xmax = min(tex_size - 1, int(np.ceil(max(uv0[0], uv1[0], uv2[0]))))
-        ymin = max(0, int(np.floor(min(uv0[1], uv1[1], uv2[1]))))
-        ymax = min(tex_size - 1, int(np.ceil(max(uv0[1], uv1[1], uv2[1]))))
-        if xmax < xmin or ymax < ymin:
-            continue
-
-        # Pixel grid for the bbox
-        xs = np.arange(xmin, xmax + 1, dtype=np.float32)
-        ys = np.arange(ymin, ymax + 1, dtype=np.float32)
-        xx, yy = np.meshgrid(xs, ys)  # both (H, W)
-        pts = np.stack([xx.ravel(), yy.ravel()], axis=-1)  # (N, 2)
-
-        # Barycentric (vectorized)
-        v0v1 = uv1 - uv0
-        v0v2 = uv2 - uv0
-        v0p = pts - uv0
-        d00 = np.dot(v0v1, v0v1)
-        d01 = np.dot(v0v1, v0v2)
-        d11 = np.dot(v0v2, v0v2)
-        d20 = v0p @ v0v1
-        d21 = v0p @ v0v2
-        denom = d00 * d11 - d01 * d01
-        if abs(denom) < 1e-12:
-            continue
-        v = (d11 * d20 - d01 * d21) / denom
-        w = (d00 * d21 - d01 * d20) / denom
-        u = 1 - v - w
-        inside = (u >= -1e-5) & (v >= -1e-5) & (w >= -1e-5)
-        if not inside.any():
-            continue
-
-        u, v, w = u[inside], v[inside], w[inside]
-        col = (u[:, None] * c0) + (v[:, None] * c1) + (w[:, None] * c2)  # (M, 3)
-        px = pts[inside].astype(np.int32)
-        tex[px[:, 1], px[:, 0]] = col
-        mask[px[:, 1], px[:, 0]] = True
-
-    # Fill UV-island gaps via nearest-neighbor distance transform
-    if not mask.all():
-        _, indices = ndimage.distance_transform_edt(~mask, return_indices=True)
-        for ch in range(3):
-            tex[..., ch] = tex[..., ch][indices[0], indices[1]]
-
-    # Encode linear → sRGB before saving as PNG.
-    # Three.js treats PNG textures as sRGB and decodes to linear during shading,
-    # so storing linear values would double-darken them.
-    tex_srgb = _linear_to_srgb(tex)
-    tex_u8 = np.clip(tex_srgb * 255, 0, 255).astype(np.uint8)
-    img = Image.fromarray(tex_u8)
-
-    # Per-corner UV array for the trimesh (V_uv-indexed UVs aligned to F_uv)
-    per_corner_uvs = uvs[F_uv].astype(np.float32)  # (F, 3, 2)
-    return per_corner_uvs, img
+    # Return the decimated mesh WITH its decimated vertex colors. Viser displays
+    # these directly via add_mesh_trimesh + vertex_colors (no GLB texture-atlas
+    # round-trip → no UV scramble bugs). The on-disk OBJ uses the texture atlas
+    # we just saved (MeshLab / Blender path).
+    return {
+        "verts": V,                          # decimated vertices (no seam-split)
+        "faces": Faces.astype(np.int32),     # decimated faces (no seam-split)
+        "colors": np.clip(C, 0, 1),          # decimated per-vertex colors
+        # Texture artifacts still available for users who want to push a textured GLB:
+        "uv": uvs,
+        "tex_image": img_for_viser,
+        "uv_verts": V_uv,                    # xatlas-unwrapped (for textured GLB)
+        "uv_faces": F_uv.astype(np.int32),
+        "per_vertex_uv": True,
+    }
 
 
 def _linear_to_srgb(c: np.ndarray) -> np.ndarray:

@@ -523,7 +523,8 @@ class SplatTrainer:
 
         video = Path(video)
         signature = (video, int(max_frames))
-        out_dir = self.output_root / (name or video.stem)
+        self.name = name or video.stem
+        out_dir = self.output_root / self.name
         if self._last_video != signature or self.data is None:
             self.data = _preprocess_video(video, out_dir, self.device, max_frames)
             self._last_video = signature
