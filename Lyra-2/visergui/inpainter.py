@@ -104,33 +104,33 @@ class InpainterPanel:
             self.gui_prompt = self.server.gui.add_text(
                 "prompt",
                 initial_value=(
-                    "Fill in the missing regions to match the reference views consistently. "
-                    "Maintain scene geometry and lighting."
+                    "Fill in the missing regions consistent with the reference view. "
+                    "Maintain scene geometry, lighting, and architecture."
                 ),
             )
             self.gui_model_id = self.server.gui.add_text(
                 "model_id",
-                initial_value="black-forest-labs/FLUX.1-schnell",
+                initial_value="black-forest-labs/FLUX.2-klein-base-9B",
                 hint=(
-                    "Default = FLUX.1-schnell ('fast' in German), Apache-licensed, ~1s @ 4 steps. "
-                    "Highest quality + multi-view refs: black-forest-labs/FLUX.1-Kontext-dev (~30s). "
-                    "FLUX inpaint-tuned: black-forest-labs/FLUX.1-Fill-dev. "
-                    "Mainstream fallbacks: stable-diffusion-v1-5/stable-diffusion-inpainting (~1-2s), "
-                    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 (~3-6s)."
+                    "Default = FLUX.2-Klein-base-9B (BFL's 'interactive visual intelligence' inpaint "
+                    "model with native reference-image conditioning, 9B params, ~25GB). "
+                    "KV variant: black-forest-labs/FLUX.2-klein-9b-kv. "
+                    "Alternatives: black-forest-labs/FLUX.1-Fill-dev (no refs), "
+                    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 (SDXL inpaint, no refs)."
                 ),
             )
             self.gui_steps = self.server.gui.add_slider(
-                "steps", initial_value=4, min=1, max=50, step=1,
-                hint="FLUX-schnell: 4 (2 for speed). FLUX-Fill/Kontext: 28+. SD-1.5: 20-30. SDXL: 12-20.",
+                "steps", initial_value=20, min=1, max=50, step=1,
+                hint="FLUX2-Klein: 20-30. FLUX-Fill: 28+. SDXL: 12-20. SD-1.5: 20-30.",
             )
             self.gui_guidance = self.server.gui.add_slider(
-                "guidance", initial_value=0.0, min=0.0, max=15.0, step=0.5,
-                hint="FLUX-schnell: 0 (distilled). FLUX-Fill: 3-5. SD: 7-9. SDXL: 5-8.",
+                "guidance", initial_value=8.0, min=0.0, max=15.0, step=0.5,
+                hint="FLUX2-Klein: 8.0. FLUX-Fill: 3-5. SDXL: 5-8. SD: 7-9.",
             )
             self.gui_strength = self.server.gui.add_slider(
-                "strength", initial_value=0.95, min=0.1, max=1.0, step=0.05,
+                "strength", initial_value=0.85, min=0.1, max=1.0, step=0.05,
                 hint="How much noise to add to the masked region (1.0=full inpaint, lower=preserve "
-                     "more of the original). Few-step models (schnell, 4 steps) need ~0.95.",
+                     "more of the original). FLUX2-Klein default: 0.8.",
             )
             self.gui_inpaint_btn = self.server.gui.add_button("Inpaint")
             self.gui_inpaint_preview = self.server.gui.add_image(placeholder, label="inpaint result")
@@ -374,39 +374,84 @@ class InpainterPanel:
             guidance = float(self.gui_guidance.value)
             model_id = self.gui_model_id.value
 
+            # SDXL/FLUX require height & width divisible by 8 (FLUX often 16).
+            # Pad the image+mask up to the next multiple, run, then crop back.
+            mult = 16 if "flux" in model_id.lower() else 8
+            target_W = ((image_pil.width + mult - 1) // mult) * mult
+            target_H = ((image_pil.height + mult - 1) // mult) * mult
+            pad_r = target_W - image_pil.width
+            pad_b = target_H - image_pil.height
+            if pad_r or pad_b:
+                im_np = np.asarray(image_pil)
+                mk_np = np.asarray(mask_pil)
+                im_padded = np.pad(im_np, ((0, pad_b), (0, pad_r), (0, 0)),
+                                   mode="edge")
+                # Mask the padded strip = 0 (don't inpaint there), so output
+                # padding region is undefined but we'll crop it out anyway.
+                mk_padded = np.pad(mk_np, ((0, pad_b), (0, pad_r)),
+                                   mode="constant", constant_values=0)
+                image_for_pipe = Image.fromarray(im_padded)
+                mask_for_pipe = Image.fromarray(mk_padded)
+            else:
+                image_for_pipe = image_pil
+                mask_for_pipe = mask_pil
+
             self.gui_status.content = f"_Loading {model_id}…_"
             pipeline = self._get_pipeline(model_id)
             self.gui_status.content = f"_Running {model_id} ({steps} steps)…_"
             t0 = time.perf_counter()
 
+            # Debug: save the EXACT image+mask going to the pipeline so we can
+            # check that the mask is meaningful (white = inpaint, black = keep)
+            # and the image looks right.
+            dbg_dir = self._out_dir()
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            image_for_pipe.save(str(dbg_dir / "_dbg_pipe_input.png"))
+            mask_for_pipe.save(str(dbg_dir / "_dbg_pipe_mask.png"))
+            print(f"  inpainter: dbg input → {dbg_dir / '_dbg_pipe_input.png'}",
+                  file=sys.stderr, flush=True)
+            print(f"  inpainter: dbg mask  → {dbg_dir / '_dbg_pipe_mask.png'}",
+                  file=sys.stderr, flush=True)
+            mk_arr = np.asarray(mask_for_pipe)
+            print(f"  inpainter: mask stats: min={mk_arr.min()} max={mk_arr.max()} "
+                  f"mean={mk_arr.mean():.1f} white_pixels={(mk_arr > 127).sum()}",
+                  file=sys.stderr, flush=True)
+
             with torch.no_grad():
                 kwargs = dict(
                     prompt=prompt,
-                    image=image_pil,
-                    mask_image=mask_pil,
+                    image=image_for_pipe,
+                    mask_image=mask_for_pipe,
                     num_inference_steps=steps,
                     guidance_scale=guidance,
                     strength=float(self.gui_strength.value),
-                    height=image_pil.height,
-                    width=image_pil.width,
+                    height=image_for_pipe.height,
+                    width=image_for_pipe.width,
                 )
-                # FLUX-schnell's T5 caps at 256 tokens; FLUX-dev allows 512.
+                # FLUX-schnell's T5 caps at 256 tokens; other FLUX variants 512.
                 pipeline_kind = type(pipeline).__name__
-                if "Flux" in pipeline_kind:
+                if "Flux" in pipeline_kind and "Flux2" not in pipeline_kind:
                     kwargs["max_sequence_length"] = 256 if "schnell" in model_id.lower() else 512
-                # FluxKontextPipeline takes a list of reference images.
-                # FluxFill / SDXL inpaint don't — we just skip references in that case.
-                if "Kontext" in pipeline_kind:
-                    kwargs["reference_images"] = ref_pils
+                # Reference-image arg per pipeline:
+                #   - Flux2KleinInpaintPipeline → image_reference (single PIL)
+                #   - FluxKontextInpaintPipeline → ip_adapter_image (needs adapter loaded)
+                #   - FluxInpaintPipeline → ip_adapter_image (needs adapter loaded)
+                #   - Others → no reference support; skip silently
+                if ref_pils and "Klein" in pipeline_kind:
+                    # Klein takes a single best-neighbor reference (the first one,
+                    # which we already ranked highest in Phase 2a).
+                    kwargs["image_reference"] = ref_pils[0]
                 out = pipeline(**kwargs).images[0]                    # PIL
 
             dt = time.perf_counter() - t0
 
             inpaint_u8 = np.asarray(out.convert("RGB"))
-            # If the model rescaled, make sure shapes match what we planned
-            # for K_out / W / H. Force resize back if needed.
+            # Crop off the padding so the output matches the saved K/c2w/H/W.
             if inpaint_u8.shape[:2] != (H, W):
-                inpaint_u8 = np.asarray(out.convert("RGB").resize((W, H), Image.BILINEAR))
+                inpaint_u8 = inpaint_u8[:H, :W]
+            if inpaint_u8.shape[:2] != (H, W):
+                # Fallback if the model rescaled (rare, but covered)
+                inpaint_u8 = np.asarray(Image.fromarray(inpaint_u8).resize((W, H), Image.BILINEAR))
 
             # Phase 2c — save artifacts.
             out_dir = self._out_dir()
@@ -459,12 +504,14 @@ class InpainterPanel:
         import diffusers
         mid = model_id.lower()
         # Choose pipeline class:
-        if "kontext" in mid:
-            cls = diffusers.FluxKontextPipeline
+        if "klein" in mid:
+            cls = diffusers.Flux2KleinInpaintPipeline   # inpaint + image_reference
+        elif "kontext" in mid:
+            cls = diffusers.FluxKontextInpaintPipeline  # whole-image edit + mask
         elif "flux" in mid and "fill" in mid:
             cls = diffusers.FluxFillPipeline
         elif "flux" in mid:
-            cls = diffusers.FluxInpaintPipeline   # works for schnell + dev
+            cls = diffusers.FluxInpaintPipeline         # schnell + dev
         else:
             cls = diffusers.AutoPipelineForInpainting
         # FLUX prefers bf16; SD/SDXL run fine in fp16.
