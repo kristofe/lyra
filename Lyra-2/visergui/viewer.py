@@ -907,6 +907,18 @@ class ViewerApp:
             )
         # Add mesh panel after init controls
         self._build_mesh_panel()
+        # Inpainter panel (Phase 1+ — see inpainter.py)
+        try:
+            from inpainter import InpainterPanel
+            self.inpainter = InpainterPanel(
+                server=self.server,
+                trainer_ref=self._trainer_ref,
+                viewer=self,
+            )
+        except Exception as e:
+            import traceback
+            print(f"  inpainter: panel init skipped: {e}", file=__import__("sys").stderr)
+            traceback.print_exc()
 
     def _build_mesh_panel(self) -> None:
         """Mesh generation controls (Phase 4)."""
