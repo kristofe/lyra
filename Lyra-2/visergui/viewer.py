@@ -836,12 +836,26 @@ class ViewerApp:
         # original flat layout.
         if self.training_control is not None or self._initializer is not None:
             tabs = self.server.gui.add_tab_group()
-            with tabs.add_tab("Inspect"):
+            with tabs.add_tab("Render"):
                 self._build_inspect_panel()
-            with tabs.add_tab("Training"):
+            with tabs.add_tab("Train"):
                 if self._initializer is not None:
                     self._build_init_panel()
                 self._build_training_gui(with_folder=False)
+            with tabs.add_tab("Mesh"):
+                self._build_mesh_panel()
+            with tabs.add_tab("Inpaint"):
+                try:
+                    from inpainter import InpainterPanel
+                    self.inpainter = InpainterPanel(
+                        server=self.server,
+                        trainer_ref=self._trainer_ref,
+                        viewer=self,
+                    )
+                except Exception as e:
+                    import traceback
+                    print(f"  inpainter: panel init skipped: {e}", file=__import__("sys").stderr)
+                    traceback.print_exc()
         else:
             self._build_inspect_panel()
 
@@ -905,20 +919,7 @@ class ViewerApp:
                     float(self.gui_init_scale_mult.value)
                 )
             )
-        # Add mesh panel after init controls
-        self._build_mesh_panel()
-        # Inpainter panel (Phase 1+ — see inpainter.py)
-        try:
-            from inpainter import InpainterPanel
-            self.inpainter = InpainterPanel(
-                server=self.server,
-                trainer_ref=self._trainer_ref,
-                viewer=self,
-            )
-        except Exception as e:
-            import traceback
-            print(f"  inpainter: panel init skipped: {e}", file=__import__("sys").stderr)
-            traceback.print_exc()
+        # Mesh + Inpaint panels are now their own tabs (see _build_panel).
 
     def _build_mesh_panel(self) -> None:
         """Mesh generation controls (Phase 4)."""
@@ -1372,7 +1373,7 @@ class ViewerApp:
 
         with self.server.gui.add_folder("Training Cameras"):
             self.gui_show_train_cams = self.server.gui.add_checkbox(
-                "show", initial_value=True,
+                "show", initial_value=False,
                 hint="Render a frustum for every training-frame camera.",
             )
             self.gui_train_cam_scale = self.server.gui.add_slider(
@@ -1380,7 +1381,7 @@ class ViewerApp:
                 hint="Frustum size in world units.",
             )
             self.gui_train_cam_images = self.server.gui.add_checkbox(
-                "show images", initial_value=True,
+                "show images", initial_value=False,
                 hint="Display each training frame inside its frustum.",
             )
             self.gui_train_cam_count = self.server.gui.add_markdown(
