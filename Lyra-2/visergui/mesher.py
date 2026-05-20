@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import Callable
 
 
+# Module-level cache for DLNR depth maps. Keyed on a tuple that identifies the
+# splat state + camera config + DLNR stereo params. The cached value is a list
+# of (rgb_cpu, depth_cpu, weight_cpu, c2w_cpu, K_cpu) tuples — one per camera.
+# Density / shell_thickness are NOT part of the key; they only affect the
+# downstream TSDF integration which is cheap to rerun.
+_DLNR_DEPTH_CACHE: dict[tuple, list] = {}
+
+
 def generate_mesh(
     means: torch.Tensor,
     quats: torch.Tensor,
@@ -34,6 +42,7 @@ def generate_mesh(
     tex_size: int = 1024,
     out_path: Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
+    splat_fingerprint: int | None = None,
 ) -> dict:
     """
     Generate a mesh from Gaussian splats using fvdb TSDF or DLNR.
@@ -71,7 +80,8 @@ def generate_mesh(
     elif mode == "dlnr":
         return _mesh_dlnr(
             model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
-            density, shell_thickness, bake_texture, tex_size, out_path, progress_cb
+            density, shell_thickness, bake_texture, tex_size, out_path, progress_cb,
+            splat_fingerprint,
         )
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -139,96 +149,188 @@ def _mesh_tsdf(
     return {"verts": verts, "faces": faces, "normals": normals, "colors": None}
 
 
+@torch.no_grad()
 def _mesh_dlnr(model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
-               density, shell_thickness, bake_texture, tex_size, out_path, progress_cb):
-    """DLNR stereo depth meshing with per-vertex colors."""
-    from fvdb_reality_capture.tools import mesh_from_splats_dlnr
-    from fvdb_reality_capture.sfm_scene import sfm_cache
+               density, shell_thickness, bake_texture, tex_size, out_path, progress_cb,
+               splat_fingerprint):
+    """DLNR stereo depth meshing with per-vertex colors.
+
+    DLNR depth generation is the dominant cost (~10s+); density and
+    shell_thickness only affect the TSDF integration that follows. We cache
+    the per-camera (rgb, depth, weight) tensors keyed on splat state + camera
+    config so re-meshing with different density/shell skips the DLNR pass.
+    """
+    import sys
+    import pathlib
+    import tempfile
     import threading
+    from fvdb import Grid
+    from fvdb_reality_capture.tools._tsdf_from_splats_dlnr import TSDFInputDataset
+    from fvdb_reality_capture.foundation_models.dlnr import DLNRModel
+    from fvdb_reality_capture.sfm_scene import sfm_cache
 
-    # Patch FileLock to not use signals (which don't work in non-main threads or with event loops)
-    original_enter = sfm_cache.FileLock.__enter__
-    original_exit = sfm_cache.FileLock.__exit__
+    # DLNR stereo params (kept stable so density/shell can change without invalidating)
+    BASELINE_FRAC = 0.15
+    NEAR_MULT = 1.0
+    FAR_MULT = 100.0
+    REPRO_THRESH = 10.0
+    ALPHA_THRESH = 0.1
 
-    def patched_enter(self):
-        # Skip signal setup, just use basic locking
-        if not hasattr(self, '_lock'):
-            self._lock = threading.Lock()
-        self._lock.acquire()
-        return self
-
-    def patched_exit(self, *args):
-        if hasattr(self, '_lock'):
-            self._lock.release()
-
-    sfm_cache.FileLock.__enter__ = patched_enter
-    sfm_cache.FileLock.__exit__ = patched_exit
-
-    try:
-        import sys
-        TRUNC = density * scene_diag
-        vox = TRUNC / shell_thickness
-        print(f"  _mesh_dlnr: scene_diag={scene_diag:.4f}  density={density}  "
-              f"TRUNC={TRUNC:.4f}  voxel={vox:.4f}  shell={shell_thickness}",
+    TRUNC = density * scene_diag
+    vox = TRUNC / shell_thickness
+    print(f"  _mesh_dlnr: scene_diag={scene_diag:.4f}  density={density}  "
+          f"TRUNC={TRUNC:.4f}  voxel={vox:.4f}  shell={shell_thickness}",
+          file=sys.stderr, flush=True)
+    if TRUNC > 0.05:
+        print(f"  _mesh_dlnr: WARNING — TRUNC={TRUNC*100:.1f}cm is large; "
+              f"colors will be averaged across a wide spatial band. "
+              f"Lower 'density' slider for finer color resolution.",
               file=sys.stderr, flush=True)
-        if TRUNC > 0.05:
-            print(f"  _mesh_dlnr: WARNING — TRUNC={TRUNC*100:.1f}cm is large; "
-                  f"colors will be averaged across a wide spatial band. "
-                  f"Lower 'density' slider for finer color resolution.",
-                  file=sys.stderr, flush=True)
-        image_sizes = torch.tensor([[H, W]] * n_cams, dtype=torch.int32, device=device)
 
-        verts_d, faces_d, colors_d = mesh_from_splats_dlnr(
-            model=model,
-            camera_to_world_matrices=c2w,
-            projection_matrices=K,
-            image_sizes=image_sizes,
-            truncation_margin=TRUNC,
-            grid_shell_thickness=shell_thickness,
-            baseline=0.15,
-            near=1.0,
-            far=100.0,
-            disparity_reprojection_threshold=10.0,
-            alpha_threshold=0.1,
-            image_downsample_factor=1,
-            use_absolute_baseline=False,
-            show_progress=True,
+    image_sizes = torch.tensor([[H, W]] * n_cams, dtype=torch.int32, device=device)
+
+    # ---- 1. DLNR depth pass (cached on splat_fingerprint + camera/stereo config) ----
+    cache_key = (
+        splat_fingerprint, n_cams, H, W,
+        BASELINE_FRAC, NEAR_MULT, FAR_MULT, REPRO_THRESH, ALPHA_THRESH,
+    )
+    cached = _DLNR_DEPTH_CACHE.get(cache_key) if splat_fingerprint is not None else None
+
+    if cached is None:
+        # Patch FileLock to skip signal handling (broken in non-main threads)
+        original_enter = sfm_cache.FileLock.__enter__
+        original_exit = sfm_cache.FileLock.__exit__
+
+        def patched_enter(self):
+            if not hasattr(self, '_lock'):
+                self._lock = threading.Lock()
+            self._lock.acquire()
+            return self
+
+        def patched_exit(self, *args):
+            if hasattr(self, '_lock'):
+                self._lock.release()
+
+        sfm_cache.FileLock.__enter__ = patched_enter
+        sfm_cache.FileLock.__exit__ = patched_exit
+
+        try:
+            print(f"  _mesh_dlnr: DLNR cache miss — generating depths for {n_cams} cams",
+                  file=sys.stderr, flush=True)
+            with torch.no_grad(), tempfile.TemporaryDirectory() as tmpdir:
+                dataset = TSDFInputDataset(
+                    cache_path=pathlib.Path(tmpdir),
+                    model=model,
+                    camera_to_world_matrices=c2w,
+                    projection_matrices=K,
+                    image_sizes=image_sizes,
+                    baseline=BASELINE_FRAC,
+                    near=NEAR_MULT,
+                    far=FAR_MULT,
+                    reprojection_threshold=REPRO_THRESH,
+                    alpha_threshold=ALPHA_THRESH,
+                    dlnr_model=DLNRModel(backbone="middleburry", device=model.device),
+                    use_absolute_baseline=False,
+                    show_progress=True,
+                )
+                # Drain dataset entries onto CPU so we can release the tempdir.
+                cached = []
+                for i in range(len(dataset)):
+                    rgb_i, depth_i, weight_i = dataset[i]
+                    cached.append((rgb_i.cpu(), depth_i.cpu(), weight_i.cpu()))
+        finally:
+            sfm_cache.FileLock.__enter__ = original_enter
+            sfm_cache.FileLock.__exit__ = original_exit
+
+        if splat_fingerprint is not None:
+            _DLNR_DEPTH_CACHE.clear()  # only keep one entry — splat state changes invalidate old
+            _DLNR_DEPTH_CACHE[cache_key] = cached
+    else:
+        print(f"  _mesh_dlnr: DLNR cache HIT — reusing {n_cams} cached depths",
+              file=sys.stderr, flush=True)
+
+    # ---- 2. Manual TSDF integration using cached (rgb, depth, weight) tuples ----
+    dtype = torch.float16
+    feature_dtype = torch.uint8
+    accum_grid = Grid.from_dense(dense_dims=1, ijk_min=0, voxel_size=vox, origin=0.0, device=device)
+    tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    weights = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    colors_grid = torch.zeros((accum_grid.num_voxels, model.num_channels), device=device, dtype=feature_dtype)
+
+    for i, (rgb_cpu, depth_cpu, weight_cpu) in enumerate(cached):
+        cam_to_world_matrix = c2w[i].to(dtype=torch.float32, device=device)
+        projection_matrix = K[i].to(dtype=torch.float32, device=device)
+
+        rgb_image = (rgb_cpu * 255).to(feature_dtype).to(device)
+        depth_image = depth_cpu.to(dtype).to(device)
+        weight_image = weight_cpu.to(dtype).to(device)
+
+        accum_grid, tsdf, weights, colors_grid = accum_grid.integrate_tsdf_with_features(
+            TRUNC,
+            projection_matrix.to(dtype),
+            cam_to_world_matrix.to(dtype),
+            tsdf,
+            colors_grid,
+            weights,
+            depth_image,
+            rgb_image,
+            weight_image,
         )
 
-        verts = verts_d.cpu().numpy().astype(np.float32)
-        faces = faces_d.cpu().numpy().astype(np.int32)
-        faces = faces[:, ::-1]  # Flip winding order to fix inside-out mesh
-        colors = colors_d.cpu().numpy().astype(np.float32)
+        # Prune zero-weight voxels each step to bound memory
+        new_grid = accum_grid.pruned_grid(weights > 0.0)
+        tsdf = new_grid.inject_from(accum_grid, tsdf)
+        colors_grid = new_grid.inject_from(accum_grid, colors_grid)
+        weights = new_grid.inject_from(accum_grid, weights)
+        accum_grid = new_grid
 
-        # Texture bake → returns (uv, tex_image) or (None, None) if disabled/fails
-        uv, tex_image = (None, None)
-        if bake_texture:
-            try:
-                uv, tex_image = _bake_texture_fast(verts, faces, colors, tex_size)
-            except Exception as e:
-                print(f"Texture baking skipped: {e}")
-                import traceback; traceback.print_exc()
-
-        # Save mesh files if requested
-        if out_path:
-            out_path = Path(out_path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            _save_ply(out_path.with_stem("mesh_dlnr"), verts, faces, colors=colors)
-            if uv is not None and tex_image is not None:
-                _save_textured_obj(out_path.with_stem("mesh_dlnr_tex"), verts, faces, uv, tex_image)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         if progress_cb:
-            progress_cb(n_cams, n_cams)
+            progress_cb(i + 1, n_cams)
 
-        return {
-            "verts": verts, "faces": faces,
-            "normals": None, "colors": colors,
-            "uv": uv, "tex_image": tex_image,
-        }
-    finally:
-        # Restore original FileLock methods
-        sfm_cache.FileLock.__enter__ = original_enter
-        sfm_cache.FileLock.__exit__ = original_exit
+    # Final prune
+    new_grid = accum_grid.pruned_grid(weights > 0.0)
+    filter_tsdf = new_grid.inject_from(accum_grid, tsdf)
+    filter_colors = new_grid.inject_from(accum_grid, colors_grid)
+
+    # ---- 3. Marching cubes + vertex color sampling ----
+    mesh_vertices, mesh_faces, _ = new_grid.marching_cubes(filter_tsdf, 0.0)
+    mesh_colors = new_grid.sample_trilinear(mesh_vertices, filter_colors.to(dtype)) / 255.0
+    mesh_colors.clip_(min=0.0, max=1.0)
+
+    verts = mesh_vertices.cpu().numpy().astype(np.float32)
+    faces = mesh_faces.cpu().numpy().astype(np.int32)
+    faces = faces[:, ::-1]  # Flip winding order to fix inside-out mesh
+    colors = mesh_colors.cpu().numpy().astype(np.float32)
+
+    # Texture bake → (uv, tex_image) or (None, None) if disabled/fails
+    uv, tex_image = (None, None)
+    if bake_texture:
+        try:
+            uv, tex_image = _bake_texture_fast(verts, faces, colors, tex_size)
+        except Exception as e:
+            print(f"Texture baking skipped: {e}")
+            import traceback; traceback.print_exc()
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _save_ply(out_path.with_stem("mesh_dlnr"), verts, faces, colors=colors)
+        if uv is not None and tex_image is not None:
+            _save_textured_obj(out_path.with_stem("mesh_dlnr_tex"), verts, faces, uv, tex_image)
+
+    return {
+        "verts": verts, "faces": faces,
+        "normals": None, "colors": colors,
+        "uv": uv, "tex_image": tex_image,
+    }
+
+
+def clear_dlnr_cache() -> None:
+    """Drop any cached DLNR depth maps. Call after manual splat edits."""
+    _DLNR_DEPTH_CACHE.clear()
 
 
 # -----------------------------------------------------------------------------
@@ -712,50 +814,50 @@ def bake_texture_from_splat_projection(
         pos3d = u_b.unsqueeze(-1) * vv0 + v_b.unsqueeze(-1) * vv1 + w_b.unsqueeze(-1) * vv2
         # → (B, H_pad, W_pad, 3)
 
-        # Project to ALL cameras at once. Output shape will be (B, H_pad, W_pad, C, ...)
-        # Memory: ch_size * H_pad * W_pad * n_cams * (3 + 2) * 4 bytes
-        pos_h = torch.cat([pos3d, torch.ones_like(pos3d[..., :1])], dim=-1)   # (B, H, W, 4)
-        # Reshape for batched matmul against (C, 4, 4) w2c
-        pos_h_flat = pos_h.unsqueeze(-2)                                       # (B, H, W, 1, 4)
-        # w2c: (C, 4, 4) — we want (B, H, W, C, 3) after projection
-        # Use einsum for clarity
-        # pos_cam = w2c @ pos_h, then take xyz: pos_cam[..., :3]
-        # einsum: "C i j, B H W j -> B H W C i"
-        pos_cam_all = torch.einsum("cij,bhwj->bhwci", w2c, pos_h)              # (B, H, W, C, 4)
-        pos_cam = pos_cam_all[..., :3]                                          # (B, H, W, C, 3)
-        z = pos_cam[..., 2]                                                     # (B, H, W, C)
-        ok_z = z > 1e-6
-        z_safe = z.clamp_min(1e-6).unsqueeze(-1)                                # (B, H, W, C, 1)
-        # Project via K (shared, take K[0] since all cameras have same intrinsics)
+        # Batch cameras to keep per-chunk memory bounded while staying vectorized.
+        # Pick cam_batch so each (B, H, W, cam_batch, 3) tensor fits within ~1 GB.
+        # (Peak is several such tensors; the 1 GB budget keeps total per-tensor footprint sane.)
         K0 = K[0]                                                                # (3, 3)
-        proj = torch.einsum("ij,bhwcj->bhwci", K0, (pos_cam / z_safe))           # (B, H, W, C, 3)
-        ix = proj[..., 0].round().long()
-        iy = proj[..., 1].round().long()
-        ok_xy = ok_z & (ix >= 0) & (ix < image_size) & (iy >= 0) & (iy < image_size)
+        bytes_per_elem = 4 * 3
+        cam_batch = max(1, min(n_cams,
+            int(1e9 // max(1, ch_size * H_pad * W_pad * bytes_per_elem))))
 
-        # Depth visibility: rendered cam_depth at (cam, iy, ix) ≈ projected z
-        # We need cam_depth indexed by (cam, iy, ix). Build flat index.
-        # cam_depth shape: (C, H_img, W_img) → flat indexable
-        ix_c = ix.clamp(0, image_size - 1)
-        iy_c = iy.clamp(0, image_size - 1)
-        # cam index for each (b, h, w, c) is just c
-        c_idx_tensor = torch.arange(n_cams, device=device).view(1, 1, 1, n_cams).expand_as(ix_c)
-        rendered_z = cam_depth[c_idx_tensor, iy_c, ix_c]                         # (B, H, W, C)
-        visible = (rendered_z - z).abs() < DEPTH_TOL
+        inside_f = inside.float()
+        wsum = torch.zeros_like(inside_f)                                        # (B, H, W)
+        rgbsum = torch.zeros((*inside_f.shape, 3), device=device, dtype=torch.float32)
+        normal_b = ch_normal.view(ch_size, 1, 1, 1, 3)                           # broadcast over C
+        pos3d_5 = pos3d.unsqueeze(-2)                                            # (B, H, W, 1, 3)
+        pos_h = torch.cat([pos3d, torch.ones_like(pos3d[..., :1])], dim=-1)      # (B, H, W, 4)
 
-        # Per-camera weight: max(0, normal · (camera_center - pos3d).normalized())
-        # = max(0, dot(normal, view_vec_to_camera))
-        view_vec = cam_centers.view(1, 1, 1, n_cams, 3) - pos3d.unsqueeze(-2)    # (B, H, W, C, 3)
-        view_vec_n = view_vec / view_vec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        normal_b = ch_normal.view(ch_size, 1, 1, 1, 3)                           # (B, 1, 1, 1, 3)
-        weight = (view_vec_n * normal_b).sum(-1).clamp_min(0)                    # (B, H, W, C)
-        weight = weight * visible.float() * ok_xy.float() * inside.unsqueeze(-1).float()
+        for cb_s in range(0, n_cams, cam_batch):
+            cb_e = min(n_cams, cb_s + cam_batch)
+            Cb = cb_e - cb_s
+            w2c_b = w2c[cb_s:cb_e]                                               # (Cb, 4, 4)
+            cc_b  = cam_centers[cb_s:cb_e]                                       # (Cb, 3)
 
-        # Sample RGB at (cam, iy_c, ix_c)
-        rgb_all = cam_rgb[c_idx_tensor, iy_c, ix_c]                              # (B, H, W, C, 3)
-        # Weighted average
-        wsum  = weight.sum(dim=-1)                                                # (B, H, W)
-        rgbsum = (rgb_all * weight.unsqueeze(-1)).sum(dim=-2)                    # (B, H, W, 3)
+            pos_cam = torch.einsum("cij,bhwj->bhwci", w2c_b, pos_h)[..., :3]     # (B, H, W, Cb, 3)
+            z = pos_cam[..., 2]                                                  # (B, H, W, Cb)
+            ok_z = z > 1e-6
+            z_safe = z.clamp_min(1e-6).unsqueeze(-1)
+            proj = torch.einsum("ij,bhwcj->bhwci", K0, pos_cam / z_safe)         # (B, H, W, Cb, 3)
+            ix = proj[..., 0].round().long()
+            iy = proj[..., 1].round().long()
+            ok_xy = ok_z & (ix >= 0) & (ix < image_size) & (iy >= 0) & (iy < image_size)
+            ix_c = ix.clamp(0, image_size - 1)
+            iy_c = iy.clamp(0, image_size - 1)
+
+            cam_idx = torch.arange(cb_s, cb_e, device=device).view(1, 1, 1, Cb).expand_as(ix_c)
+            rendered_z = cam_depth[cam_idx, iy_c, ix_c]                          # (B, H, W, Cb)
+            visible = (rendered_z - z).abs() < DEPTH_TOL
+
+            view_vec = cc_b.view(1, 1, 1, Cb, 3) - pos3d_5                       # (B, H, W, Cb, 3)
+            view_vec_n = view_vec / view_vec.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            n_dot_v = (view_vec_n * normal_b).sum(-1).clamp_min(0)               # (B, H, W, Cb)
+            w_b = n_dot_v * visible.float() * ok_xy.float() * inside_f.unsqueeze(-1)
+            rgb_b = cam_rgb[cam_idx, iy_c, ix_c]                                 # (B, H, W, Cb, 3)
+            wsum  = wsum + w_b.sum(dim=-1)
+            rgbsum = rgbsum + (rgb_b * w_b.unsqueeze(-1)).sum(dim=-2)
+
         valid_texel = wsum > 1e-6
         rgb_avg = torch.zeros_like(rgbsum)
         rgb_avg[valid_texel] = rgbsum[valid_texel] / wsum[valid_texel].unsqueeze(-1)

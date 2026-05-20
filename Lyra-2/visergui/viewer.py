@@ -1035,6 +1035,11 @@ class ViewerApp:
             import sys
             print(f"  mesh: output dir = {out_dir.resolve()}", file=sys.stderr, flush=True)
 
+            # Fingerprint = (step_count, num_splats). Changes whenever the splat
+            # state advances or its size changes, invalidating the DLNR cache.
+            step_count = int(getattr(t, "_step_count", 0))
+            fingerprint = hash((step_count, int(means.shape[0])))
+
             result = generate_mesh(
                 means=means,
                 quats=quats,
@@ -1050,6 +1055,7 @@ class ViewerApp:
                 bake_texture=False,
                 out_path=out_path,
                 progress_cb=progress,
+                splat_fingerprint=fingerprint,
             )
 
             # Persist the raw mesh so we can bake textures later

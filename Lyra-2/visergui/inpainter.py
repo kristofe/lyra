@@ -148,7 +148,7 @@ class InpainterPanel:
     # ----------------------------------------------------------- Phase 1
 
     def _on_capture_click(self) -> None:
-        """Capture a splat render from the viewer's current camera."""
+        """Capture a render from the viewer's current camera, honoring its display mode."""
         try:
             t0 = time.perf_counter()
 
@@ -177,30 +177,14 @@ class InpainterPanel:
             H, W = int(d.H), int(d.W)
             K = d.K[0].to(device, dtype=torch.float32)
 
-            # 4. Render via gsplat.
-            from gsplat import rasterization
-            p = t.train.params
-            with torch.no_grad():
-                means    = p["means"]
-                quats    = F.normalize(p["quats"], dim=-1)
-                scales   = torch.exp(p["scales"])
-                opac     = torch.sigmoid(p["opacities"])
-                # SH: cat sh0 + shN (shN may be (M, 0, 3) if sh_max_deg=0)
-                sh = torch.cat([p["sh0"], p["shN"]], dim=1)
-                sh_deg = int(round(sh.shape[1] ** 0.5)) - 1
-                out, alpha, _ = rasterization(
-                    means=means, quats=quats, scales=scales, opacities=opac,
-                    colors=sh,
-                    viewmats=w2c[None], Ks=K[None],
-                    width=W, height=H,
-                    sh_degree=sh_deg, packed=False,
-                    render_mode="RGB+ED",
-                )
-                # out: (1, H, W, 4) → RGB+depth ; alpha: (1, H, W, 1)
-                rgb = out[0, :, :, :3].clamp(0, 1).cpu().numpy()
-                alpha_np = alpha[0, :, :, 0].clamp(0, 1).cpu().numpy()
-
-            rgb_u8 = (rgb * 255).astype(np.uint8)
+            # 4. Pick renderer based on the viewer's Display dropdown.
+            display_mode = (self._viewer.display_mode if self._viewer is not None else "splats")
+            if display_mode == "points":
+                rgb_u8, alpha_np = self._render_points(w2c, K, W, H, device)
+            elif display_mode == "mesh":
+                rgb_u8, alpha_np = self._render_mesh(w2c_np, K.cpu().numpy(), W, H)
+            else:
+                rgb_u8, alpha_np = self._render_splats(w2c, K, W, H, t)
 
             # 5. Save to disk.
             out_dir = self._out_dir()
@@ -223,7 +207,8 @@ class InpainterPanel:
             dt = time.perf_counter() - t0
             cov = float((alpha_np > 0.5).mean()) * 100
             self.gui_status.content = (
-                f"_Captured {W}×{H}, alpha>0.5 coverage {cov:.0f}% in {dt:.2f}s_  \n"
+                f"_Captured ({display_mode}) {W}×{H}, alpha>0.5 coverage "
+                f"{cov:.0f}% in {dt:.2f}s_  \n"
                 f"`{png_path.resolve()}`"
             )
             print(f"  inpainter: captured → {png_path.resolve()}",
@@ -233,6 +218,104 @@ class InpainterPanel:
             import traceback
             self.gui_status.content = f"_Capture error: {e}_"
             traceback.print_exc()
+
+    # ---------------------------------------------- per-display-mode renderers
+
+    def _render_splats(self, w2c, K, W, H, t) -> tuple[np.ndarray, np.ndarray]:
+        from gsplat import rasterization
+        p = t.train.params
+        with torch.no_grad():
+            sh = torch.cat([p["sh0"], p["shN"]], dim=1)
+            sh_deg = int(round(sh.shape[1] ** 0.5)) - 1
+            out, alpha, _ = rasterization(
+                means=p["means"],
+                quats=F.normalize(p["quats"], dim=-1),
+                scales=torch.exp(p["scales"]),
+                opacities=torch.sigmoid(p["opacities"]),
+                colors=sh,
+                viewmats=w2c[None], Ks=K[None],
+                width=W, height=H,
+                sh_degree=sh_deg, packed=False,
+                render_mode="RGB+ED",
+            )
+            rgb = out[0, :, :, :3].clamp(0, 1).cpu().numpy()
+            alpha_np = alpha[0, :, :, 0].clamp(0, 1).cpu().numpy()
+        return (rgb * 255).astype(np.uint8), alpha_np
+
+    def _render_points(self, w2c, K, W, H, device) -> tuple[np.ndarray, np.ndarray]:
+        """Rasterize visible PointCloudLayers as tiny opaque splats via gsplat."""
+        from gsplat import rasterization
+        from viewer import compute_colors
+
+        scene = self._viewer.scene
+        with scene.read() as s:
+            layers = [l for l in s.point_clouds.values() if l.visible]
+        if not layers:
+            return np.zeros((H, W, 3), dtype=np.uint8), np.zeros((H, W), dtype=np.float32)
+
+        means_list, color_list, scale_list = [], [], []
+        for layer in layers:
+            pts = torch.from_numpy(layer.points.astype(np.float32)).to(device)
+            rgb = torch.from_numpy(compute_colors(layer).astype(np.float32) / 255.0).to(device)
+            means_list.append(pts)
+            color_list.append(rgb)
+            # Use the layer's point_size as a world-space radius for an isotropic splat.
+            r = float(layer.point_size) if layer.point_size > 0 else 0.0005
+            scale_list.append(torch.full((pts.shape[0], 3), r, device=device))
+
+        means = torch.cat(means_list, dim=0)
+        colors = torch.cat(color_list, dim=0).unsqueeze(1)            # (N, 1, 3) — sh0 only
+        scales = torch.cat(scale_list, dim=0)
+        quats = torch.zeros((means.shape[0], 4), device=device)
+        quats[:, 0] = 1.0                                              # identity
+        opacities = torch.ones((means.shape[0],), device=device)
+
+        with torch.no_grad():
+            out, alpha, _ = rasterization(
+                means=means, quats=quats, scales=scales, opacities=opacities,
+                colors=colors,
+                viewmats=w2c[None], Ks=K[None],
+                width=W, height=H,
+                sh_degree=0, packed=False,
+                render_mode="RGB+ED",
+            )
+            rgb = out[0, :, :, :3].clamp(0, 1).cpu().numpy()
+            alpha_np = alpha[0, :, :, 0].clamp(0, 1).cpu().numpy()
+        return (rgb * 255).astype(np.uint8), alpha_np
+
+    def _render_mesh(self, w2c_np, K_np, W, H) -> tuple[np.ndarray, np.ndarray]:
+        """Rasterize the current mesh via Open3D's offscreen renderer."""
+        import open3d as o3d
+        scene = self._viewer.scene
+        with scene.read() as s:
+            verts = s.mesh_verts
+            faces = s.mesh_faces
+            colors = s.mesh_colors
+        if verts is None or faces is None:
+            raise RuntimeError("No mesh available — run Generate Mesh first.")
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+        if colors is not None:
+            mesh.vertex_colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+        mesh.compute_vertex_normals()
+
+        renderer = o3d.visualization.rendering.OffscreenRenderer(int(W), int(H))
+        renderer.scene.set_background([0.0, 0.0, 0.0, 0.0])
+        mat = o3d.visualization.rendering.MaterialRecord()
+        mat.shader = "defaultUnlit" if colors is not None else "defaultLit"
+        renderer.scene.add_geometry("mesh", mesh, mat)
+
+        fx, fy = float(K_np[0, 0]), float(K_np[1, 1])
+        cx, cy = float(K_np[0, 2]), float(K_np[1, 2])
+        intr = o3d.camera.PinholeCameraIntrinsic(int(W), int(H), fx, fy, cx, cy)
+        renderer.setup_camera(intr, w2c_np.astype(np.float64))
+
+        img = np.asarray(renderer.render_to_image())                  # (H, W, 3) uint8
+        depth = np.asarray(renderer.render_to_depth_image(z_in_view_space=True))
+        alpha = (np.isfinite(depth) & (depth > 0)).astype(np.float32)
+        return img, alpha
 
     # ---------------------------------------------------------- Phase 2a
 
