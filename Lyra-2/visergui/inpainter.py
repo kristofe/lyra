@@ -172,10 +172,29 @@ class InpainterPanel:
             device = t.means_t.device
             w2c = torch.from_numpy(w2c_np).to(device, dtype=torch.float32)
 
-            # 3. Use the same intrinsics + resolution as the training frames.
+            # 3. Resolution + intrinsics: match the viser viewport so the
+            #    capture is WYSIWYG. Fall back to training shape if viser
+            #    hasn't reported a viewport size yet.
             d = t.data
-            H, W = int(d.H), int(d.W)
-            K = d.K[0].to(device, dtype=torch.float32)
+            try:
+                W = int(cam.image_width); H = int(cam.image_height)
+                if W <= 0 or H <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                H, W = int(d.H), int(d.W)
+            # Cap resolution to keep capture time reasonable; preserve aspect.
+            max_side = max(int(d.H), int(d.W))
+            if max(H, W) > max_side:
+                s = max_side / max(H, W)
+                H = max(1, int(round(H * s)))
+                W = max(1, int(round(W * s)))
+            vfov = float(getattr(cam, "fov", 1.047))  # radians; ~60° fallback
+            fy = H / (2.0 * float(np.tan(vfov * 0.5)))
+            fx = fy                                                    # square pixels
+            K_np = np.array([[fx, 0.0, W / 2.0],
+                             [0.0, fy, H / 2.0],
+                             [0.0, 0.0, 1.0]], dtype=np.float32)
+            K = torch.from_numpy(K_np).to(device)
 
             # 4. Pick renderer based on the viewer's Display dropdown.
             display_mode = (self._viewer.display_mode if self._viewer is not None else "splats")
@@ -243,45 +262,114 @@ class InpainterPanel:
         return (rgb * 255).astype(np.uint8), alpha_np
 
     def _render_points(self, w2c, K, W, H, device) -> tuple[np.ndarray, np.ndarray]:
-        """Rasterize visible PointCloudLayers as tiny opaque splats via gsplat."""
-        from gsplat import rasterization
+        """Rasterize visible PointCloudLayers as screen-space sprites with a
+        z-buffer — mirrors three.js point rendering used by viser."""
+        from dataclasses import replace as dc_replace
         from viewer import compute_colors
 
+        handles = getattr(self._viewer, "_handles", {})
+        pts_list, col_list, size_list = [], [], []
         scene = self._viewer.scene
         with scene.read() as s:
-            layers = [l for l in s.point_clouds.values() if l.visible]
-        if not layers:
+            layer_items = list(s.point_clouds.items())
+        for name, layer in layer_items:
+            h = handles.get(name)
+            if h is not None:
+                if not bool(h["visible"].value):
+                    continue
+                resolved = dc_replace(
+                    layer,
+                    point_size=float(h["size"].value),
+                    color_mode=str(h["color_mode"].value),
+                    uniform_color=tuple(int(c) for c in h["uniform_color"].value),
+                )
+            else:
+                if not layer.visible:
+                    continue
+                resolved = layer
+            pts_list.append(resolved.points.astype(np.float32))
+            col_list.append(compute_colors(resolved).astype(np.float32) / 255.0)
+            size_list.append(np.full(len(resolved.points), float(resolved.point_size), dtype=np.float32))
+
+        if not pts_list:
             return np.zeros((H, W, 3), dtype=np.uint8), np.zeros((H, W), dtype=np.float32)
 
-        means_list, color_list, scale_list = [], [], []
-        for layer in layers:
-            pts = torch.from_numpy(layer.points.astype(np.float32)).to(device)
-            rgb = torch.from_numpy(compute_colors(layer).astype(np.float32) / 255.0).to(device)
-            means_list.append(pts)
-            color_list.append(rgb)
-            # Use the layer's point_size as a world-space radius for an isotropic splat.
-            r = float(layer.point_size) if layer.point_size > 0 else 0.0005
-            scale_list.append(torch.full((pts.shape[0], 3), r, device=device))
+        pts_w = torch.from_numpy(np.concatenate(pts_list)).to(device)
+        cols  = torch.from_numpy(np.concatenate(col_list)).to(device)
+        sizes = torch.from_numpy(np.concatenate(size_list)).to(device)
 
-        means = torch.cat(means_list, dim=0)
-        colors = torch.cat(color_list, dim=0).unsqueeze(1)            # (N, 1, 3) — sh0 only
-        scales = torch.cat(scale_list, dim=0)
-        quats = torch.zeros((means.shape[0], 4), device=device)
-        quats[:, 0] = 1.0                                              # identity
-        opacities = torch.ones((means.shape[0],), device=device)
+        # World → camera → image
+        R = w2c[:3, :3]; tvec = w2c[:3, 3]
+        pts_cam = pts_w @ R.T + tvec                                  # (N, 3)
+        z = pts_cam[:, 2]
+        in_front = z > 1e-3
+        if not bool(in_front.any()):
+            return np.zeros((H, W, 3), dtype=np.uint8), np.zeros((H, W), dtype=np.float32)
+        pts_cam = pts_cam[in_front]; cols = cols[in_front]
+        sizes  = sizes[in_front];   z = z[in_front]
 
-        with torch.no_grad():
-            out, alpha, _ = rasterization(
-                means=means, quats=quats, scales=scales, opacities=opacities,
-                colors=colors,
-                viewmats=w2c[None], Ks=K[None],
-                width=W, height=H,
-                sh_degree=0, packed=False,
-                render_mode="RGB+ED",
-            )
-            rgb = out[0, :, :, :3].clamp(0, 1).cpu().numpy()
-            alpha_np = alpha[0, :, :, 0].clamp(0, 1).cpu().numpy()
-        return (rgb * 255).astype(np.uint8), alpha_np
+        proj = pts_cam @ K.T / z.unsqueeze(-1)                        # (N, 3)
+        ix = proj[:, 0]; iy = proj[:, 1]
+
+        # Match viser's custom point shader (ThreeAssets.tsx PointCloudMaterial):
+        #   gl_PointSize_diameter_DB = point_size / tan(fov/2) * H_css * DPR / z
+        # In CSS pixels visible to the user that simplifies to
+        #   diameter_px = 2 * fy * size / z  →  radius_px = fy * size / z.
+        r_px = (K[1, 1] * sizes / z).clamp(min=0.5)
+
+        # Cull points whose projected disc lies entirely off-screen.
+        on_screen = (
+            (ix + r_px >= 0) & (ix - r_px < W) &
+            (iy + r_px >= 0) & (iy - r_px < H)
+        )
+        ix = ix[on_screen]; iy = iy[on_screen]; r_px = r_px[on_screen]
+        cols = cols[on_screen]; z = z[on_screen]
+        if ix.numel() == 0:
+            return np.zeros((H, W, 3), dtype=np.uint8), np.zeros((H, W), dtype=np.float32)
+
+        # Sort back-to-front so nearer points overwrite farther ones in the scatter.
+        order = torch.argsort(z, descending=True)
+        ix = ix[order]; iy = iy[order]; r_px = r_px[order]
+        cols = cols[order]; z = z[order]
+
+        img = torch.zeros((H, W, 3), device=device)
+        zbuf = torch.full((H, W), float("inf"), device=device)
+
+        # Scatter into each pixel within the on-screen disc. The disc cap (R) is
+        # taken from the max projected radius — typically 1–4 px for viser point
+        # sizes, so the (2R+1)^2 inner loop is tiny.
+        R_max = int(r_px.max().ceil().item())
+        for dy in range(-R_max, R_max + 1):
+            for dx in range(-R_max, R_max + 1):
+                if dx * dx + dy * dy > R_max * R_max:
+                    continue
+                # Per-point: in-radius for THIS offset?
+                d2 = float(dx * dx + dy * dy)
+                inside = d2 <= r_px * r_px
+                if not bool(inside.any()):
+                    continue
+                px = (ix[inside] + dx).round().long()
+                py = (iy[inside] + dy).round().long()
+                bounds = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+                px = px[bounds]; py = py[bounds]
+                cz = z[inside][bounds]; cc = cols[inside][bounds]
+                if px.numel() == 0:
+                    continue
+                # Per-pixel z-buffer compare. Use scatter_reduce to take min depth.
+                flat = py * W + px
+                # For simplicity: iterate in back-to-front order means later writes win.
+                # Filter to pixels where this point is in front of current zbuf.
+                current_z = zbuf.view(-1)[flat]
+                closer = cz < current_z
+                if not bool(closer.any()):
+                    continue
+                flat_c = flat[closer]; cc_c = cc[closer]; cz_c = cz[closer]
+                zbuf.view(-1).scatter_(0, flat_c, cz_c)
+                img.view(-1, 3).index_copy_(0, flat_c, cc_c)
+
+        alpha = (zbuf < float("inf")).to(torch.float32)
+        rgb_u8 = (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        return rgb_u8, alpha.cpu().numpy()
 
     def _render_mesh(self, w2c_np, K_np, W, H) -> tuple[np.ndarray, np.ndarray]:
         """Rasterize the current mesh via Open3D's offscreen renderer."""
