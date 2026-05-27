@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import gsplat
+from gsplat.utils import depth_to_normal
 import numpy as np
 import torch
 import viser
@@ -571,6 +572,9 @@ class Renderer:
     `color_mode='RGB'` runs gsplat with render_mode='RGB'.
     `color_mode='Depth'` runs render_mode='RGB+ED' and turbo-colorizes the
     expected-z-depth channel using a GPU LUT, normalized by [near, far].
+    `color_mode='Normals'` reuses the RGB+ED rasterization and converts the
+    expected depth to world-space surface normals via depth_to_normal, then
+    encodes them as (n+1)/2 -> RGB with empty pixels set to black.
     """
 
     def __init__(self, device: str = "cuda") -> None:
@@ -630,8 +634,8 @@ class Renderer:
             sh_degree_eff = max(0, min(int(sh_degree), int(s.sh_degree)))
             t0 = time.perf_counter()
 
-            if color_mode == "Depth":
-                out, _alpha, _info = gsplat.rasterization(
+            if color_mode in ("Depth", "Normals"):
+                out, alpha, _info = gsplat.rasterization(
                     means=s.means,
                     quats=s.quats,
                     scales=s.scales,
@@ -646,10 +650,24 @@ class Renderer:
                 )
                 # Last channel is expected depth.
                 depth = out[0, :, :, 3]
-                span = max(far - near, 1e-6)
-                d_norm = ((depth - near) / span).clamp(0.0, 1.0)
-                idx = (d_norm * 255.0).to(torch.long)
-                img_t = self._get_depth_lut()[idx]  # (H, W, 3) uint8
+                if color_mode == "Depth":
+                    span = max(far - near, 1e-6)
+                    d_norm = ((depth - near) / span).clamp(0.0, 1.0)
+                    idx = (d_norm * 255.0).to(torch.long)
+                    img_t = self._get_depth_lut()[idx]  # (H, W, 3) uint8
+                else:
+                    # Camera-space normals: identity camtoworlds leaves the
+                    # unprojected points (and thus the normals) in the OpenCV
+                    # camera frame. Negate so surfaces facing the camera have
+                    # n_z = +1 (standard normal-map convention -> light blue).
+                    eye = torch.eye(4, dtype=torch.float32, device=self.device)[None]
+                    normals = -depth_to_normal(
+                        depth[None, ..., None], eye, K, z_depth=True
+                    )[0]
+                    rgb_n = ((normals + 1.0) * 127.5).clamp(0.0, 255.0)
+                    bg = alpha[0, ..., 0] < 0.01
+                    rgb_n[bg] = 0.0
+                    img_t = rgb_n.to(torch.uint8)
             else:
                 rgb, _alpha, _info = gsplat.rasterization(
                     means=s.means,
@@ -906,13 +924,23 @@ class ViewerApp:
                 hint="Enable gsplat clone/split/prune (v3). Splat count "
                      "evolves during training.",
             )
+            self.gui_init_mode = self.server.gui.add_dropdown(
+                "mode",
+                options=("3dgs", "2dgs"),
+                initial_value=str(d.get("mode", "3dgs")),
+                hint="3dgs = gsplat.rasterization. 2dgs = rasterization_2dgs + "
+                     "distortion / normal-consistency / DA3 depth+normal "
+                     "supervision (notebook recipe). Applies on next Initialize.",
+            )
             self.gui_init_btn = self.server.gui.add_button("Initialize")
             self.gui_init_reset_btn = self.server.gui.add_button("Reset")
+            self.gui_init_prune_btn = self.server.gui.add_button("Prune Splats")
             self.gui_init_status = self.server.gui.add_markdown(
                 "**init:** not initialized"
             )
         self.gui_init_btn.on_click(lambda _ev: self._on_init_click())
         self.gui_init_reset_btn.on_click(lambda _ev: self._on_reset_click())
+        self.gui_init_prune_btn.on_click(lambda _ev: self._on_prune_click())
         if self._on_scale_mult_change is not None:
             self.gui_init_scale_mult.on_update(
                 lambda _ev: self._on_scale_mult_change(
@@ -1317,7 +1345,7 @@ class ViewerApp:
                 hint="SH degree used by the rasterizer. Clamped to the scene's available bands.",
             )
             self.gui_render_mode = self.server.gui.add_dropdown(
-                "render_mode", options=("RGB", "Depth"), initial_value="RGB"
+                "render_mode", options=("RGB", "Depth", "Normals"), initial_value="RGB"
             )
             self.gui_fov = self.server.gui.add_slider(
                 "fov_deg", min=30.0, max=110.0, step=1.0, initial_value=60.0,
@@ -1951,6 +1979,7 @@ class ViewerApp:
                 sh_max_deg=int(self.gui_init_sh_max_deg.value),
                 lpips_weight=float(self.gui_init_lpips_weight.value),
                 use_densify=bool(self.gui_init_densify.value),
+                mode=str(self.gui_init_mode.value),
             )
             # viser runs on_click in a thread pool, so blocking here is fine.
             self._initializer(opts)
@@ -1997,6 +2026,43 @@ class ViewerApp:
             self.gui_init_status.content = f"**init:** reset error — {type(e).__name__}: {e}"
         finally:
             self.gui_init_reset_btn.disabled = False
+
+    def _on_prune_click(self) -> None:
+        """Pause training, run `trainer.prune_splats()`, report counts, and
+        leave training paused so the user can inspect before resuming."""
+        t = self._trainer_ref
+        if t is None or getattr(t, "prune_splats", None) is None:
+            self.gui_init_status.content = "**prune:** trainer doesn't support pruning"
+            return
+        if not getattr(t, "_initialized", False):
+            self.gui_init_status.content = "**prune:** initialize training first"
+            return
+        try:
+            self.gui_init_prune_btn.disabled = True
+            if self.training_control is not None:
+                try:
+                    self.training_control.pause()
+                except Exception:
+                    pass
+            self.gui_init_status.content = "**prune:** running…"
+            counts = t.prune_splats()
+            # Recompute home pose so reset-camera targets the post-prune bbox.
+            if self.scene.means is not None and int(self.scene.num_splats) > 0:
+                means_np = self.scene.means.detach().cpu().numpy()
+                self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+            parts = [f"{k}={counts[k]}" for k in ("opacity", "scale", "aniso", "knn")
+                     if k in counts and counts[k] >= 0]
+            detail = ", ".join(parts) if parts else "no filters fired"
+            self.gui_init_status.content = (
+                f"**prune:** {counts['started']:,} → {counts['kept']:,} "
+                f"(−{counts['removed_total']:,}; {detail}) — click resume"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_init_status.content = f"**prune:** error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_init_prune_btn.disabled = False
 
     @staticmethod
     def _make_loss_figure(history: list[tuple[int, float]]):

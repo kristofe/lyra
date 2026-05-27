@@ -57,6 +57,8 @@ def main() -> None:
                    help="Default for the Setup→densify checkbox (1 = on, 0 = off).")
     p.add_argument("--densify-total-steps", type=int, default=7000,
                    help="Total steps the densify schedule plans for.")
+    p.add_argument("--mode", choices=("3dgs", "2dgs"), default="3dgs",
+                   help="Default for the Setup→mode dropdown.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     args = p.parse_args()
@@ -89,6 +91,7 @@ def main() -> None:
             lpips_weight=float(opts.get("lpips_weight", 0.0)),
             use_densify=bool(opts.get("use_densify", False)),
             densify_total_steps=int(args.densify_total_steps),
+            mode=str(opts.get("mode", "3dgs")),
         )
         d = trainer.data
         if d is None:
@@ -128,6 +131,7 @@ def main() -> None:
             lpips_weight=args.lpips_weight,
             scale_clamp_voxel_mult=args.max_scale_voxels,
             use_densify=bool(args.densify),
+            mode=args.mode,
         ),
         derive_splat_points=False,  # live splats invalidate the derived layer
     )

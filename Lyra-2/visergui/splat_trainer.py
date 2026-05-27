@@ -35,7 +35,8 @@ import matplotlib.pyplot as plt
 import lpips
 from tqdm.auto import tqdm
 from plyfile import PlyData, PlyElement
-from gsplat import rasterization, DefaultStrategy
+from gsplat import rasterization, rasterization_2dgs, DefaultStrategy
+from gsplat.utils import depth_to_normal
 
 if TYPE_CHECKING:
     from viewer import SceneState
@@ -347,14 +348,17 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
 
 def _make_train_state(init: GaussianInit, sh_max_deg: int = 0,
                       use_densify: bool = False,
-                      densify_total_steps: int = 7000) -> TrainState:
+                      densify_total_steps: int = 7000,
+                      mode: str = "3dgs") -> TrainState:
     """Build the ParameterDict + per-key Adam optimizers + (optional)
     DefaultStrategy.
 
     `sh_max_deg > 0` allocates shN of shape (M, (sh_max_deg+1)²−1, 3) with
     its own Adam at 1/20 of the sh0 LR. `use_densify=True` wires up the
     gsplat clone/split/prune strategy; `means` LR is scaled by scene_scale
-    to match the v3 notebook recipe."""
+    to match the v3 notebook recipe. `mode="2dgs"` switches the densify
+    strategy's gradient key to `gradient_2dgs` and disables opacity reset
+    (2DGS is very sensitive to it — matches the notebook recipe)."""
     torch.set_grad_enabled(True)
     device = init.means.device
     M = init.means.shape[0]
@@ -390,15 +394,27 @@ def _make_train_state(init: GaussianInit, sh_max_deg: int = 0,
     strategy = None
     strategy_state = None
     if use_densify:
-        # Aggressive schedule: start ~2.5x sooner, densify 2x more often,
-        # reset opacity 2x more often, and keep refining longer at the tail.
-        strategy = DefaultStrategy(
-            refine_start_iter=200,                                  # was 500
-            refine_stop_iter=max(500, densify_total_steps - 200),   # was -500
-            reset_every=1500,                                       # was 3000
-            refine_every=50,                                        # was 100
-            verbose=False,
-        )
+        if mode == "2dgs":
+            # 2DGS recipe (matches notebook cell 7): opacity reset disabled,
+            # gradient key switched to the 2DGS-specific accumulator.
+            strategy = DefaultStrategy(
+                refine_start_iter=500,
+                refine_stop_iter=max(500, densify_total_steps - 500),
+                reset_every=densify_total_steps + 1,
+                refine_every=100,
+                key_for_gradient="gradient_2dgs",
+                verbose=False,
+            )
+        else:
+            # Aggressive 3DGS schedule: start ~2.5x sooner, densify 2x more
+            # often, reset opacity 2x more often, refine longer at the tail.
+            strategy = DefaultStrategy(
+                refine_start_iter=200,                                  # was 500
+                refine_stop_iter=max(500, densify_total_steps - 200),   # was -500
+                reset_every=1500,                                       # was 3000
+                refine_every=50,                                        # was 100
+                verbose=False,
+            )
         strategy.check_sanity(params, opts)
         strategy_state = strategy.initialize_state(scene_scale=init.scene_scale)
 
@@ -406,8 +422,15 @@ def _make_train_state(init: GaussianInit, sh_max_deg: int = 0,
                       strategy=strategy, strategy_state=strategy_state)
 
 
-def render_view(data: VideoData, means, quats, log_s, logit_o, sh_all, cam_idx):
+def render_view(data: VideoData, means, quats, log_s, logit_o, sh_all, cam_idx,
+                mode: str = "3dgs"):
     sh_deg = int(round(sh_all.shape[1] ** 0.5)) - 1
+    if mode == "2dgs":
+        out, *_ = rasterization_2dgs(
+            means, quats, torch.exp(log_s), torch.sigmoid(logit_o), sh_all,
+            data.w2c[cam_idx:cam_idx+1], data.K[cam_idx:cam_idx+1], data.W, data.H,
+            sh_degree=sh_deg, packed=False, render_mode="RGB")
+        return out[0].clamp(0, 1)
     out, _, _ = rasterization(
         means, quats, torch.exp(log_s), torch.sigmoid(logit_o), sh_all,
         data.w2c[cam_idx:cam_idx+1], data.K[cam_idx:cam_idx+1], data.W, data.H,
@@ -416,12 +439,13 @@ def render_view(data: VideoData, means, quats, log_s, logit_o, sh_all, cam_idx):
 
 
 def render_and_show(data: VideoData, means, quats, log_s, logit_o, sh_all,
-                    tag: str, n_views: int = 4):
+                    tag: str, n_views: int = 4, mode: str = "3dgs"):
     idxs = torch.linspace(0, data.N - 1, n_views).round().long().tolist()
     fig, ax = plt.subplots(2, n_views, figsize=(4 * n_views, 8))
     with torch.no_grad():
         for c, i in enumerate(idxs):
-            r = render_view(data, means, quats, log_s, logit_o, sh_all, i).cpu().numpy()
+            r = render_view(data, means, quats, log_s, logit_o, sh_all, i,
+                            mode=mode).cpu().numpy()
             ax[0, c].imshow(data.rgb[i].cpu().numpy()); ax[0, c].set_title(f"gt frame {i}"); ax[0, c].axis("off")
             ax[1, c].imshow(r);                         ax[1, c].set_title(f"{tag} cam {i}"); ax[1, c].axis("off")
     plt.suptitle(tag)
@@ -509,6 +533,18 @@ class SplatTrainer:
         self.scale_clamp_voxel_mult: float = 2.0
         self._log_scale_max: float | None = None
 
+        # 2DGS mode and its extra loss terms. All weights are ignored in
+        # "3dgs" mode. Defaults match the notebook recipe in
+        # video_to_2dsplats.ipynb cell 7.
+        self.mode: str = "3dgs"                  # "3dgs" or "2dgs"
+        self.distortion_weight: float = 1.0
+        self.normal_consistency_weight: float = 0.05
+        self.depth_sup_weight: float = 0.5
+        self.da3_normal_weight: float = 0.05
+        self.dist_warmup_steps: int = 700
+        self.normal_warmup_steps: int = 1600
+        self._da3_normals: torch.Tensor | None = None
+
         self.data:  VideoData    | None = None
         self.init:  GaussianInit | None = None
         self.train: TrainState   | None = None
@@ -551,7 +587,8 @@ class SplatTrainer:
                          l1_weight: float = 1.0,
                          sh_ramp_steps_per_band: int = 1000,
                          use_densify: bool = False,
-                         densify_total_steps: int = 7000) -> None:
+                         densify_total_steps: int = 7000,
+                         mode: str = "3dgs") -> None:
         """One-call init: preprocess video (skipped if same video already
         processed), build initial gaussians, build train state, and publish
         to the scene.
@@ -560,7 +597,13 @@ class SplatTrainer:
         every `sh_ramp_steps_per_band` steps. `lpips_weight` > 0 adds an
         LPIPS perceptual term to the L1 loss. `use_densify` wires up the
         gsplat clone/split/prune strategy; `densify_total_steps` sets when
-        the strategy stops refining (refine_stop_iter = total - 500)."""
+        the strategy stops refining (refine_stop_iter = total - 500).
+        `mode="2dgs"` switches the rasterizer to `gsplat.rasterization_2dgs`
+        and adds the notebook's 2DGS loss recipe (distortion, normal
+        consistency, DA3 depth + normal supervision)."""
+        if mode not in ("3dgs", "2dgs"):
+            raise ValueError(f"mode must be '3dgs' or '2dgs', got {mode!r}")
+        self.mode = mode
         self.sh_max_deg = int(sh_max_deg)
         self.lpips_weight = float(lpips_weight)
         self.l1_weight = float(l1_weight)
@@ -583,10 +626,30 @@ class SplatTrainer:
             self.init, sh_max_deg=self.sh_max_deg,
             use_densify=self.use_densify,
             densify_total_steps=self.densify_total_steps,
+            mode=self.mode,
         )
+        # Precompute per-pixel world-space normals from DA3 depth for the
+        # 2DGS DA3 normal-supervision term. Same convention as gsplat's
+        # surf_normals (depth_to_normal of rendered depth), so the (1-cos)
+        # term pins splat orientations to actual surfaces.
+        if self.mode == "2dgs" and self.da3_normal_weight > 0.0:
+            with torch.no_grad():
+                self._da3_normals = depth_to_normal(
+                    self.data.depth[..., None], self.data.c2w, self.data.K,
+                )
+        else:
+            self._da3_normals = None
         # Cap each gaussian axis-scale at `scale_clamp_voxel_mult * voxel`.
-        # Clamping is applied after each optimizer step in log-space.
-        self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
+        # Clamping is applied after each optimizer step in log-space. Skipped
+        # in 2DGS mode — 2DGS disks routinely need scales an order of
+        # magnitude larger than voxel to cover smooth surfaces, and the
+        # 3DGS-tuned clamp prevents L1 from converging (use the post-train
+        # Prune Splats button to catch outliers instead, matching the
+        # notebook recipe).
+        if self.mode == "2dgs":
+            self._log_scale_max = None
+        else:
+            self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
         self._publish_to_scene()
         self._initialized = True
 
@@ -611,9 +674,10 @@ class SplatTrainer:
     def set_scale_clamp(self, voxel_mult: float) -> None:
         """Update the per-axis scale cap as a multiple of the init voxel edge.
         Takes effect on the next `step()`. Safe to call before init (the cap
-        will be re-derived from `init.voxel` once prepare_and_init runs)."""
+        will be re-derived from `init.voxel` once prepare_and_init runs).
+        In 2DGS mode the clamp is disabled — see `prepare_and_init`."""
         self.scale_clamp_voxel_mult = float(voxel_mult)
-        if self.init is not None:
+        if self.init is not None and self.mode != "2dgs":
             self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
 
     def save_current(self, path: str) -> None:
@@ -651,7 +715,8 @@ class SplatTrainer:
         sh_all = (p["sh0"] if p["shN"].shape[1] == 0
                   else torch.cat([p["sh0"], p["shN"]], dim=1))
         render_and_show(self.data, p["means"], p["quats"],
-                        p["scales"], p["opacities"], sh_all, tag=tag)
+                        p["scales"], p["opacities"], sh_all, tag=tag,
+                        mode=self.mode)
 
     def reset(self) -> None:
         """Tear down trainable state and clear the scene. Caller is
@@ -663,6 +728,7 @@ class SplatTrainer:
         self._step_count = 0
         self.train = None
         self.init = None
+        self._da3_normals = None
         if self.scene is not None:
             with self.scene.write() as s:
                 s.means = s.quats = s.scales = None
@@ -673,6 +739,109 @@ class SplatTrainer:
                 s.splat_version += 1
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def prune_splats(self,
+                     opa_min: float = 0.05,
+                     scale_max_frac: float = 0.10,
+                     aniso_max: float = 10.0,
+                     use_knn: bool = True,
+                     knn_k: int = 20,
+                     knn_std: float = 2.0) -> dict:
+        """Filter floater / spiky / oversized splats from the trainable
+        params in-place, then rebuild the per-key Adam optimizers and
+        (if densify is on) re-initialize strategy state. Returns a dict
+        of per-filter counts removed.
+
+        Mirrors notebook cell 17 (`splats_2dgs_clean.ply`):
+        - opacity < `opa_min`
+        - max axis-scale > `scale_max_frac * scene_scale`
+        - anisotropy (disk-plane scale ratio) > `aniso_max`
+        - KNN floaters: mean-distance > mean + `knn_std`*std (scipy KDTree)
+
+        Caller is responsible for pausing the training thread before calling
+        — replacing `self.train.params` mid-step would race with the
+        forward pass.
+        """
+        if self.train is None or self.init is None:
+            raise RuntimeError("call prepare_and_init() before prune_splats()")
+        t = self.train
+        p = t.params
+        device = p["means"].device
+        M = int(p["means"].shape[0])
+
+        with torch.no_grad():
+            scales_exp = torch.exp(p["scales"].detach())     # (M, 3)
+            opa        = torch.sigmoid(p["opacities"].detach())
+            # 2DGS: disk plane is scales[:, :2]. 3DGS: use the two largest
+            # axes as the "disk plane" for an analogous needle test.
+            if self.mode == "2dgs":
+                s_pair = scales_exp[:, :2]
+            else:
+                s_pair = scales_exp.topk(2, dim=1).values
+            s_pair_sorted, _ = torch.sort(s_pair, dim=1)
+            aniso     = s_pair_sorted[:, 1] / s_pair_sorted[:, 0].clamp_min(1e-8)
+            max_scale = scales_exp.max(dim=1).values
+            scale_cap = scale_max_frac * self.init.scene_scale
+
+            counts: dict = {"started": M}
+            keep = torch.ones(M, dtype=torch.bool, device=device)
+            for name, m in (
+                ("opacity", opa       >= opa_min),
+                ("scale",   max_scale <= scale_cap),
+                ("aniso",   aniso     <= aniso_max),
+            ):
+                counts[name] = int((~m).sum().item())
+                keep &= m
+
+            if use_knn and M > knn_k + 1:
+                try:
+                    from scipy.spatial import cKDTree
+                    means_np = p["means"].detach().cpu().numpy()
+                    tree = cKDTree(means_np)
+                    dists, _ = tree.query(means_np, k=knn_k + 1)
+                    avg_d = dists[:, 1:].mean(axis=1)
+                    thresh = float(avg_d.mean() + knn_std * avg_d.std())
+                    knn_mask = torch.from_numpy(avg_d <= thresh).to(device)
+                    counts["knn"] = int((~knn_mask).sum().item())
+                    keep &= knn_mask
+                except ImportError:
+                    counts["knn"] = -1   # scipy missing
+
+        kept = int(keep.sum().item())
+        counts["kept"] = kept
+        counts["removed_total"] = M - kept
+        if kept == M:
+            return counts
+
+        # Rebuild params + optimizers with filtered tensors. Adam state for
+        # kept splats is dropped — momentum recovers within ~hundreds of
+        # steps and the alternative (per-param state surgery) is brittle.
+        new_params = torch.nn.ParameterDict({
+            k: torch.nn.Parameter(p[k].detach()[keep].clone())
+            for k in ("means", "scales", "quats", "opacities", "sh0", "shN")
+        }).to(device)
+        means_lr = 1.6e-4 * self.init.scene_scale if self.use_densify else 1.6e-4
+        lr_table = {
+            "means":     means_lr,
+            "scales":    5e-3,
+            "quats":     1e-3,
+            "opacities": 5e-2,
+            "sh0":       2.5e-3,
+            "shN":       2.5e-3 / 20.0,
+        }
+        new_opts = {
+            k: torch.optim.Adam([{"params": [new_params[k]], "lr": lr}])
+            for k, lr in lr_table.items()
+        }
+        if t.strategy is not None:
+            t.strategy.check_sanity(new_params, new_opts)
+            t.strategy_state = t.strategy.initialize_state(
+                scene_scale=self.init.scene_scale,
+            )
+        t.params = new_params
+        t.opts   = new_opts
+        self._publish_to_scene()
+        return counts
 
     def step(self) -> float:
         if (not self._initialized or self.train is None
@@ -688,12 +857,24 @@ class SplatTrainer:
         cur_sh = self._current_sh_degree()
         sh_all = torch.cat([p["sh0"], p["shN"]], dim=1)
 
-        out, _, info = rasterization(
-            p["means"], p["quats"],
-            torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
-            sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
-            sh_degree=cur_sh, packed=False)
-        pred = out[0]                                       # (H,W,3) float
+        normals = surf_normals = distort = None
+        depth_pred = None
+        if self.mode == "2dgs":
+            colors, _, normals, surf_normals, distort, _, info = rasterization_2dgs(
+                p["means"], p["quats"],
+                torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
+                sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
+                sh_degree=cur_sh, packed=False,
+                render_mode="RGB+ED", distloss=True)
+            pred = colors[0, ..., :3]                       # (H,W,3) float
+            depth_pred = colors[0, ..., 3]                  # (H,W) float
+        else:
+            out, _, info = rasterization(
+                p["means"], p["quats"],
+                torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
+                sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
+                sh_degree=cur_sh, packed=False)
+            pred = out[0]                                   # (H,W,3) float
 
         if t.strategy is not None:
             t.strategy.step_pre_backward(p, t.opts, t.strategy_state,
@@ -720,6 +901,33 @@ class SplatTrainer:
             gt_bchw   = d.rgb[idx].permute(2, 0, 1)[None]
             lp = net(pred_bchw * 2 - 1, gt_bchw * 2 - 1).mean()
             loss = loss + self.lpips_weight * lp
+
+        # 2DGS-only regularizers. Distortion + internal normal-consistency
+        # are gated by step-count warmups so the splats don't collapse onto
+        # the rendered surface before they've learned RGB. DA3 depth + normal
+        # supervision are active from step 0 (DA3 is the init source — these
+        # just keep the disks anchored to those surfaces).
+        if self.mode == "2dgs":
+            if distort is not None and self._step_count >= self.dist_warmup_steps:
+                loss = loss + self.distortion_weight * distort.mean()
+            if (normals is not None and surf_normals is not None
+                    and self._step_count >= self.normal_warmup_steps):
+                loss = loss + self.normal_consistency_weight * (
+                    1 - (normals * surf_normals).sum(-1)
+                ).mean()
+            if self.depth_sup_weight > 0.0 and depth_pred is not None:
+                z_gt = d.depth[idx]
+                zmask = z_gt > 0.01
+                if zmask.any():
+                    loss = loss + self.depth_sup_weight * (
+                        (depth_pred - z_gt).abs()[zmask].mean()
+                    )
+            if (self.da3_normal_weight > 0.0 and self._da3_normals is not None
+                    and normals is not None):
+                nmask = d.depth[idx] > 0.01
+                if nmask.any():
+                    cos = (normals[0] * self._da3_normals[idx]).sum(-1)
+                    loss = loss + self.da3_normal_weight * (1 - cos[nmask]).mean()
 
         loss.backward()
         for o in t.opts.values():
@@ -800,6 +1008,9 @@ def main() -> None:
                    help="1 enables gsplat DefaultStrategy clone/split/prune (v3).")
     p.add_argument("--densify-total-steps", type=int, default=7000,
                    help="Total steps the densify schedule plans for (sets refine_stop_iter).")
+    p.add_argument("--mode", choices=("3dgs", "2dgs"), default="3dgs",
+                   help="3dgs = gsplat.rasterization; 2dgs = rasterization_2dgs + "
+                        "distortion/normal/depth/da3-normal regularizers (notebook recipe).")
     args = p.parse_args()
 
     #DEBUGGING
@@ -822,6 +1033,7 @@ def main() -> None:
         lpips_weight=args.lpips_weight,
         use_densify=(args.densify != 0),
         densify_total_steps=args.densify_total_steps,
+        mode=args.mode,
     )
     trainer.refine_gaussians(args.steps)
 
