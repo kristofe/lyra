@@ -60,6 +60,44 @@ class VideoData:
     H: int
     W: int
 
+    def append_frame(self, rgb: torch.Tensor, depth: torch.Tensor,
+                     K: torch.Tensor, c2w: torch.Tensor,
+                     conf: torch.Tensor | None = None,
+                     sky: torch.Tensor | None = None) -> int:
+        """Append one frame (H, W, 3) RGB / (H, W) depth / (3, 3) K / (4, 4) c2w.
+
+        Casts to the existing tensors' device + dtype, recomputes w2c, and
+        bumps N. Returns the new frame index.
+
+        Resolution must match (self.H, self.W). Caller can pass conf/sky;
+        if either field already has rows, the matching argument is required
+        (we fill with ones / zeros if None to keep the row count aligned).
+        """
+        if rgb.shape[:2] != (self.H, self.W) or depth.shape != (self.H, self.W):
+            raise ValueError(f"frame shape must be ({self.H}, {self.W}); got rgb={tuple(rgb.shape)}, depth={tuple(depth.shape)}")
+        rgb_new   = rgb.to(self.rgb).reshape(1, self.H, self.W, 3)
+        depth_new = depth.to(self.depth).reshape(1, self.H, self.W)
+        K_new     = K.to(self.K).reshape(1, 3, 3)
+        c2w_new   = c2w.to(self.c2w).reshape(1, 4, 4)
+        w2c_new   = torch.linalg.inv(c2w_new)
+
+        self.rgb   = torch.cat([self.rgb,   rgb_new],   dim=0)
+        self.depth = torch.cat([self.depth, depth_new], dim=0)
+        self.K     = torch.cat([self.K,     K_new],     dim=0)
+        self.c2w   = torch.cat([self.c2w,   c2w_new],   dim=0)
+        self.w2c   = torch.cat([self.w2c,   w2c_new],   dim=0)
+        if self.conf is not None:
+            conf_row = conf.to(self.conf).reshape(1, self.H, self.W) if conf is not None \
+                else torch.ones((1, self.H, self.W), device=self.conf.device, dtype=self.conf.dtype)
+            self.conf = torch.cat([self.conf, conf_row], dim=0)
+        if self.sky is not None:
+            sky_row = sky.to(self.sky).reshape(1, self.H, self.W) if sky is not None \
+                else torch.zeros((1, self.H, self.W), device=self.sky.device, dtype=self.sky.dtype)
+            self.sky = torch.cat([self.sky, sky_row], dim=0)
+
+        self.N += 1
+        return self.N - 1
+
 
 @dataclass
 class GaussianInit:
@@ -73,6 +111,15 @@ class GaussianInit:
     scene_scale: float
     conf_thresh: float | None
     voxel: float                     # voxel edge length used for init downsampling
+
+    def append_train_mask(self, mask: torch.Tensor) -> None:
+        """Append a per-pixel mask (H, W) bool for one new frame, keeping
+        train_mask shape in lock-step with VideoData.N after `append_frame`."""
+        m = mask.to(device=self.train_mask.device, dtype=self.train_mask.dtype)
+        if m.shape != self.train_mask.shape[1:]:
+            raise ValueError(f"mask shape {tuple(m.shape)} != train_mask frame shape "
+                             f"{tuple(self.train_mask.shape[1:])}")
+        self.train_mask = torch.cat([self.train_mask, m.unsqueeze(0)], dim=0)
 
 
 @dataclass

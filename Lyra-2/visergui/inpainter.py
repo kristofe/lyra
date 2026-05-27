@@ -135,15 +135,36 @@ class InpainterPanel:
             self.gui_inpaint_btn = self.server.gui.add_button("Inpaint")
             self.gui_inpaint_preview = self.server.gui.add_image(placeholder, label="inpaint result")
 
+            # ---- Phase 3: InstaInpaint backend (parallel to FLUX-Kontext)
+            self.gui_backend = self.server.gui.add_dropdown(
+                "backend",
+                options=["flux_kontext", "instainpaint"],
+                initial_value="flux_kontext",
+                hint=(
+                    "flux_kontext = existing FLUX path (~30 s, 2D inpaint + DA3 depth + injection). "
+                    "instainpaint = feed-forward 3DGS inpaint (~0.4 s, direct splat output)."
+                ),
+            )
+            self.gui_instainpaint_btn = self.server.gui.add_button("Run InstaInpaint")
+            self.gui_instainpaint_status = self.server.gui.add_markdown("_no instainpaint run yet_")
+
+            # ---- Phase 4: append captured view as a training frame
+            self.gui_add_frame_btn = self.server.gui.add_button("Add as Training Frame")
+            self.gui_add_frame_status = self.server.gui.add_markdown("_no frame appended_")
+
         self.gui_capture_btn.on_click(lambda _ev: self._on_capture_click())
         self.gui_neighbors_btn.on_click(lambda _ev: self._on_neighbors_click())
         self.gui_inpaint_btn.on_click(lambda _ev: self._on_inpaint_click())
+        self.gui_instainpaint_btn.on_click(lambda _ev: self._on_instainpaint_click())
+        self.gui_add_frame_btn.on_click(lambda _ev: self._on_add_frame_click())
 
         # Phase 2 state
         self.last_neighbors: dict | None = None     # {'mask','indices','rgbs','c2ws','K','H','W'}
         self.last_inpaint: dict | None = None        # {'rgb','mask','K','c2w','H','W','path','meta'}
         self._kontext_pipeline = None                # lazy-loaded diffusers pipeline
         self._kontext_model_id = None                # which model_id the cached pipeline is for
+        # Phase 3 state — provenance ledger keyed on splat index ranges added by each run.
+        self.gaussian_provenance: list[dict] = []    # [{'backend':..., 'start':int, 'end':int}, ...]
 
     # ----------------------------------------------------------- Phase 1
 
@@ -197,13 +218,15 @@ class InpainterPanel:
             K = torch.from_numpy(K_np).to(device)
 
             # 4. Pick renderer based on the viewer's Display dropdown.
+            #    Splat capture yields per-pixel depth; the other modes leave it None.
             display_mode = (self._viewer.display_mode if self._viewer is not None else "splats")
+            depth_np = None
             if display_mode == "points":
                 rgb_u8, alpha_np = self._render_points(w2c, K, W, H, device)
             elif display_mode == "mesh":
                 rgb_u8, alpha_np = self._render_mesh(w2c_np, K.cpu().numpy(), W, H)
             else:
-                rgb_u8, alpha_np = self._render_splats(w2c, K, W, H, t)
+                rgb_u8, alpha_np, depth_np = self._render_splats(w2c, K, W, H, t)
 
             # 5. Save to disk.
             out_dir = self._out_dir()
@@ -215,7 +238,7 @@ class InpainterPanel:
 
             # 6. Stash state for downstream phases.
             self.last_screenshot = {
-                "rgb": rgb_u8, "alpha": alpha_np,
+                "rgb": rgb_u8, "alpha": alpha_np, "depth": depth_np,
                 "K": K.cpu().numpy(), "c2w": c2w_np,
                 "H": H, "W": W, "path": png_path,
             }
@@ -240,7 +263,9 @@ class InpainterPanel:
 
     # ---------------------------------------------- per-display-mode renderers
 
-    def _render_splats(self, w2c, K, W, H, t) -> tuple[np.ndarray, np.ndarray]:
+    def _render_splats(self, w2c, K, W, H, t):
+        """Returns (rgb_u8, alpha_np, depth_np). Depth is in world units; pixels
+        with alpha=0 will have depth=0 from gsplat's accumulated-depth output."""
         from gsplat import rasterization
         p = t.train.params
         with torch.no_grad():
@@ -259,7 +284,10 @@ class InpainterPanel:
             )
             rgb = out[0, :, :, :3].clamp(0, 1).cpu().numpy()
             alpha_np = alpha[0, :, :, 0].clamp(0, 1).cpu().numpy()
-        return (rgb * 255).astype(np.uint8), alpha_np
+            # gsplat ED accumulates expected depth; divide by alpha to get expected depth.
+            a = alpha[0, :, :, 0].clamp_min(1e-6)
+            depth_np = (out[0, :, :, 3] / a).cpu().numpy()
+        return (rgb * 255).astype(np.uint8), alpha_np, depth_np
 
     def _render_points(self, w2c, K, W, H, device) -> tuple[np.ndarray, np.ndarray]:
         """Rasterize visible PointCloudLayers as screen-space sprites with a
@@ -665,6 +693,266 @@ class InpainterPanel:
         except Exception as e:
             import traceback
             self.gui_status.content = f"_Inpaint error: {e}_"
+            traceback.print_exc()
+
+    # ----------------------------------------------------------- Phase 3
+
+    def _on_instainpaint_click(self) -> None:
+        """Run the InstaInpaint backend: feed-forward 3DGS inpainting.
+
+        Uses the captured viewport (view 0) + 3 nearest training views with
+        SAM-2 per-view masks, then merges the resulting gaussian dict directly
+        into trainer.train.params.
+        """
+        try:
+            t0 = time.perf_counter()
+
+            if self.last_screenshot is None:
+                self.gui_instainpaint_status.content = "_Capture a view first_"
+                return
+            if self.last_neighbors is None:
+                self.gui_instainpaint_status.content = "_Click 'Find Neighbors + Build Mask' first_"
+                return
+            ss = self.last_screenshot
+            if ss.get("depth") is None:
+                self.gui_instainpaint_status.content = (
+                    "_InstaInpaint needs splat-mode capture for depth — "
+                    "switch viewer Display to 'splats' and re-capture._"
+                )
+                return
+
+            t = self._trainer_ref
+            if t is None or getattr(t, "train", None) is None:
+                self.gui_instainpaint_status.content = "_Trainer not initialized_"
+                return
+
+            nb = self.last_neighbors
+            captured_rgb_u8 = ss["rgb"]
+            captured_mask = nb["mask"].astype(bool)
+            captured_depth = ss["depth"]
+            captured_K = np.asarray(ss["K"], dtype=np.float32)
+            captured_c2w = np.asarray(ss["c2w"], dtype=np.float32)
+
+            # 1. SAM-2 per-neighbor masks via back-projection through depth.
+            from multiview_mask import prepare_multiview_masks
+            neighbor_rgbs = nb["rgbs"][:3]                # take exactly 3
+            neighbor_c2ws = [np.asarray(c, dtype=np.float32) for c in nb["c2ws"][:3]]
+            neighbor_Ks   = [np.asarray(nb["K"], dtype=np.float32)] * len(neighbor_rgbs)
+            if len(neighbor_rgbs) < 3:
+                self.gui_instainpaint_status.content = (
+                    f"_Need 3 neighbors, got {len(neighbor_rgbs)}. Raise 'n_neighbors' slider._"
+                )
+                return
+            self.gui_instainpaint_status.content = "_Running SAM 2 per-view masks…_"
+            _, nb_masks, nb_prompts = prepare_multiview_masks(
+                captured_rgb_u8, captured_mask, captured_depth,
+                captured_K, captured_c2w,
+                neighbor_rgbs, neighbor_Ks, neighbor_c2ws,
+            )
+            valid_nb = [(rgb, m, K_, c2w_) for rgb, m, K_, c2w_ in
+                        zip(neighbor_rgbs, nb_masks, neighbor_Ks, neighbor_c2ws)
+                        if m is not None]
+            if len(valid_nb) < 3:
+                self.gui_instainpaint_status.content = (
+                    f"_SAM 2 projected only {len(valid_nb)}/3 valid neighbors. "
+                    f"Pick a different click; the 3D point may have fallen out of the others' frusta._"
+                )
+                return
+
+            # 2. InstaInpaint expects ALL 4 views at the same H×W, multiples of 8.
+            #    Use the captured resolution; resize neighbors to match.
+            H_c, W_c = int(ss["H"]), int(ss["W"])
+            H_t = (H_c // 8) * 8
+            W_t = (W_c // 8) * 8
+            if (H_t, W_t) != (H_c, W_c):
+                print(f"  instainpaint: cropping {H_c}x{W_c} → {H_t}x{W_t} (multiple of 8)",
+                      file=sys.stderr, flush=True)
+
+            def _crop_to_8(img: np.ndarray) -> np.ndarray:
+                return img[:H_t, :W_t]
+
+            def _resize_to(img: np.ndarray, mode_bilinear: bool) -> np.ndarray:
+                import cv2
+                if img.shape[:2] == (H_t, W_t):
+                    return img
+                interp = cv2.INTER_AREA if mode_bilinear else cv2.INTER_NEAREST
+                return cv2.resize(img, (W_t, H_t), interpolation=interp)
+
+            captured_rgb_f = _crop_to_8(captured_rgb_u8).astype(np.float32) / 255.0
+            captured_mask_f = _crop_to_8(captured_mask).astype(np.float32)
+            ref_rgbs_f, ref_masks_f = [], []
+            for rgb, m, _, _ in valid_nb:
+                ref_rgbs_f.append(_resize_to(rgb, True).astype(np.float32) / 255.0)
+                ref_masks_f.append(_resize_to(m.astype(np.uint8), False).astype(np.float32))
+
+            rgbs   = torch.from_numpy(np.stack([captured_rgb_f]  + ref_rgbs_f))     # (4, H, W, 3)
+            masks  = torch.from_numpy(np.stack([captured_mask_f] + ref_masks_f))    # (4, H, W)
+            c2ws_cv = torch.from_numpy(np.stack([captured_c2w] + [c2w for _, _, _, c2w in valid_nb]))
+            Ks     = torch.from_numpy(np.stack([captured_K]   + [K_ for _, _, K_, _ in valid_nb]))
+
+            # 3. Call the wrapper.
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vendor" / "InstaInpaint"))
+            from wrapper import inpaint as _instainpaint
+            self.gui_instainpaint_status.content = f"_Running InstaInpaint on {H_t}x{W_t}…_"
+            out = _instainpaint(rgbs, masks, c2ws_cv, Ks)
+
+            # 4. Filter to the inpaint mask of the captured view (view 0) only.
+            #    Output gaussians are (1, 4, C, H, W); pick view 0 and mask
+            #    where the captured mask is 1 (the region we asked to inpaint).
+            xyz_v0     = out["xyz"][0, 0]        # (3, H, W)
+            rgb_v0     = out["rgb"][0, 0]        # (3, H, W)
+            opacity_v0 = out["opacity"][0, 0, 0] # (H, W)
+            scale_v0   = out["scale"][0, 0]      # (3, H, W)
+            rot_v0     = out["rotation"][0, 0]   # (4, H, W)
+
+            m_t = torch.from_numpy(captured_mask_f > 0.5).to(xyz_v0.device)
+            sel = m_t.flatten()
+            n_new = int(sel.sum().item())
+            if n_new == 0:
+                self.gui_instainpaint_status.content = "_Mask was empty after crop — nothing to add._"
+                return
+
+            def _flat(t):  # (C, H, W) → (H*W, C)
+                return t.permute(1, 2, 0).reshape(-1, t.shape[0])
+
+            means_new    = _flat(xyz_v0)[sel]                                   # (n_new, 3)
+            rgb_new      = _flat(rgb_v0).clamp(0, 1)[sel]                       # (n_new, 3) — assume already in [0,1] after fp32 cast
+            opacity_new  = opacity_v0.flatten()[sel].clamp(1e-6, 1.0 - 1e-6)    # (n_new,)
+            scale_new    = _flat(scale_v0).clamp_min(1e-6)[sel]                 # (n_new, 3)
+            rot_new      = _flat(rot_v0)[sel]                                   # (n_new, 4) quaternion (w, x, y, z)
+
+            # 5. Merge into trainer.train.params (same in-place resize pattern
+            #    used elsewhere). RGB → sh0 via inverse SH-DC: sh0 = (rgb-0.5)/C0.
+            C0 = 0.282094791
+            sh0_new = ((rgb_new - 0.5) / C0).unsqueeze(1)                       # (n_new, 1, 3)
+
+            p = t.train.params
+            existing_means = p["means"]
+            shN_existing = p["shN"]
+            shN_bands = shN_existing.shape[1]
+            shN_new = torch.zeros((n_new, shN_bands, 3), device=means_new.device, dtype=existing_means.dtype)
+
+            # Inverse activations: trainer stores log(scale), logit(opacity), unnormalized quats.
+            log_scale_new = torch.log(scale_new.to(existing_means.dtype))
+            logit_opacity_new = torch.log(opacity_new / (1 - opacity_new)).to(existing_means.dtype)
+            quats_new = rot_new.to(existing_means.dtype)
+            quats_new = quats_new / quats_new.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            start_idx = int(existing_means.shape[0])
+
+            def _append(name: str, new_tensor: torch.Tensor):
+                old = p[name].data
+                new_tensor = new_tensor.to(device=old.device, dtype=old.dtype)
+                p[name].data = torch.cat([old, new_tensor], dim=0)
+
+            _append("means",     means_new.to(existing_means.dtype))
+            _append("quats",     quats_new)
+            _append("scales",    log_scale_new)
+            _append("opacities", logit_opacity_new)
+            _append("sh0",       sh0_new.to(existing_means.dtype))
+            _append("shN",       shN_new)
+
+            end_idx = int(p["means"].shape[0])
+            self.gaussian_provenance.append({
+                "backend": "instainpaint", "start": start_idx, "end": end_idx,
+                "captured_path": str(ss["path"]),
+            })
+
+            # Trigger re-render.
+            if hasattr(self._viewer, "scene") and hasattr(self._viewer.scene, "_lock"):
+                with self._viewer.scene._lock:
+                    self._viewer.scene.splat_version += 1
+                    self._viewer.scene.num_splats = end_idx
+            elif hasattr(t, "scene") and getattr(t, "scene", None) is not None:
+                with t.scene._lock:
+                    t.scene.splat_version += 1
+                    t.scene.num_splats = end_idx
+
+            dt = time.perf_counter() - t0
+            self.gui_instainpaint_status.content = (
+                f"_InstaInpaint merged {n_new:,} new gaussians "
+                f"(total {end_idx:,}) in {dt:.2f}s_"
+            )
+            print(f"  instainpaint: merged {n_new} gaussians → total {end_idx} in {dt:.2f}s",
+                  file=sys.stderr, flush=True)
+
+        except Exception as e:
+            import traceback
+            self.gui_instainpaint_status.content = f"_InstaInpaint error: {e}_"
+            traceback.print_exc()
+
+    # ----------------------------------------------------------- Phase 4
+
+    def _on_add_frame_click(self) -> None:
+        """Append the current capture to trainer.data so the photometric loop
+        can refine the newly merged region. Prefers the FLUX-inpainted RGB
+        when available; falls back to the raw splat render. Requires depth
+        (i.e., splat-mode capture)."""
+        try:
+            if self.last_screenshot is None:
+                self.gui_add_frame_status.content = "_Capture a view first_"
+                return
+            t = self._trainer_ref
+            if t is None or getattr(t, "data", None) is None:
+                self.gui_add_frame_status.content = "_Trainer not initialized_"
+                return
+            ss = self.last_screenshot
+            depth_np = ss.get("depth")
+            if depth_np is None:
+                self.gui_add_frame_status.content = (
+                    "_Need splat-mode capture for depth — switch viewer Display to 'splats'._"
+                )
+                return
+
+            # Prefer FLUX-inpainted RGB if a recent inpaint was run; else raw.
+            if self.last_inpaint is not None and self.last_inpaint.get("rgb") is not None:
+                rgb_src = self.last_inpaint["rgb"]
+                src_tag = "flux-inpainted"
+            else:
+                rgb_src = ss["rgb"]
+                src_tag = "raw splat render"
+
+            d = t.data
+            H, W = int(d.H), int(d.W)
+            # Resize to training resolution if needed (data tensors are fixed H×W).
+            import cv2 as _cv2
+            if rgb_src.shape[:2] != (H, W):
+                rgb_src = _cv2.resize(rgb_src, (W, H), interpolation=_cv2.INTER_AREA)
+                depth_np = _cv2.resize(depth_np, (W, H), interpolation=_cv2.INTER_NEAREST)
+            # Build K at the training resolution from the captured K, scaling by H/W ratio.
+            K_cap = np.asarray(ss["K"], dtype=np.float32)
+            scale_x = W / float(ss["W"])
+            scale_y = H / float(ss["H"])
+            K_new = K_cap.copy()
+            K_new[0, 0] *= scale_x
+            K_new[1, 1] *= scale_y
+            K_new[0, 2] *= scale_x
+            K_new[1, 2] *= scale_y
+
+            rgb_t   = torch.from_numpy(rgb_src.astype(np.float32) / 255.0).to(d.rgb.device, d.rgb.dtype)
+            depth_t = torch.from_numpy(depth_np.astype(np.float32)).to(d.depth.device, d.depth.dtype)
+            K_t     = torch.from_numpy(K_new).to(d.K.device, d.K.dtype)
+            c2w_t   = torch.from_numpy(np.asarray(ss["c2w"], dtype=np.float32)).to(d.c2w.device, d.c2w.dtype)
+
+            new_idx = d.append_frame(rgb_t, depth_t, K_t, c2w_t)
+
+            # Extend the per-frame loss mask. Supervise the whole frame — depth
+            # is from the splat render itself so the "valid depth" gate isn't
+            # meaningful here; the inpainted region is the part we care about.
+            init = getattr(t, "init", None)
+            if init is not None:
+                mask = torch.ones((H, W), device=init.train_mask.device, dtype=init.train_mask.dtype)
+                init.append_train_mask(mask)
+
+            self.gui_add_frame_status.content = (
+                f"_Appended frame #{new_idx} ({src_tag}) → trainer.data now has {d.N} frames._"
+            )
+            print(f"  inpainter: appended frame #{new_idx} (src={src_tag}); data.N={d.N}",
+                  file=sys.stderr, flush=True)
+
+        except Exception as e:
+            import traceback
+            self.gui_add_frame_status.content = f"_Add-frame error: {e}_"
             traceback.print_exc()
 
     def _get_pipeline(self, model_id: str):
