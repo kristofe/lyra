@@ -648,8 +648,13 @@ def _mesh_dc(
     origin = accum_grid.voxel_to_world(ijk_min.float().unsqueeze(0))[0]
 
     # ---- 4. Dual Contouring ----
+    # Pass splat Hermite data so the per-cell QEF can use raw 2DGS disc
+    # normals where they're available — this is what makes DC actually
+    # deliver sharp corners (∇φ on its own gets washed out by TSDF fusion).
+    splat_normals = dual_contouring.quat_to_disk_normal(quats_f)
     verts, faces, vcolors = dual_contouring.dual_contour_from_grid(
         phi_dense, valid_dense, origin, VOX, colors=colors_dense,
+        splat_positions=means_f, splat_normals=splat_normals,
     )
 
     # Winding flip — same convention `_mesh_tsdf_2dgs` and `_mesh_dlnr` use

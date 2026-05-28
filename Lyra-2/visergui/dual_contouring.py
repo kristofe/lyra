@@ -319,16 +319,30 @@ def dual_contour(positions: torch.Tensor, normals: torch.Tensor,
 
 def dual_contour_from_grid(phi: torch.Tensor, valid: torch.Tensor,
                            origin: torch.Tensor, voxel_size: float,
-                           colors: torch.Tensor | None = None):
+                           colors: torch.Tensor | None = None,
+                           splat_positions: torch.Tensor | None = None,
+                           splat_normals: torch.Tensor | None = None,
+                           splat_radius_voxels: float = 3.0):
     """Classical Dual Contouring on a dense corner-SDF grid.
 
-    This is the production DC path for 2DGS meshing. The SDF comes from
-    `fvdb.Grid.integrate_tsdf*` (proven good — handles depth-driven
-    contributions across many views with proper truncation), so it's a real
-    signed-distance field with sharp zero crossings, not the splat-normal
-    projection we used in v1. Per-cell vertex placement is by QEF on the
-    surface-crossing points along the 12 cell edges, with per-crossing
-    normals from ∇φ (finite differences on the grid).
+    Topology (which cells are active, edge-walk for quads) comes from the
+    fvdb-integrated TSDF — a real, well-defined signed distance field that
+    handles depth-driven contributions across many views with proper
+    truncation. **Vertex placement** uses QEF with per-sample Hermite data,
+    preferred sources in this order:
+
+    1. If `splat_positions` + `splat_normals` are given, the QEF samples
+       are the splats falling within `splat_radius_voxels * voxel_size` of
+       the cell center. This is what makes DC actually deliver sharp
+       corners: 2DGS discs have discrete orientations (e.g. one face of a
+       cube has all-normals-+x; another has all-normals-+y), and feeding
+       those raw to QEF places a vertex on the corner-intersection ridge.
+       The smoothed ∇φ averages those normals together and gives a rounded
+       answer, which is why the V2-without-splat-Hermite cube test showed
+       DC ≈ TSDF.
+    2. If no splats are nearby (or no splat data was passed), fall back to
+       interpolated edge crossings on φ with normals from ∇φ. This is the
+       classical textbook DC — fine for smooth surfaces, not sharp ones.
 
     Args:
       phi:    (Cx, Cy, Cz) float32 — SDF at voxel corners. >0 outside,
@@ -341,6 +355,16 @@ def dual_contour_from_grid(phi: torch.Tensor, valid: torch.Tensor,
       colors: optional (Cx, Cy, Cz, 3) uint8 corner colors. When supplied,
               each output vertex gets trilinearly-sampled RGB at its world
               position.
+      splat_positions: optional (M, 3) world-space splat centers.
+      splat_normals:   optional (M, 3) unit splat normals (e.g.
+                       `quat_to_disk_normal(quats)` from a 2DGS scene).
+      splat_radius_voxels: search radius (in units of voxel_size) for
+                       splat Hermite samples per cell. 3.0 is the default —
+                       tighter values miss the sharp-corner case where the
+                       cell straddling one face needs to also see splats
+                       from the adjacent face (cube A/B on synthetic data:
+                       1.2 → 1% sharp-edge verts; 3.0 → 3.2%, matching the
+                       geometric ideal; 5.0 → 3.4% with diminishing return).
 
     Returns:
       verts:  (V, 3) float32 world-space.
@@ -412,110 +436,165 @@ def dual_contour_from_grid(phi: torch.Tensor, valid: torch.Tensor,
                     out += wt * colors_np[i0 + dx, j0 + dy, k0 + dz]
         return out / 255.0
 
-    for i in range(Nx):
-        for j in range(Ny):
-            for k in range(Nz):
-                # Quick reject: any invalid corner → skip.
-                cs = (sign_np[i, j, k], sign_np[i+1, j, k], sign_np[i, j+1, k],
-                      sign_np[i+1, j+1, k], sign_np[i, j, k+1], sign_np[i+1, j, k+1],
-                      sign_np[i, j+1, k+1], sign_np[i+1, j+1, k+1])
-                if -1 in cs:
-                    continue
-                s_sum = sum(cs)
-                if s_sum == 0 or s_sum == 8:
-                    continue
+    # ---- Vectorized active-cell detection ----------------------------------
+    # On a real scene most cells are interior / exterior / fully-invalid —
+    # only a thin shell straddles the surface. We compute the active mask in
+    # torch (whole-grid slice ops) and Python-iterate only over those cells.
+    c000 = sign[:-1, :-1, :-1]; c100 = sign[1:, :-1, :-1]
+    c010 = sign[:-1, 1:, :-1];  c110 = sign[1:, 1:, :-1]
+    c001 = sign[:-1, :-1, 1:];  c101 = sign[1:, :-1, 1:]
+    c011 = sign[:-1, 1:, 1:];   c111 = sign[1:, 1:, 1:]
+    any_invalid = ((c000 == -1) | (c100 == -1) | (c010 == -1) | (c110 == -1)
+                   | (c001 == -1) | (c101 == -1) | (c011 == -1) | (c111 == -1))
+    s_sum = (c000 + c100 + c010 + c110 + c001 + c101 + c011 + c111).to(torch.int16)
+    active = (~any_invalid) & (s_sum > 0) & (s_sum < 8)                # (Nx,Ny,Nz)
+    active_cells = active.nonzero(as_tuple=False).cpu().numpy()        # (K, 3)
 
-                crossings_pos: list[np.ndarray] = []
-                crossings_normal: list[np.ndarray] = []
-                for a, b in EDGES:
-                    ai, aj, ak = i + a[0], j + a[1], k + a[2]
-                    bi, bj, bk = i + b[0], j + b[1], k + b[2]
-                    sa = int(sign_np[ai, aj, ak])
-                    sb = int(sign_np[bi, bj, bk])
-                    if sa == sb:
-                        continue
-                    pa = float(phi_np[ai, aj, ak])
-                    pb = float(phi_np[bi, bj, bk])
-                    denom = pa - pb
-                    t = pa / denom if abs(denom) > 1e-9 else 0.5
-                    t = max(0.0, min(1.0, t))
-                    corner_a = origin_np + np.array([ai, aj, ak], dtype=np.float64) * voxel_size
-                    corner_b = origin_np + np.array([bi, bj, bk], dtype=np.float64) * voxel_size
-                    pos = corner_a + t * (corner_b - corner_a)
-                    n = grad_np[ai, aj, ak] + t * (grad_np[bi, bj, bk] - grad_np[ai, aj, ak])
-                    nn = float(np.linalg.norm(n))
-                    if not np.isfinite(nn) or nn < 1e-8 or not np.isfinite(n).all():
-                        n = np.array([0.0, 0.0, 1.0])
-                    else:
-                        n = n / nn
-                    crossings_pos.append(pos)
-                    crossings_normal.append(n)
+    # Dense cell→vert-index grid; -1 means "this cell did not produce a vert".
+    # Replaces the dict lookup in the connectivity pass below.
+    vert_idx_grid = np.full((Nx, Ny, Nz), -1, dtype=np.int64)
 
-                if len(crossings_pos) < 2:
-                    continue
+    # Optional splat-Hermite source. We use a cKDTree for radius queries —
+    # `query_ball_point` on a million-splat tree is fast (sub-ms per query).
+    splat_tree = None
+    splat_pos_np = None
+    splat_n_np = None
+    if splat_positions is not None and splat_normals is not None:
+        from scipy.spatial import cKDTree
+        splat_pos_np = (splat_positions.cpu().numpy()
+                        if isinstance(splat_positions, torch.Tensor)
+                        else np.asarray(splat_positions))
+        splat_n_np = (splat_normals.cpu().numpy()
+                      if isinstance(splat_normals, torch.Tensor)
+                      else np.asarray(splat_normals))
+        splat_pos_np = splat_pos_np.astype(np.float64, copy=False)
+        splat_n_np = splat_n_np.astype(np.float64, copy=False)
+        splat_tree = cKDTree(splat_pos_np)
+    splat_search_r = float(splat_radius_voxels) * voxel_size
 
-                cell_origin = origin_np + np.array([i, j, k], dtype=np.float64) * voxel_size
-                vert = solve_qef_cell(
-                    np.array(crossings_pos, dtype=np.float64),
-                    np.array(crossings_normal, dtype=np.float64),
-                    cell_origin, voxel_size,
-                )
+    for cell in active_cells:
+        i = int(cell[0]); j = int(cell[1]); k = int(cell[2])
+        cell_origin = origin_np + np.array([i, j, k], dtype=np.float64) * voxel_size
+        cell_center = cell_origin + 0.5 * voxel_size
+
+        # Path A — splat Hermite data: prefer when ≥2 splats are within the
+        # search radius. Gives DC its sharp-feature win.
+        if splat_tree is not None:
+            idx = splat_tree.query_ball_point(cell_center, splat_search_r)
+            if len(idx) >= 2:
+                p_samples = splat_pos_np[idx]
+                n_samples = splat_n_np[idx]
+                vert = solve_qef_cell(p_samples, n_samples,
+                                      cell_origin, voxel_size)
+                vert_idx_grid[i, j, k] = len(vert_array)
                 vert_indices[(i, j, k)] = len(vert_array)
                 vert_array.append(vert)
                 if colors_np is not None:
                     color_array.append(_sample_color_trilinear(vert))
+                continue
 
-    # Connectivity: MC-style edge walk. Same convention as `dual_contour`.
+        # Path B — edge-crossings + ∇φ fallback (classical DC on smooth φ).
+        crossings_pos: list[np.ndarray] = []
+        crossings_normal: list[np.ndarray] = []
+        for a, b in EDGES:
+            ai, aj, ak = i + a[0], j + a[1], k + a[2]
+            bi, bj, bk = i + b[0], j + b[1], k + b[2]
+            sa = int(sign_np[ai, aj, ak])
+            sb = int(sign_np[bi, bj, bk])
+            if sa == sb:
+                continue
+            pa = float(phi_np[ai, aj, ak])
+            pb = float(phi_np[bi, bj, bk])
+            denom = pa - pb
+            t = pa / denom if abs(denom) > 1e-9 else 0.5
+            t = max(0.0, min(1.0, t))
+            corner_a = origin_np + np.array([ai, aj, ak], dtype=np.float64) * voxel_size
+            corner_b = origin_np + np.array([bi, bj, bk], dtype=np.float64) * voxel_size
+            pos = corner_a + t * (corner_b - corner_a)
+            n = grad_np[ai, aj, ak] + t * (grad_np[bi, bj, bk] - grad_np[ai, aj, ak])
+            nn = float(np.linalg.norm(n))
+            if not np.isfinite(nn) or nn < 1e-8 or not np.isfinite(n).all():
+                n = np.array([0.0, 0.0, 1.0])
+            else:
+                n = n / nn
+            crossings_pos.append(pos)
+            crossings_normal.append(n)
+
+        if len(crossings_pos) < 2:
+            continue
+
+        vert = solve_qef_cell(
+            np.array(crossings_pos, dtype=np.float64),
+            np.array(crossings_normal, dtype=np.float64),
+            cell_origin, voxel_size,
+        )
+        vert_idx_grid[i, j, k] = len(vert_array)
+        vert_indices[(i, j, k)] = len(vert_array)
+        vert_array.append(vert)
+        if colors_np is not None:
+            color_array.append(_sample_color_trilinear(vert))
+
+    # ---- Vectorized connectivity edge walk ---------------------------------
+    # For each axis, compute the corner-edge sign-change mask in torch, then
+    # Python-iterate only over the (usually small) set of crossing edges.
     faces: list[tuple[int, int, int, int]] = []
 
-    def _crosses(a: int, b: int) -> bool:
-        return (a == 0 and b == 1) or (a == 1 and b == 0)
+    def _cross_mask(s1: torch.Tensor, s2: torch.Tensor) -> torch.Tensor:
+        return ((s1 == 0) & (s2 == 1)) | ((s1 == 1) & (s2 == 0))
 
-    # +z edges (corner (i,j,k) → (i,j,k+1)) — quad over cells (i-1,j-1,k),
-    # (i,j-1,k), (i,j,k), (i-1,j,k).
-    for k in range(Cz - 1):
-        for i in range(1, Cx - 1):
-            for j in range(1, Cy - 1):
-                s1 = int(sign_np[i, j, k]); s2 = int(sign_np[i, j, k + 1])
-                if not _crosses(s1, s2):
-                    continue
-                cells = [(i-1, j-1, k), (i, j-1, k), (i, j, k), (i-1, j, k)]
-                if not all(c in vert_indices for c in cells):
-                    continue
-                idx = [vert_indices[c] for c in cells]
-                if s2:
-                    idx = idx[::-1]
-                faces.append(tuple(idx))
+    # +z edges. Interior corners (i,j) ∈ [1..Cx-2] × [1..Cy-2]; edge k ∈ [0..Cz-2].
+    if Cx > 2 and Cy > 2 and Cz > 1:
+        s_z0 = sign[1:-1, 1:-1, :-1]
+        s_z1 = sign[1:-1, 1:-1, 1:]
+        crosses_z = _cross_mask(s_z0, s_z1).nonzero(as_tuple=False).cpu().numpy()
+        for (i_, j_, k) in crosses_z:
+            i = int(i_) + 1; j = int(j_) + 1; k = int(k)
+            v00 = vert_idx_grid[i-1, j-1, k]
+            v10 = vert_idx_grid[i,   j-1, k]
+            v11 = vert_idx_grid[i,   j,   k]
+            v01 = vert_idx_grid[i-1, j,   k]
+            if v00 < 0 or v10 < 0 or v11 < 0 or v01 < 0:
+                continue
+            idx = [int(v00), int(v10), int(v11), int(v01)]
+            if int(sign_np[i, j, k + 1]):
+                idx = idx[::-1]
+            faces.append(tuple(idx))
 
-    # +y edges — quad over (i-1,j,k-1), (i,j,k-1), (i,j,k), (i-1,j,k).
-    for j in range(Cy - 1):
-        for i in range(1, Cx - 1):
-            for k in range(1, Cz - 1):
-                s1 = int(sign_np[i, j, k]); s2 = int(sign_np[i, j + 1, k])
-                if not _crosses(s1, s2):
-                    continue
-                cells = [(i-1, j, k-1), (i, j, k-1), (i, j, k), (i-1, j, k)]
-                if not all(c in vert_indices for c in cells):
-                    continue
-                idx = [vert_indices[c] for c in cells]
-                if s1:
-                    idx = idx[::-1]
-                faces.append(tuple(idx))
+    # +y edges. Interior corners (i,k) ∈ [1..Cx-2] × [1..Cz-2]; edge j ∈ [0..Cy-2].
+    if Cx > 2 and Cy > 1 and Cz > 2:
+        s_y0 = sign[1:-1, :-1, 1:-1]
+        s_y1 = sign[1:-1, 1:, 1:-1]
+        crosses_y = _cross_mask(s_y0, s_y1).nonzero(as_tuple=False).cpu().numpy()
+        for (i_, j, k_) in crosses_y:
+            i = int(i_) + 1; j = int(j); k = int(k_) + 1
+            v00 = vert_idx_grid[i-1, j, k-1]
+            v10 = vert_idx_grid[i,   j, k-1]
+            v11 = vert_idx_grid[i,   j, k]
+            v01 = vert_idx_grid[i-1, j, k]
+            if v00 < 0 or v10 < 0 or v11 < 0 or v01 < 0:
+                continue
+            idx = [int(v00), int(v10), int(v11), int(v01)]
+            if int(sign_np[i, j, k]):
+                idx = idx[::-1]
+            faces.append(tuple(idx))
 
-    # +x edges — quad over (i,j-1,k-1), (i,j,k-1), (i,j,k), (i,j-1,k).
-    for i in range(Cx - 1):
-        for j in range(1, Cy - 1):
-            for k in range(1, Cz - 1):
-                s1 = int(sign_np[i, j, k]); s2 = int(sign_np[i + 1, j, k])
-                if not _crosses(s1, s2):
-                    continue
-                cells = [(i, j-1, k-1), (i, j, k-1), (i, j, k), (i, j-1, k)]
-                if not all(c in vert_indices for c in cells):
-                    continue
-                idx = [vert_indices[c] for c in cells]
-                if s2:
-                    idx = idx[::-1]
-                faces.append(tuple(idx))
+    # +x edges. Interior corners (j,k) ∈ [1..Cy-2] × [1..Cz-2]; edge i ∈ [0..Cx-2].
+    if Cx > 1 and Cy > 2 and Cz > 2:
+        s_x0 = sign[:-1, 1:-1, 1:-1]
+        s_x1 = sign[1:, 1:-1, 1:-1]
+        crosses_x = _cross_mask(s_x0, s_x1).nonzero(as_tuple=False).cpu().numpy()
+        for (i, j_, k_) in crosses_x:
+            i = int(i); j = int(j_) + 1; k = int(k_) + 1
+            v00 = vert_idx_grid[i, j-1, k-1]
+            v10 = vert_idx_grid[i, j,   k-1]
+            v11 = vert_idx_grid[i, j,   k]
+            v01 = vert_idx_grid[i, j-1, k]
+            if v00 < 0 or v10 < 0 or v11 < 0 or v01 < 0:
+                continue
+            idx = [int(v00), int(v10), int(v11), int(v01)]
+            if int(sign_np[i + 1, j, k]):
+                idx = idx[::-1]
+            faces.append(tuple(idx))
 
     verts_np = (np.array(vert_array, dtype=np.float32)
                 if vert_array else np.zeros((0, 3), dtype=np.float32))
