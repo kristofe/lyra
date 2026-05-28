@@ -979,9 +979,11 @@ class ViewerApp:
         with self.server.gui.add_folder("Mesh"):
             self.gui_mesh_mode = self.server.gui.add_dropdown(
                 "mode",
-                options=["tsdf", "dlnr"],
+                options=["tsdf", "dlnr", "dc"],
                 initial_value="dlnr",
-                hint="TSDF (soft alpha) or DLNR (stereo depth, colored)",
+                hint="TSDF (soft alpha) / DLNR (stereo depth, colored) / "
+                     "DC (Dual Contouring on splat Hermite data — best for "
+                     "2DGS scenes with sharp features)",
             )
             self.gui_mesh_ncams = self.server.gui.add_number(
                 "cameras",
@@ -1100,7 +1102,8 @@ class ViewerApp:
                 opacities=opacities,
                 sh=sh,
                 device=str(means.device),
-                mode=self.gui_mesh_mode.value,
+                mesh_mode=self.gui_mesh_mode.value,
+                rasterizer_mode=str(getattr(t, "mode", "3dgs")),
                 n_cams=int(self.gui_mesh_ncams.value),
                 density=float(self.gui_mesh_density.value),
                 shell_thickness=float(self.gui_mesh_shell.value),
@@ -2012,6 +2015,20 @@ class ViewerApp:
             )
             # viser runs on_click in a thread pool, so blocking here is fine.
             self._initializer(opts)
+            # Auto-snap Mesh-tab sliders to the rasterizer-mode defaults
+            # (2DGS wants tighter truncation + finer voxels than 3DGS — see
+            # mesher.default_tsdf_params for the values). Skipped silently if
+            # the user doesn't have a trainer or the mesh panel didn't build.
+            t = self._trainer_ref
+            if (t is not None and getattr(self, "gui_mesh_density", None) is not None
+                    and getattr(t, "mode", None) is not None):
+                try:
+                    from mesher import default_tsdf_params
+                    p = default_tsdf_params(str(t.mode))
+                    self.gui_mesh_density.value = float(p["density"])
+                    self.gui_mesh_shell.value = float(p["shell_thickness"])
+                except Exception:
+                    pass
             # Recompute home pose from the newly-populated scene so the
             # camera-reset button lands somewhere sensible. Push the new
             # up/position/look_at to every connected client — otherwise the

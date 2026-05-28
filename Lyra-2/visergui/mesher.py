@@ -24,6 +24,17 @@ from typing import Callable
 _DLNR_DEPTH_CACHE: dict[tuple, list] = {}
 
 
+def default_tsdf_params(rasterizer_mode: str) -> dict:
+    """2DGS-friendly defaults vs 3DGS — used by the viewer to auto-snap the
+    Mesh-tab `density` / `shell_thickness` sliders when training mode changes.
+    The 2DGS notebook (`meshing_2Dexample.ipynb`) calibrates `truncation =
+    0.015 * scene_diag` and `shell_thickness = 3.0`; the existing 3DGS path
+    runs looser. The dropdown remains user-overridable after snap."""
+    if rasterizer_mode == "2dgs":
+        return {"density": 0.015, "shell_thickness": 3.0}
+    return {"density": 0.02, "shell_thickness": 6.0}
+
+
 def generate_mesh(
     means: torch.Tensor,
     quats: torch.Tensor,
@@ -31,7 +42,8 @@ def generate_mesh(
     opacities: torch.Tensor,
     sh: torch.Tensor,
     device: str = "cuda",
-    mode: str = "tsdf",
+    mesh_mode: str = "tsdf",
+    rasterizer_mode: str = "3dgs",
     n_cams: int = 96,
     H: int = 1024,
     W: int = 1024,
@@ -45,13 +57,19 @@ def generate_mesh(
     splat_fingerprint: int | None = None,
 ) -> dict:
     """
-    Generate a mesh from Gaussian splats using fvdb TSDF or DLNR.
+    Generate a mesh from Gaussian splats using fvdb TSDF, DLNR stereo, or DC.
 
     Args:
         means, quats, scales, opacities: post-activation tensors from trainer
         sh: full SH tensor (N, K, 3) — DC + higher-order bands
         device: torch device
-        mode: "tsdf" (fvdb soft-alpha TSDF) or "dlnr" (stereo depth w/ per-vertex colors)
+        mesh_mode: "tsdf" (fvdb soft-alpha TSDF) / "dlnr" (stereo depth w/ per-
+            vertex colors) / "dc" (Dual Contouring on splat Hermite data)
+        rasterizer_mode: "3dgs" or "2dgs" — when "2dgs", the TSDF path uses
+            `gsplat.rasterization_2dgs(depth_mode="median")` for dome renders
+            (less depth bias than expected depth) and weights TSDF integration
+            by a per-pixel splat-normal front-facing weight (suppresses
+            backfacing-disk contamination). 3DGS path ignores this arg.
         n_cams: number of Fibonacci-dome cameras
         H, W: render resolution per camera (1024x1024 default)
         alpha_thresh: drop pixels where alpha < this
@@ -59,8 +77,8 @@ def generate_mesh(
         progress_cb: optional callback(cam_idx, total_cams)
 
     Returns:
-        dict with "verts", "faces", "normals" (TSDF) or "normals"=None (DLNR)
-        and "colors" (None for TSDF, (V,3) float for DLNR)
+        dict with "verts", "faces", "normals" (TSDF / DC) or "normals"=None
+        (DLNR) and "colors" (None for TSDF / DC, (V,3) float for DLNR)
     """
     # Scene bounds
     bbmin = means.min(0).values
@@ -68,30 +86,68 @@ def generate_mesh(
     scene_diag = float((bbmax - bbmin).norm())
     scene_center = 0.5 * (bbmin + bbmax)
 
-    # Build splat model + dome cameras via shared helpers
-    model = _build_splat_model(means, quats, scales, opacities, sh)
+    # Dome cameras are shared by tsdf / dlnr / dc paths — build once.
     c2w, w2c, K = _build_dome_cameras(scene_center, scene_diag, n_cams, W, device)
 
-    if mode == "tsdf":
+    if mesh_mode == "dc":
+        return _mesh_dc(
+            means, quats, scales, opacities, sh,
+            c2w, w2c, K, device, n_cams, H, W, scene_diag,
+            alpha_thresh, density, shell_thickness, out_path, progress_cb,
+        )
+    if mesh_mode == "tsdf":
+        # 3DGS tsdf needs the fvdb model; 2DGS path uses gsplat directly.
+        if rasterizer_mode == "2dgs":
+            return _mesh_tsdf(
+                None, c2w, w2c, K, device, n_cams, H, W, scene_diag,
+                alpha_thresh, density, shell_thickness, out_path, progress_cb,
+                rasterizer_mode=rasterizer_mode,
+                means=means, quats=quats, scales=scales, opacities=opacities, sh=sh,
+            )
+        model = _build_splat_model(means, quats, scales, opacities, sh)
         return _mesh_tsdf(
             model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
-            alpha_thresh, density, shell_thickness, out_path, progress_cb
+            alpha_thresh, density, shell_thickness, out_path, progress_cb,
+            rasterizer_mode=rasterizer_mode,
         )
-    elif mode == "dlnr":
+    if mesh_mode == "dlnr":
+        model = _build_splat_model(means, quats, scales, opacities, sh)
         return _mesh_dlnr(
             model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
             density, shell_thickness, bake_texture, tex_size, out_path, progress_cb,
             splat_fingerprint,
         )
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+    raise ValueError(f"Unknown mesh_mode: {mesh_mode}")
 
 
 def _mesh_tsdf(
     model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
-    alpha_thresh, density, shell_thickness, out_path, progress_cb
+    alpha_thresh, density, shell_thickness, out_path, progress_cb,
+    rasterizer_mode: str = "3dgs",
+    means=None, quats=None, scales=None, opacities=None, sh=None,
 ):
-    """TSDF fusion with soft alpha weighting (verbatim from notebook)."""
+    """TSDF fusion with soft alpha weighting.
+
+    Two sub-paths:
+    - `rasterizer_mode="3dgs"` (default): verbatim notebook path — fvdb's
+      mode-blind `render_images_and_depths` + expected-depth + alpha-weighted
+      integration. No vertex colors (use the texture-bake step for that).
+    - `rasterizer_mode="2dgs"`: dispatches to `_mesh_tsdf_2dgs` which uses
+      `gsplat.rasterization_2dgs(depth_mode="median")` for sharper depth
+      (notebook §15 shows ~5× lower depth rel-err than expected) AND feeds
+      RGB through `Grid.integrate_tsdf_with_features` to produce a colored
+      mesh in one pass (no separate bake step needed). Returns
+      vertex-colored output matching the DLNR contract.
+    """
+    if rasterizer_mode == "2dgs":
+        if means is None or quats is None or scales is None or opacities is None or sh is None:
+            raise ValueError("rasterizer_mode='2dgs' requires means/quats/scales/opacities/sh")
+        return _mesh_tsdf_2dgs(
+            c2w, w2c, K, device, n_cams, H, W, scene_diag,
+            alpha_thresh, density, shell_thickness, out_path, progress_cb,
+            means, quats, scales, opacities, sh,
+        )
+
     import fvdb
     from fvdb import Grid
 
@@ -147,6 +203,132 @@ def _mesh_tsdf(
         _save_ply(out_path.with_stem("mesh_tsdf"), verts, faces, normals=normals)
 
     return {"verts": verts, "faces": faces, "normals": normals, "colors": None}
+
+
+@torch.no_grad()
+def _mesh_tsdf_2dgs(
+    c2w, w2c, K, device, n_cams, H, W, scene_diag,
+    alpha_thresh, density, shell_thickness, out_path, progress_cb,
+    means, quats, scales, opacities, sh,
+):
+    """2DGS-rasterizer TSDF fusion with per-vertex colors.
+
+    Bypasses fvdb's mode-blind splat renderer in favour of
+    `gsplat.rasterization_2dgs(..., depth_mode="median")` for the dome views.
+    Two material differences vs the 3DGS path:
+
+    1. Median depth instead of expected depth — 2DGS expected depth is biased
+       by stacked semi-transparent disks; median crosses transmittance 0.5,
+       which sits on the actual surface.
+    2. `integrate_tsdf_with_features` accumulates RGB into a feature grid in
+       lockstep with TSDF, then `sample_trilinear` extracts per-vertex colors
+       after marching cubes (same pattern as `_mesh_dlnr`). One pass, no
+       separate bake step.
+
+    Weight is just `alpha * valid` — same as the 3DGS path. An earlier
+    revision multiplied by `(-normal · forward).clamp_min(0)` to suppress
+    backfacing disks; in practice 2DGS rasterization is two-sided in depth
+    (a backfacing disk still produces an accurate depth sample) so the
+    cosine just throws away good samples, creating coverage gaps that MC
+    fills with sign-flipped extrapolation — hence triangles pointing the
+    wrong way. Dropping it cleans up the winding.
+
+    Winding is explicitly flipped at the end (`faces[:, ::-1]`), matching
+    `_mesh_dlnr`. Both downstream paths share the convention that fvdb's
+    marching-cubes output is "inside-out" relative to viewer expectations.
+    """
+    from fvdb import Grid
+    from gsplat import rasterization_2dgs
+
+    TRUNC = density * scene_diag
+    VOX = TRUNC / shell_thickness
+    NEAR = 0.05 * scene_diag
+    FAR = 4.0 * scene_diag
+
+    dtype = torch.float16
+    feature_dtype = torch.uint8
+    accum_grid = Grid.from_dense(
+        dense_dims=1, ijk_min=0, voxel_size=VOX, origin=0.0, device=device,
+    )
+    tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    weights_g = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    colors_grid = torch.zeros((accum_grid.num_voxels, 3), device=device, dtype=feature_dtype)
+
+    sh_deg = int(round(sh.shape[1] ** 0.5)) - 1
+    means_f = means.to(torch.float32)
+    quats_f = quats.to(torch.float32)
+    scales_f = scales.to(torch.float32)
+    opa_f = opacities.to(torch.float32)
+    sh_f = sh.to(torch.float32)
+
+    for i in range(n_cams):
+        colors_pred, alphas, _normals, _surf, _distort, median_out, _info = rasterization_2dgs(
+            means_f, quats_f, scales_f, opa_f, sh_f,
+            w2c[i : i + 1].to(torch.float32),
+            K[i : i + 1].to(torch.float32),
+            W, H,
+            sh_degree=sh_deg,
+            packed=False,
+            render_mode="RGB+ED",
+            depth_mode="median",
+            distloss=False,
+        )
+        # colors_pred: (1, H, W, 4) = RGB + expected_depth (we don't use ED here).
+        rgb = colors_pred[0, ..., :3].clamp(0.0, 1.0)             # (H, W, 3) float
+        depth_med = median_out[0, ..., 0].clamp_min(0)            # (H, W) float
+        alpha_i = alphas[0, ..., 0].clamp_min(1e-10)              # (H, W) float
+
+        valid = ((depth_med > NEAR) & (depth_med < FAR) & (alpha_i > alpha_thresh)).float()
+        depth_image = depth_med.to(dtype).contiguous()
+        weight_image = (alpha_i * valid).to(dtype).contiguous()
+        rgb_image = (rgb * 255).to(feature_dtype).contiguous()    # (H, W, 3) uint8
+
+        accum_grid, tsdf, weights_g, colors_grid = accum_grid.integrate_tsdf_with_features(
+            TRUNC,
+            K[i].to(torch.float32).to(dtype),
+            c2w[i].to(torch.float32).to(dtype),
+            tsdf,
+            colors_grid,
+            weights_g,
+            depth_image,
+            rgb_image,
+            weight_image,
+        )
+
+        # Prune zero-weight voxels each step to bound memory (same as DLNR).
+        new_grid = accum_grid.pruned_grid(weights_g > 0.0)
+        tsdf = new_grid.inject_from(accum_grid, tsdf)
+        colors_grid = new_grid.inject_from(accum_grid, colors_grid)
+        weights_g = new_grid.inject_from(accum_grid, weights_g)
+        accum_grid = new_grid
+
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        if progress_cb:
+            progress_cb(i + 1, n_cams)
+
+    # Final prune + MC + color sampling — mirrors _mesh_dlnr §3.
+    new_grid = accum_grid.pruned_grid(weights_g > 0.0)
+    filt_tsdf = new_grid.inject_from(accum_grid, tsdf)
+    filt_colors = new_grid.inject_from(accum_grid, colors_grid)
+
+    mesh_v, mesh_f, _ = new_grid.marching_cubes(filt_tsdf, 0.0)
+    mesh_c = new_grid.sample_trilinear(mesh_v, filt_colors.to(dtype)) / 255.0
+    mesh_c.clip_(min=0.0, max=1.0)
+
+    verts = mesh_v.cpu().numpy().astype(np.float32)
+    faces = mesh_f.cpu().numpy().astype(np.int32)
+    faces = faces[:, ::-1]                                       # flip winding
+    colors = mesh_c.cpu().numpy().astype(np.float32)
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _save_ply(out_path.with_stem("mesh_tsdf_2dgs"), verts, faces, colors=colors)
+
+    return {"verts": verts, "faces": faces, "normals": None, "colors": colors}
 
 
 @torch.no_grad()
@@ -331,6 +513,156 @@ def _mesh_dlnr(model, c2w, w2c, K, device, n_cams, H, W, scene_diag,
 def clear_dlnr_cache() -> None:
     """Drop any cached DLNR depth maps. Call after manual splat edits."""
     _DLNR_DEPTH_CACHE.clear()
+
+
+# -----------------------------------------------------------------------------
+# Dual Contouring — `mesh_mode="dc"` path
+# -----------------------------------------------------------------------------
+
+@torch.no_grad()
+def _mesh_dc(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    sh: torch.Tensor,
+    c2w: torch.Tensor,
+    w2c: torch.Tensor,
+    K: torch.Tensor,
+    device: str,
+    n_cams: int, H: int, W: int, scene_diag: float,
+    alpha_thresh: float, density: float, shell_thickness: float,
+    out_path: Path | None,
+    progress_cb: Callable[[int, int], None] | None,
+) -> dict:
+    """Dual Contouring meshing.
+
+    The first implementation built its SDF directly from splat normals
+    (Σ wᵢ·nᵢ·(c−pᵢ) over the K-nearest splats). That produced thick
+    surfaces, lumpy verts where splats didn't fall directly inside a cell,
+    and holes near the support boundary. Replaced with the proven 2DGS
+    median-depth TSDF integration (same path as `_mesh_tsdf_2dgs`), then
+    densified to a torch grid for the DC step.
+
+    Pipeline:
+      1. Render dome views via `rasterization_2dgs(depth_mode="median")`.
+         RGB → feature grid; median depth + alpha → TSDF.
+      2. `Grid.integrate_tsdf_with_features` accumulates per-voxel SDF and
+         colors. Same fvdb mechanic that `_mesh_tsdf_2dgs` uses.
+      3. Scatter the sparse fvdb output into dense torch tensors indexed by
+         IJK − ijk_min. Origin shifts accordingly.
+      4. `dual_contouring.dual_contour_from_grid` runs classical DC: per-cell
+         QEF on edge crossings with ∇SDF normals, MC-style edge connectivity,
+         winding flip applied at the end (same convention as the other
+         fvdb-MC paths).
+    """
+    import dual_contouring
+    from fvdb import Grid
+    from gsplat import rasterization_2dgs
+
+    TRUNC = density * scene_diag
+    VOX = TRUNC / shell_thickness
+    NEAR = 0.05 * scene_diag
+    FAR = 4.0 * scene_diag
+
+    dtype = torch.float16
+    feature_dtype = torch.uint8
+    accum_grid = Grid.from_dense(
+        dense_dims=1, ijk_min=0, voxel_size=VOX, origin=0.0, device=device,
+    )
+    tsdf = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    weights_g = torch.zeros(accum_grid.num_voxels, device=device, dtype=dtype)
+    colors_grid_sp = torch.zeros((accum_grid.num_voxels, 3),
+                                 device=device, dtype=feature_dtype)
+
+    sh_deg = int(round(sh.shape[1] ** 0.5)) - 1
+    means_f = means.to(torch.float32)
+    quats_f = quats.to(torch.float32)
+    scales_f = scales.to(torch.float32)
+    opa_f = opacities.to(torch.float32)
+    sh_f = sh.to(torch.float32)
+
+    # ---- 1+2. Dome render + fvdb TSDF integration with RGB features ----
+    for i in range(n_cams):
+        colors_pred, alphas, _normals, _surf, _distort, median_out, _info = rasterization_2dgs(
+            means_f, quats_f, scales_f, opa_f, sh_f,
+            w2c[i : i + 1].to(torch.float32),
+            K[i : i + 1].to(torch.float32),
+            W, H,
+            sh_degree=sh_deg,
+            packed=False,
+            render_mode="RGB+ED",
+            depth_mode="median",
+            distloss=False,
+        )
+        rgb = colors_pred[0, ..., :3].clamp(0.0, 1.0)
+        depth_med = median_out[0, ..., 0].clamp_min(0)
+        alpha_i = alphas[0, ..., 0].clamp_min(1e-10)
+        valid = ((depth_med > NEAR) & (depth_med < FAR) & (alpha_i > alpha_thresh)).float()
+
+        depth_image = depth_med.to(dtype).contiguous()
+        weight_image = (alpha_i * valid).to(dtype).contiguous()
+        rgb_image = (rgb * 255).to(feature_dtype).contiguous()
+
+        accum_grid, tsdf, weights_g, colors_grid_sp = accum_grid.integrate_tsdf_with_features(
+            TRUNC,
+            K[i].to(torch.float32).to(dtype),
+            c2w[i].to(torch.float32).to(dtype),
+            tsdf, colors_grid_sp, weights_g,
+            depth_image, rgb_image, weight_image,
+        )
+
+        new_grid = accum_grid.pruned_grid(weights_g > 0.0)
+        tsdf = new_grid.inject_from(accum_grid, tsdf)
+        colors_grid_sp = new_grid.inject_from(accum_grid, colors_grid_sp)
+        weights_g = new_grid.inject_from(accum_grid, weights_g)
+        accum_grid = new_grid
+
+        if str(device).startswith("cuda"):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        if progress_cb:
+            progress_cb(i + 1, n_cams)
+
+    # ---- 3. Sparse → dense scatter ----
+    # Treat each fvdb voxel's CENTER world position as a DC corner sample.
+    # `accum_grid.ijk` (fvdb 0.4.2: plain Tensor of shape (N, 3)) gives the
+    # voxel indices; `voxel_to_world` resolves those to world coords so we
+    # don't have to guess the half-voxel offset for ourselves.
+    ijk = accum_grid.ijk                                                  # (N, 3) int
+    ijk_min = ijk.min(dim=0).values
+    ijk_max = ijk.max(dim=0).values
+    shape = tuple((ijk_max - ijk_min + 1).tolist())                       # (Cx,Cy,Cz)
+    phi_dense = torch.full(shape, float("inf"), dtype=torch.float32, device=device)
+    valid_dense = torch.zeros(shape, dtype=torch.bool, device=device)
+    colors_dense = torch.zeros((*shape, 3), dtype=torch.uint8, device=device)
+
+    idx = (ijk - ijk_min).long()                                          # (N, 3)
+    phi_dense[idx[:, 0], idx[:, 1], idx[:, 2]] = tsdf.float()
+    valid_dense[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    colors_dense[idx[:, 0], idx[:, 1], idx[:, 2]] = colors_grid_sp
+
+    # World origin of dense-grid corner (0,0,0) = world position of voxel
+    # ijk_min.
+    origin = accum_grid.voxel_to_world(ijk_min.float().unsqueeze(0))[0]
+
+    # ---- 4. Dual Contouring ----
+    verts, faces, vcolors = dual_contouring.dual_contour_from_grid(
+        phi_dense, valid_dense, origin, VOX, colors=colors_dense,
+    )
+
+    # Winding flip — same convention `_mesh_tsdf_2dgs` and `_mesh_dlnr` use
+    # for fvdb-driven SDF meshes.
+    if faces.size > 0:
+        faces = faces[:, ::-1].copy()
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _save_ply(out_path.with_stem("mesh_dc"), verts, faces, colors=vcolors)
+
+    return {"verts": verts, "faces": faces, "normals": None, "colors": vcolors}
 
 
 # -----------------------------------------------------------------------------
