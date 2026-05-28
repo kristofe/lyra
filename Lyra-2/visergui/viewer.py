@@ -40,6 +40,7 @@ from plyfile import PlyData
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from training import TrainingControl  # noqa: E402
+from splat_trainer import format_loss_components  # noqa: E402
 
 
 SH_C0 = 0.28209479177387814  # band-0 SH normalization (gsplat / Inria convention)
@@ -469,6 +470,13 @@ class SceneState:
         # the same lock; the GUI pump reads them under read().
         self.step: int = 0
         self.loss_history: list[tuple[int, float]] = []
+        # Latest per-term loss breakdown published by the trainer
+        # (e.g. {"l1": 0.005, "distortion": 4.2, ...}). Empty when the
+        # trainer hasn't produced any component info yet.
+        self.last_loss_components: dict[str, float] = {}
+        # Parallel history of (step, components_dict) — same length cap as
+        # `loss_history`. Used to draw per-term traces on the loss plot.
+        self.loss_components_history: list[tuple[int, dict[str, float]]] = []
         # Bumped by anything that swaps the splat tensors; the GUI pump
         # watches this so live-training publishes trigger a re-render.
         self.splat_version: int = 0
@@ -507,14 +515,23 @@ class SceneState:
         with self.write():
             self.point_clouds.pop(name, None)
 
-    def record_step(self, step: int, loss: float) -> None:
+    def record_step(self, step: int, loss: float,
+                    components: dict[str, float] | None = None) -> None:
         """Trainer-side hook. Records progress under the write lock so the
-        GUI pump's reader can never observe a partially-mutated history."""
+        GUI pump's reader can never observe a partially-mutated history.
+        `components` is the latest per-term loss breakdown (see
+        `splat_trainer.format_loss_components`); pass None or {} when no
+        breakdown is available."""
         with self.write():
             self.step = int(step)
             self.loss_history.append((int(step), float(loss)))
             if len(self.loss_history) > 10_000:
                 self.loss_history = self.loss_history[-10_000:]
+            comps = dict(components) if components else {}
+            self.last_loss_components = comps
+            self.loss_components_history.append((int(step), comps))
+            if len(self.loss_components_history) > 10_000:
+                self.loss_components_history = self.loss_components_history[-10_000:]
 
 
 # --------------------------------------------------------------------------- #
@@ -1946,6 +1963,9 @@ class ViewerApp:
             self.gui_train_status = self.server.gui.add_markdown("**status:** stopped")
             self.gui_train_step = self.server.gui.add_markdown("**step:** 0")
             self.gui_train_loss = self.server.gui.add_markdown("**loss:** —")
+            self.gui_train_loss_breakdown = self.server.gui.add_markdown(
+                "`breakdown: —`"
+            )
             self.gui_train_splat_count = self.server.gui.add_markdown(
                 f"**splats:** {int(self.scene.num_splats):,}"
             )
@@ -2074,9 +2094,15 @@ class ViewerApp:
             self.gui_init_prune_btn.disabled = False
 
     @staticmethod
-    def _make_loss_figure(history: list[tuple[int, float]]):
-        """Build a small plotly figure from a (step, loss) list, downsampled
-        stride-uniformly to ≤1000 points so websocket pushes stay cheap."""
+    def _make_loss_figure(
+        history: list[tuple[int, float]],
+        components_history: list[tuple[int, dict[str, float]]] | None = None,
+    ):
+        """Build a small plotly figure from a (step, loss) list plus an
+        optional per-term components history. Both are downsampled
+        stride-uniformly to ≤1000 points so websocket pushes stay cheap.
+        Y-axis is log so L1 (~0.005) and depth_sup (~5) can be read on the
+        same plot. Click traces in the legend to hide/show."""
         import plotly.graph_objects as go
         h = history
         if len(h) > 1000:
@@ -2084,12 +2110,37 @@ class ViewerApp:
             h = h[::stride]
         xs = [p[0] for p in h]
         ys = [p[1] for p in h]
-        fig = go.Figure(data=[go.Scatter(x=xs, y=ys, mode="lines", name="loss")])
+        traces = [go.Scatter(x=xs, y=ys, mode="lines", name="loss",
+                             line=dict(width=2, color="black"))]
+
+        if components_history:
+            ch = components_history
+            if len(ch) > 1000:
+                stride = len(ch) // 1000
+                ch = ch[::stride]
+            # Collect every key ever seen; build a per-key trace with only
+            # the steps where that key was active (warmup-gated terms have
+            # gaps before their start step).
+            keys: list[str] = []
+            for _, comps in ch:
+                for k in comps:
+                    if k not in keys:
+                        keys.append(k)
+            for k in keys:
+                kx = [step for step, comps in ch if k in comps]
+                ky = [comps[k] for _, comps in ch if k in comps]
+                if kx:
+                    traces.append(go.Scatter(x=kx, y=ky, mode="lines", name=k))
+
+        fig = go.Figure(data=traces)
         fig.update_layout(
             margin=dict(l=20, r=20, t=20, b=20),
-            height=220,
+            height=260,
             xaxis_title="step",
-            yaxis_title="loss",
+            yaxis_title="loss (log)",
+            yaxis_type="log",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1.0),
         )
         return fig
 
@@ -2124,6 +2175,8 @@ class ViewerApp:
                 step = s.step
                 splats = s.num_splats
                 history_snapshot = list(s.loss_history)
+                components_snapshot = dict(s.last_loss_components)
+                components_history_snapshot = list(s.loss_components_history)
                 splat_version = s.splat_version
             if splat_version != last_splat_version:
                 last_splat_version = splat_version
@@ -2140,6 +2193,12 @@ class ViewerApp:
                 self.gui_train_status.content = f"**status:** {ctl.status()}"
                 self.gui_train_step.content = f"**step:** {int(step):,}"
                 self.gui_train_loss.content = f"**loss:** {float(latest_loss):.6f}"
+                if components_snapshot:
+                    self.gui_train_loss_breakdown.content = (
+                        f"`{format_loss_components(components_snapshot)}`"
+                    )
+                else:
+                    self.gui_train_loss_breakdown.content = "`breakdown: —`"
                 self.gui_train_splat_count.content = f"**splats:** {int(splats):,}"
                 self.gui_splat_count_readout.content = (
                     f"**splat_count:** {int(splats):,}"
@@ -2149,7 +2208,9 @@ class ViewerApp:
                 continue
             if now - last_plot_t >= 0.5:  # 2 Hz plot
                 try:
-                    self.gui_train_loss_plot.figure = self._make_loss_figure(history_snapshot)
+                    self.gui_train_loss_plot.figure = self._make_loss_figure(
+                        history_snapshot, components_history_snapshot,
+                    )
                 except Exception:
                     pass
                 last_plot_t = now

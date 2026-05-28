@@ -594,6 +594,22 @@ def save_inria_ply(path, means, sh_all, log_s, logit_o, quats):
     PlyData([PlyElement.describe(arr, "vertex")], text=False).write(path)
 
 
+_COMPONENT_ABBR = {
+    "l1": "l1", "void": "void", "lpips": "lpips",
+    "distortion": "dist", "normal_consistency": "nrm",
+    "depth_sup": "dep", "da3_normal": "da3",
+}
+
+
+def format_loss_components(components: dict[str, float]) -> str:
+    """Compact `k=v` rendering of a per-term loss dict, sorted by magnitude.
+    Used by the trainer's tqdm postfix and the GUI loss-breakdown panel."""
+    if not components:
+        return "(no components)"
+    items = sorted(components.items(), key=lambda kv: abs(kv[1]), reverse=True)
+    return " ".join(f"{_COMPONENT_ABBR.get(k, k)}={v:.4g}" for k, v in items)
+
+
 # --------------------------------------------------------------------------- #
 # SplatTrainer: lifecycle + orchestration + scene publishing
 # --------------------------------------------------------------------------- #
@@ -658,6 +674,10 @@ class SplatTrainer:
         self.dist_warmup_steps: int = 700
         self.normal_warmup_steps: int = 1600
         self._da3_normals: torch.Tensor | None = None
+
+        # Last step's per-term loss breakdown — populated by `step()` and
+        # read by the tqdm postfix + GUI status panel.
+        self._last_loss_components: dict[str, float] = {}
 
         self.data:  VideoData    | None = None
         self.init:  GaussianInit | None = None
@@ -833,11 +853,16 @@ class SplatTrainer:
         for s in pbar:
             loss = self.step()
             if s % 100 == 0:
-                pbar.set_postfix(
-                    loss=f"{loss:.4f}",
-                    M=int(self.train.params["means"].shape[0]),
-                    sh=self._current_sh_degree(),
-                )
+                postfix = {
+                    "loss": f"{loss:.4f}",
+                    "M":    int(self.train.params["means"].shape[0]),
+                    "sh":   self._current_sh_degree(),
+                }
+                if self._last_loss_components:
+                    postfix["breakdown"] = format_loss_components(
+                        self._last_loss_components
+                    )
+                pbar.set_postfix(**postfix)
 
         torch.set_grad_enabled(False)
         self.save_current(f"{tag}.ply")
@@ -1020,11 +1045,15 @@ class SplatTrainer:
         if n_kept == 0:
             # nothing to supervise — count the iteration but skip optimizer.
             self._step_count += 1
+            self._last_loss_components = {}
             if self.scene is not None:
-                self.scene.record_step(self._step_count, 0.0)
+                self.scene.record_step(self._step_count, 0.0, {})
             return 0.0
         l1 = (diff * mask).sum() / (n_kept * 3)
         loss = self.l1_weight * l1
+        # Per-term breakdown — each entry is the *weighted* contribution to
+        # `loss` (so they sum to ~loss). Read by tqdm + GUI status panel.
+        components: dict[str, float] = {"l1": float((self.l1_weight * l1).detach().item())}
 
         # Void loss: penalise rendered alpha inside `~train_mask`. Without
         # this the masked region has zero gradient signal, so boundary
@@ -1037,6 +1066,7 @@ class SplatTrainer:
                 alpha_img = alphas[0, ..., 0]               # (H,W) in [0,1]
                 void = (alpha_img.pow(2) * void_mask).sum() / n_void
                 loss = loss + self.void_weight * void
+                components["void"] = float((self.void_weight * void).detach().item())
 
         # LPIPS over the full frame (the mask only weights L1; lpips wants a
         # spatially-contiguous image and per-pixel masking it makes no sense).
@@ -1046,6 +1076,7 @@ class SplatTrainer:
             gt_bchw   = d.rgb[idx].permute(2, 0, 1)[None]
             lp = net(pred_bchw * 2 - 1, gt_bchw * 2 - 1).mean()
             loss = loss + self.lpips_weight * lp
+            components["lpips"] = float((self.lpips_weight * lp).detach().item())
 
         # 2DGS-only regularizers. Distortion + internal normal-consistency
         # are gated by step-count warmups so the splats don't collapse onto
@@ -1054,25 +1085,33 @@ class SplatTrainer:
         # just keep the disks anchored to those surfaces).
         if self.mode == "2dgs":
             if distort is not None and self._step_count >= self.dist_warmup_steps:
-                loss = loss + self.distortion_weight * distort.mean()
+                dist_term = self.distortion_weight * distort.mean()
+                loss = loss + dist_term
+                components["distortion"] = float(dist_term.detach().item())
             if (normals is not None and surf_normals is not None
                     and self._step_count >= self.normal_warmup_steps):
-                loss = loss + self.normal_consistency_weight * (
+                nc_term = self.normal_consistency_weight * (
                     1 - (normals * surf_normals).sum(-1)
                 ).mean()
+                loss = loss + nc_term
+                components["normal_consistency"] = float(nc_term.detach().item())
             if self.depth_sup_weight > 0.0 and depth_pred is not None:
                 z_gt = d.depth[idx]
                 zmask = z_gt > 0.01
                 if zmask.any():
-                    loss = loss + self.depth_sup_weight * (
+                    dep_term = self.depth_sup_weight * (
                         (depth_pred - z_gt).abs()[zmask].mean()
                     )
+                    loss = loss + dep_term
+                    components["depth_sup"] = float(dep_term.detach().item())
             if (self.da3_normal_weight > 0.0 and self._da3_normals is not None
                     and normals is not None):
                 nmask = d.depth[idx] > 0.01
                 if nmask.any():
                     cos = (normals[0] * self._da3_normals[idx]).sum(-1)
-                    loss = loss + self.da3_normal_weight * (1 - cos[nmask]).mean()
+                    da3_term = self.da3_normal_weight * (1 - cos[nmask]).mean()
+                    loss = loss + da3_term
+                    components["da3_normal"] = float(da3_term.detach().item())
 
         loss.backward()
         for o in t.opts.values():
@@ -1091,9 +1130,10 @@ class SplatTrainer:
                 p["scales"].clamp_(max=self._log_scale_max)
 
         loss_f = float(loss.item())
+        self._last_loss_components = components
         self._step_count += 1
         if self.scene is not None:
-            self.scene.record_step(self._step_count, loss_f)
+            self.scene.record_step(self._step_count, loss_f, components)
             if self._step_count % self.publish_every == 0:
                 self._publish_to_scene()
         return loss_f
