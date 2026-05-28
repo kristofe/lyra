@@ -911,6 +911,14 @@ class ViewerApp:
                 initial_value=float(d.get("lpips_weight", 0.0)),
                 hint="LPIPS perceptual loss weight added to L1 (0 disables).",
             )
+            self.gui_init_void_weight = self.server.gui.add_slider(
+                "void_weight",
+                min=0.0, max=2.0, step=0.05,
+                initial_value=float(d.get("void_weight", 0.5)),
+                hint="Penalty on rendered alpha inside ~train_mask. Drives "
+                     "splats to render nothing in filtered regions and "
+                     "removes asymmetric growth at mask boundaries (0 disables).",
+            )
             self.gui_init_scale_mult = self.server.gui.add_slider(
                 "max_scale_voxels",
                 min=0.5, max=10.0, step=0.1,
@@ -1978,6 +1986,7 @@ class ViewerApp:
                 remove_sky=bool(self.gui_init_remove_sky.value),
                 sh_max_deg=int(self.gui_init_sh_max_deg.value),
                 lpips_weight=float(self.gui_init_lpips_weight.value),
+                void_weight=float(self.gui_init_void_weight.value),
                 use_densify=bool(self.gui_init_densify.value),
                 mode=str(self.gui_init_mode.value),
             )

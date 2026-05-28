@@ -454,6 +454,116 @@ def render_and_show(data: VideoData, means, quats, log_s, logit_o, sh_all,
     #plt.show()
 
 
+def render_mask_diagnostic(data: VideoData, init: GaussianInit,
+                           means, quats, log_s, logit_o, sh_all,
+                           tag: str, n_views: int = 4, mode: str = "3dgs") -> None:
+    """Per-frame diagnostic: shows what splats are doing inside the regions
+    that `train_mask` filtered out. For `n_views` evenly-spaced frames,
+    plots one row of: GT | GT+mask (red on excluded) | render | render·mask
+    (what L1 sees) | leak (render·~mask on grey — splats inside excluded
+    regions). Saves `{tag}_mask_diag.png`."""
+    idxs = torch.linspace(0, data.N - 1, n_views).round().long().tolist()
+    titles = ["GT", "GT + mask (red = excluded)", "render",
+              "render · mask (what L1 sees)", "leak  (render · ~mask)"]
+    n_cols = len(titles)
+    fig, ax = plt.subplots(n_views, n_cols, figsize=(4 * n_cols, 4 * n_views))
+    if n_views == 1:
+        ax = ax[None, :]
+    grey = 0.5
+    with torch.no_grad():
+        for r, i in enumerate(idxs):
+            gt = data.rgb[i].cpu().numpy()
+            mask = init.train_mask[i].cpu().numpy().astype(bool)
+            rend = render_view(data, means, quats, log_s, logit_o, sh_all, i,
+                               mode=mode).cpu().numpy()
+
+            overlay = gt.copy()
+            alpha = 0.45
+            overlay[~mask, 0] = (1 - alpha) * overlay[~mask, 0] + alpha * 1.0
+            overlay[~mask, 1] = (1 - alpha) * overlay[~mask, 1]
+            overlay[~mask, 2] = (1 - alpha) * overlay[~mask, 2]
+
+            rend_masked = rend.copy()
+            rend_masked[~mask] = 0.0
+
+            leak = np.full_like(rend, grey)
+            leak[~mask] = rend[~mask]
+
+            panels = [gt, overlay, rend, rend_masked, leak]
+            for c, img in enumerate(panels):
+                ax[r, c].imshow(np.clip(img, 0, 1))
+                if r == 0:
+                    ax[r, c].set_title(titles[c])
+                if c == 0:
+                    ax[r, c].set_ylabel(f"frame {i}", rotation=90, labelpad=10)
+                ax[r, c].set_xticks([]); ax[r, c].set_yticks([])
+    kept_pct = init.train_mask.float().mean().item() * 100.0
+    plt.suptitle(f"{tag} — mask diagnostic  (train_mask keeps {kept_pct:.1f}% of pixels)")
+    plt.tight_layout()
+    plt.savefig(f"{tag}_mask_diag.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def splat_stats_diagnostic(init: GaussianInit, means, log_s, logit_o,
+                           tag: str, mode: str = "3dgs",
+                           log_scale_max: float | None = None) -> None:
+    """Histograms of splat shape stats + a printed top-10 by max-axis size,
+    so big flat-faced splats can be located by index. Saves
+    `{tag}_splat_stats.png`."""
+    with torch.no_grad():
+        scales = torch.exp(log_s.detach())               # (M, 3)
+        opa    = torch.sigmoid(logit_o.detach())         # (M,)
+        m      = means.detach()
+    voxel = max(init.voxel, 1e-8)
+    max_axis = scales.max(dim=1).values
+    max_axis_vx = (max_axis / voxel).cpu().numpy()
+
+    if mode == "2dgs":
+        pair = scales[:, :2]
+    else:
+        pair = scales.topk(2, dim=1).values
+    pair_sorted, _ = torch.sort(pair, dim=1)
+    needle = (pair_sorted[:, 1] / pair_sorted[:, 0].clamp_min(1e-8)).cpu().numpy()
+    opa_np = opa.cpu().numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].hist(max_axis_vx, bins=80, log=True)
+    axes[0].set_xlabel("max axis scale (× voxel)")
+    axes[0].set_ylabel("count (log)")
+    axes[0].set_title("Splat size")
+    if log_scale_max is not None:
+        clamp_vx = math.exp(log_scale_max) / voxel
+        axes[0].axvline(clamp_vx, color="r", ls="--",
+                        label=f"clamp = {clamp_vx:.2f}× voxel")
+        axes[0].legend()
+
+    axes[1].hist(opa_np, bins=80, range=(0, 1))
+    axes[1].set_xlabel("opacity (sigmoid)")
+    axes[1].set_title("Opacity")
+
+    axes[2].hist(needle, bins=80, log=True)
+    axes[2].set_xlabel("needle-ness (larger / smaller in-plane axis)")
+    axes[2].set_title("Disk anisotropy" if mode == "2dgs"
+                      else "3DGS top-2-axes aniso")
+
+    M = int(scales.shape[0])
+    plt.suptitle(f"{tag} — splat stats  (M={M}, voxel={voxel:.4f}, "
+                 f"scene_scale={init.scene_scale:.3f})")
+    plt.tight_layout()
+    plt.savefig(f"{tag}_splat_stats.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+    top = torch.topk(max_axis, k=min(10, max_axis.numel()))
+    idxs = top.indices.cpu().numpy()
+    print(f"[{tag}] top-{len(idxs)} splats by max-axis scale (voxel units):")
+    print(f"  {'idx':>7s}  {'max_vx':>8s}  {'opa':>6s}  {'needle':>8s}  "
+          f"{'x':>8s} {'y':>8s} {'z':>8s}")
+    for gi in idxs:
+        x, y, z = m[gi].cpu().tolist()
+        print(f"  {gi:>7d}  {max_axis_vx[gi]:>8.2f}  {opa_np[gi]:>6.3f}  "
+              f"{needle[gi]:>8.2f}  {x:>8.3f} {y:>8.3f} {z:>8.3f}")
+
+
 def save_inria_ply(path, means, sh_all, log_s, logit_o, quats):
     """sh_all: (M, K, 3) where K = (sh_deg+1)**2. Writes Inria 3DGS PLY with matching f_rest fields."""
     n = means.shape[0]
@@ -526,6 +636,10 @@ class SplatTrainer:
         self.sh_ramp_steps_per_band: int = 1000
         self.l1_weight: float = 1.0
         self.lpips_weight: float = 0.0
+        # Penalty on rendered alpha inside `~train_mask` — drives splats to
+        # render nothing in filtered regions, removing the asymmetric "free
+        # growth" at mask boundaries. 0 disables.
+        self.void_weight: float = 0.5
         self.use_densify: bool = False
         self.densify_total_steps: int = 7000
         # Max gaussian axis-scale as a multiple of the init voxel edge. The
@@ -585,6 +699,7 @@ class SplatTrainer:
                          sh_max_deg: int = 0,
                          lpips_weight: float = 0.0,
                          l1_weight: float = 1.0,
+                         void_weight: float = 0.5,
                          sh_ramp_steps_per_band: int = 1000,
                          use_densify: bool = False,
                          densify_total_steps: int = 7000,
@@ -607,6 +722,7 @@ class SplatTrainer:
         self.sh_max_deg = int(sh_max_deg)
         self.lpips_weight = float(lpips_weight)
         self.l1_weight = float(l1_weight)
+        self.void_weight = float(void_weight)
         self.sh_ramp_steps_per_band = max(1, int(sh_ramp_steps_per_band))
         self.use_densify = bool(use_densify)
         self.densify_total_steps = int(densify_total_steps)
@@ -680,6 +796,22 @@ class SplatTrainer:
         if self.init is not None and self.mode != "2dgs":
             self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
 
+    def render_diagnostics(self, tag: str) -> None:
+        """Render mask + splat-stats diagnostics for the current params.
+        See `render_mask_diagnostic` and `splat_stats_diagnostic`. Safe to
+        call any time after `prepare_and_init`."""
+        if self.train is None or self.data is None or self.init is None:
+            return
+        p = self.train.params
+        sh_all = (p["sh0"] if p["shN"].shape[1] == 0
+                  else torch.cat([p["sh0"], p["shN"]], dim=1))
+        render_mask_diagnostic(self.data, self.init, p["means"], p["quats"],
+                               p["scales"], p["opacities"], sh_all,
+                               tag=tag, mode=self.mode)
+        splat_stats_diagnostic(self.init, p["means"], p["scales"],
+                               p["opacities"], tag=tag, mode=self.mode,
+                               log_scale_max=self._log_scale_max)
+
     def save_current(self, path: str) -> None:
         """Save the current splats as an Inria-format PLY. Concatenates
         sh0 + shN automatically when higher SH bands are trained."""
@@ -717,6 +849,7 @@ class SplatTrainer:
         render_and_show(self.data, p["means"], p["quats"],
                         p["scales"], p["opacities"], sh_all, tag=tag,
                         mode=self.mode)
+        self.render_diagnostics(tag)
 
     def reset(self) -> None:
         """Tear down trainable state and clear the scene. Caller is
@@ -860,7 +993,7 @@ class SplatTrainer:
         normals = surf_normals = distort = None
         depth_pred = None
         if self.mode == "2dgs":
-            colors, _, normals, surf_normals, distort, _, info = rasterization_2dgs(
+            colors, alphas, normals, surf_normals, distort, _, info = rasterization_2dgs(
                 p["means"], p["quats"],
                 torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
                 sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
@@ -869,7 +1002,7 @@ class SplatTrainer:
             pred = colors[0, ..., :3]                       # (H,W,3) float
             depth_pred = colors[0, ..., 3]                  # (H,W) float
         else:
-            out, _, info = rasterization(
+            out, alphas, info = rasterization(
                 p["means"], p["quats"],
                 torch.exp(p["scales"]), torch.sigmoid(p["opacities"]),
                 sh_all, d.w2c[idx:idx+1], d.K[idx:idx+1], d.W, d.H,
@@ -892,6 +1025,18 @@ class SplatTrainer:
             return 0.0
         l1 = (diff * mask).sum() / (n_kept * 3)
         loss = self.l1_weight * l1
+
+        # Void loss: penalise rendered alpha inside `~train_mask`. Without
+        # this the masked region has zero gradient signal, so boundary
+        # splats grow into it for free; here we explicitly drive their
+        # rendered alpha to zero so they shrink / rotate / lose opacity.
+        if self.void_weight > 0.0:
+            void_mask = (~i.train_mask[idx]).float()        # (H,W) float
+            n_void = int(void_mask.sum().item())
+            if n_void > 0:
+                alpha_img = alphas[0, ..., 0]               # (H,W) in [0,1]
+                void = (alpha_img.pow(2) * void_mask).sum() / n_void
+                loss = loss + self.void_weight * void
 
         # LPIPS over the full frame (the mask only weights L1; lpips wants a
         # spatially-contiguous image and per-pixel masking it makes no sense).
@@ -1004,6 +1149,9 @@ def main() -> None:
                    help="0 = L1-only (v1). >0 enables SH-band progression 0→N.")
     p.add_argument("--lpips-weight", type=float, default=0.0,
                    help="LPIPS perceptual weight added to L1 (0 disables).")
+    p.add_argument("--void-weight", type=float, default=0.5,
+                   help="Penalty on rendered alpha inside `~train_mask` "
+                        "(removes free-growth into masked regions). 0 disables.")
     p.add_argument("--densify", type=int, default=0,
                    help="1 enables gsplat DefaultStrategy clone/split/prune (v3).")
     p.add_argument("--densify-total-steps", type=int, default=7000,
@@ -1031,6 +1179,7 @@ def main() -> None:
         name=args.name,
         sh_max_deg=args.sh_max_deg,
         lpips_weight=args.lpips_weight,
+        void_weight=args.void_weight,
         use_densify=(args.densify != 0),
         densify_total_steps=args.densify_total_steps,
         mode=args.mode,

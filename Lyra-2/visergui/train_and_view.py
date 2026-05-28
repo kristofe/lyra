@@ -51,6 +51,9 @@ def main() -> None:
                    help="Default for the Setup→sh_max_deg field. 0 = L1-only (v1).")
     p.add_argument("--lpips-weight", type=float, default=0.05,
                    help="Default for the Setup→lpips_weight field. 0 disables (v1).")
+    p.add_argument("--void-weight", type=float, default=0.5,
+                   help="Default for the Setup→void_weight slider. Penalises "
+                        "rendered alpha inside ~train_mask. 0 disables.")
     p.add_argument("--max-scale-voxels", type=float, default=2.0,
                    help="Default for the Setup→max_scale_voxels slider (live-adjustable).")
     p.add_argument("--densify", type=int, default=1,
@@ -89,6 +92,7 @@ def main() -> None:
             name=args.name,
             sh_max_deg=int(opts.get("sh_max_deg", 0)),
             lpips_weight=float(opts.get("lpips_weight", 0.0)),
+            void_weight=float(opts.get("void_weight", 0.5)),
             use_densify=bool(opts.get("use_densify", False)),
             densify_total_steps=int(args.densify_total_steps),
             mode=str(opts.get("mode", "3dgs")),
@@ -129,6 +133,7 @@ def main() -> None:
             remove_sky=bool(args.remove_sky),
             sh_max_deg=args.sh_max_deg,
             lpips_weight=args.lpips_weight,
+            void_weight=args.void_weight,
             scale_clamp_voxel_mult=args.max_scale_voxels,
             use_densify=bool(args.densify),
             mode=args.mode,
