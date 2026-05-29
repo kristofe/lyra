@@ -151,6 +151,12 @@ def main() -> None:
         info["epoch_counts"] = trainer.epoch_frame_counts()
         return info
 
+    def set_freeze_mode(mode: str) -> dict:
+        return trainer.set_freeze_mode(mode)
+
+    def recompute_freeze_mask() -> dict:
+        return trainer.recompute_freeze_mask()
+
     def append_frames(directory: str, seed_new_splats: bool) -> dict:
         from pathlib import Path as _P
         import json as _json
@@ -196,6 +202,8 @@ def main() -> None:
         append_video=append_video,
         append_frames=append_frames,
         set_sampling=set_sampling,
+        set_freeze_mode=set_freeze_mode,
+        recompute_freeze_mask=recompute_freeze_mask,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

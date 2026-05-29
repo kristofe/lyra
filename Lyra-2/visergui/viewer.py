@@ -766,6 +766,8 @@ class ViewerApp:
         append_video: "Callable[[str, int, bool], dict] | None" = None,
         append_frames: "Callable[[str, bool], dict] | None" = None,
         set_sampling: "Callable[[str, float, int], dict] | None" = None,
+        set_freeze_mode: "Callable[[str], dict] | None" = None,
+        recompute_freeze_mask: "Callable[[], dict] | None" = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -790,6 +792,8 @@ class ViewerApp:
         self._append_video_cb = append_video
         self._append_frames_cb = append_frames
         self._set_sampling_cb = set_sampling
+        self._set_freeze_mode_cb = set_freeze_mode
+        self._recompute_freeze_mask_cb = recompute_freeze_mask
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -1084,6 +1088,30 @@ class ViewerApp:
                 "**sampling:** uniform (epoch counts populate after init)"
             )
 
+            # Phase 4: spatial freezing of irrelevant splats.
+            self.gui_inc_freeze_mode = self.server.gui.add_dropdown(
+                "freeze mode",
+                options=("off", "new_frustums"),
+                initial_value="off",
+                hint="Off (default) = train every splat. new_frustums = "
+                     "after clicking Recompute, freeze splats invisible to "
+                     "any camera in the LATEST epoch — old-region splats "
+                     "stop moving so new-region refinement won't drag them. "
+                     "Densify is auto-disabled while a mask is active so "
+                     "splat-count can't desync the mask.",
+            )
+            self.gui_inc_freeze_btn = self.server.gui.add_button(
+                "Recompute freeze mask",
+                hint="Projects every splat into the latest-epoch cameras. "
+                     "Splats visible (in front of camera + inside the image "
+                     "rectangle of at least one) stay trainable; others "
+                     "freeze. Runs in a fraction of a second even for 3M "
+                     "splats. Click after each Append or after switching modes.",
+            )
+            self.gui_inc_freeze_status = self.server.gui.add_markdown(
+                "**freeze:** off (train all splats)"
+            )
+
         self.gui_inc_save_btn.on_click(lambda _ev: self._on_save_checkpoint_click())
         self.gui_inc_load_btn.on_click(lambda _ev: self._on_load_checkpoint_click())
         self.gui_inc_video_btn.on_click(lambda _ev: self._on_append_video_click())
@@ -1093,6 +1121,11 @@ class ViewerApp:
         self.gui_inc_sampling_mode.on_update(lambda _ev: self._on_sampling_change())
         self.gui_inc_new_frame_weight.on_update(lambda _ev: self._on_sampling_change())
         self.gui_inc_sampling_horizon.on_update(lambda _ev: self._on_sampling_change())
+
+        # Freeze mode auto-applies on change; the mask itself is only
+        # (re)computed when the user clicks the button.
+        self.gui_inc_freeze_mode.on_update(lambda _ev: self._on_freeze_mode_change())
+        self.gui_inc_freeze_btn.on_click(lambda _ev: self._on_recompute_freeze_click())
 
     def _set_inc_status(self, msg: str) -> None:
         try:
@@ -1216,6 +1249,62 @@ class ViewerApp:
             self.gui_inc_sampling_status.content = (
                 f"**sampling:** error — {type(e).__name__}: {e}"
             )
+
+    def _on_freeze_mode_change(self) -> None:
+        """Phase 4: flip the freeze policy. Doesn't recompute the mask
+        (that's the explicit button) — just updates `trainer._freeze_mode`
+        and reflects whether the existing mask is still in effect."""
+        if self._set_freeze_mode_cb is None:
+            return
+        try:
+            info = self._set_freeze_mode_cb(str(self.gui_inc_freeze_mode.value))
+            self.gui_inc_freeze_status.content = self._format_freeze_status(info)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_inc_freeze_status.content = (
+                f"**freeze:** error — {type(e).__name__}: {e}"
+            )
+
+    def _on_recompute_freeze_click(self) -> None:
+        """Phase 4: rebuild the freeze mask from the current splat positions
+        + latest-epoch cameras. Cheap; safe to spam. Pauses training so the
+        step() loop can't race the mask-swap."""
+        if self._recompute_freeze_mask_cb is None:
+            return
+        try:
+            self.gui_inc_freeze_btn.disabled = True
+            self._pause_training_quietly()
+            self.gui_inc_freeze_status.content = "**freeze:** computing…"
+            info = self._recompute_freeze_mask_cb()
+            self.gui_inc_freeze_status.content = self._format_freeze_status(info)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_inc_freeze_status.content = (
+                f"**freeze:** error — {type(e).__name__}: {e}"
+            )
+        finally:
+            self.gui_inc_freeze_btn.disabled = False
+
+    def _format_freeze_status(self, info: dict) -> str:
+        mode = info.get("mode", "?")
+        if mode == "off":
+            return "**freeze:** off (train all splats)"
+        total = info.get("n_total", 0)
+        train = info.get("n_trainable", 0)
+        frozen = info.get("n_frozen", 0)
+        cams = info.get("n_cameras", 0)
+        epoch = info.get("latest_epoch")
+        if total == 0 or cams == 0:
+            return (
+                f"**freeze:** mode={mode} (no mask — initialize + append + "
+                f"click Recompute)"
+            )
+        pct = 100.0 * train / max(total, 1)
+        return (
+            f"**freeze:** mode={mode}, latest_epoch={epoch}, "
+            f"cameras={cams} | trainable={train:,} ({pct:.1f}%), "
+            f"frozen={frozen:,} of {total:,}"
+        )
 
     def _on_append_frames_click(self) -> None:
         if self._append_frames_cb is None:

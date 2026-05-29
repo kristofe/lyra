@@ -253,6 +253,40 @@ def _preprocess_video(video_path: Path, out_dir: Path, device: torch.device,
     return data, frame_paths
 
 
+def _average_se3(Ts: torch.Tensor) -> torch.Tensor:
+    """Chordal-L2 mean of a stack of (N, 4, 4) SE(3) transforms.
+    Translation: arithmetic mean of the (N, 3) translation column.
+    Rotation: SVD-based projection of `sum_i R_i` onto SO(3) — this is
+    the standard closed-form mean rotation that minimises the chordal
+    Frobenius error and includes the reflection fix so the result is a
+    proper rotation (det = +1).
+
+    Why this over Kabsch-on-centers in `append_video`: Kabsch on camera
+    *centers* fits position alignment but ignores camera *orientations*.
+    Joint DA3 can produce poses with subtle angular drift from the
+    original single-pass run (a "twist" around shared centers). Per-frame
+    T_i = c2w_old[i] @ inv(c2w_joint[i]) and then averaging in SE(3)
+    captures *both* position and orientation evidence — small angular
+    residual collapses to ~0 instead of being silently absorbed by
+    Kabsch's position-only fit.
+    """
+    assert Ts.ndim == 3 and Ts.shape[1] == 4 and Ts.shape[2] == 4, Ts.shape
+    Rs = Ts[:, :3, :3]                                    # (N, 3, 3)
+    ts = Ts[:, :3, 3]                                     # (N, 3)
+    M = Rs.sum(dim=0)                                     # (3, 3)
+    U, _, Vt = torch.linalg.svd(M)
+    R = U @ Vt
+    if float(torch.det(R).item()) < 0:
+        Vt_fixed = Vt.clone()
+        Vt_fixed[-1, :] = -Vt_fixed[-1, :]
+        R = U @ Vt_fixed
+    t = ts.mean(dim=0)
+    T = torch.eye(4, device=Ts.device, dtype=Ts.dtype)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
 def _kabsch_se3(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Classical Kabsch / Umeyama rigid alignment — find the 4x4 SE(3)
     transform T such that `(T @ A^T)^T ≈ B` for paired point sets
@@ -914,6 +948,17 @@ class SplatTrainer:
         self._new_frame_weight: float = 1.0
         self._sampling_horizon: int = 1000
 
+        # Phase 4: per-splat freeze mask. True = trainable (gradient + Adam
+        # step applied; densify may clone/split). False = frozen (gradient
+        # zeroed before optim.step). `_freeze_mode == "off"` (default) means
+        # no freezing — `_frozen_mask` stays None and step() behaves
+        # identically to pre-Phase-4. When a freeze mode is active and the
+        # mask is computed, densify is skipped too so splat-count changes
+        # don't desync the mask. Caller must click "Recompute freeze mask"
+        # after every append (or when they want to refresh).
+        self._freeze_mode: str = "off"
+        self._frozen_mask: torch.Tensor | None = None
+
     # ---- External-compat forwarders ------------------------------------- #
     # Returned references stay valid across densify swaps because they go
     # through `self.train.params[...]` on each access — DefaultStrategy
@@ -1214,6 +1259,9 @@ class SplatTrainer:
         # the next time `_seed_splats_for_new_frames` runs.
         M_loaded = int(self.train.params["means"].shape[0])
         self._splat_epoch = torch.zeros(M_loaded, dtype=torch.int32, device=self.device)
+        # Phase 4: any freeze mask from before the load is now stale (the
+        # loaded splats are a different set entirely). Caller can recompute.
+        self._frozen_mask = None
         self._step_count = int(meta.get("step_count", 0))
         self.scale_clamp_voxel_mult = scale_clamp
         if self.mode == "2dgs":
@@ -1300,67 +1348,93 @@ class SplatTrainer:
                 f"clip to match (same aspect ratio) and re-try."
             )
 
-        # Kabsch-align joint pose frame → original frame using camera centers.
-        # Apply T to every joint c2w so the new VideoData lives in the SAME
-        # world frame as the existing splats. Falls back to identity if we
-        # don't have at least 3 original frames to fit a unique rotation.
-        old_centers = self.data.c2w[:n_orig, :3, 3].detach()
-        joint_centers_orig = joint_data.c2w[:n_orig, :3, 3].detach()
-        if n_orig >= 3:
-            T = _kabsch_se3(joint_centers_orig, old_centers)
+        # Phase 2.5 v2: align the joint frame to the *original* world frame
+        # using per-frame SE(3) average — preserves both positions AND
+        # orientations, unlike Kabsch-on-centers which silently leaves a
+        # rotational "twist" that propagates to new frames.
+        #
+        # T_i = c2w_old[i] @ inv(c2w_joint[i]) is the per-frame transform
+        # that takes a point in joint-world to old-world. With consistent
+        # poses these are all the same; with DA3 noise they differ slightly.
+        # `_average_se3` projects their mean onto SE(3) so we get one
+        # canonical T_joint_to_old.
+        old_c2w_orig = self.data.c2w[:n_orig].detach()
+        joint_c2w_orig = joint_data.c2w[:n_orig].detach()
+        if n_orig >= 1:
+            inv_joint = torch.linalg.inv(joint_c2w_orig)
+            T_per_frame = old_c2w_orig @ inv_joint           # (n_orig, 4, 4)
+            T = _average_se3(T_per_frame)
         else:
             T = torch.eye(4, device=self.device, dtype=joint_data.c2w.dtype)
-            print(f"append_video: only {n_orig} original frames — Kabsch under-"
-                  f"determined; using identity alignment (existing splats may misalign).")
-        # Alignment quality readout — large residuals signal that DA3
-        # produced inconsistent poses for the original frames (e.g. the
-        # new clip dominated the joint solution).
-        joint_centers_aligned = (T @ torch.cat(
-            [joint_centers_orig, torch.ones((n_orig, 1), device=self.device)],
-            dim=1,
-        ).T).T[:, :3]
-        align_err = (joint_centers_aligned - old_centers).norm(dim=1)
-        print(f"append_video: Kabsch alignment residuals (m) — "
-              f"mean={align_err.mean().item():.4f} "
-              f"max={align_err.max().item():.4f} "
-              f"(scene_scale≈{self.init.scene_scale:.3f})")
+            print(f"append_video: no original frames to fit alignment; "
+                  f"using identity (new splats may be globally offset).")
 
-        # Apply T to ALL joint c2w (broadcast batch matmul).
-        c2w_aligned = T.unsqueeze(0) @ joint_data.c2w
-        w2c_aligned = torch.linalg.inv(c2w_aligned)
-        joint_data.c2w = c2w_aligned
-        joint_data.w2c = w2c_aligned
+        # Residual diagnostics: where did the averaged T leave gaps? Position
+        # residual = ||T @ c2w_joint - c2w_old||; angular residual via the
+        # SO(3) chordal distance.
+        aligned_orig = T.unsqueeze(0) @ joint_c2w_orig       # (n_orig, 4, 4)
+        pos_err = (aligned_orig[:, :3, 3] - old_c2w_orig[:, :3, 3]).norm(dim=1)
+        # angle(R) = arccos((trace - 1)/2). Compute R_err per frame.
+        R_err = aligned_orig[:, :3, :3] @ old_c2w_orig[:, :3, :3].transpose(1, 2)
+        tr = R_err.diagonal(dim1=1, dim2=2).sum(dim=1)        # (n_orig,)
+        ang_err_rad = torch.acos(((tr - 1.0) / 2.0).clamp(-1.0, 1.0))
+        ang_err_deg = ang_err_rad * 180.0 / math.pi
+        print(f"append_video: SE(3) alignment residuals — "
+              f"pos mean={pos_err.mean().item():.4f} max={pos_err.max().item():.4f} m "
+              f"(scene_scale≈{self.init.scene_scale:.3f}); "
+              f"angular mean={ang_err_deg.mean().item():.3f}° max={ang_err_deg.max().item():.3f}°")
+        if ang_err_deg.max().item() > 5.0:
+            print(f"append_video: WARNING max angular residual > 5° — joint DA3 "
+                  f"may have substantially re-estimated the original poses. "
+                  f"Existing splats may need ~hundreds of training steps to settle.")
 
-        # Preserve old frame_epoch values; tag new frames with max+1.
+        # Apply T ONLY to new frames' c2w. The original frames' c2w (and
+        # depth, K, rgb) are NOT touched — they keep the exact poses the
+        # existing splats were trained against. This is the second half of
+        # the fix: even with imperfect alignment, the existing splats never
+        # see a rotated supervision signal.
+        new_c2w_aligned = T.unsqueeze(0) @ joint_data.c2w[n_orig:]
+
         cur_max_epoch = max(self.data.frame_epoch) if self.data.frame_epoch else 0
         new_epoch = cur_max_epoch + 1
-        joint_data.frame_epoch = list(self.data.frame_epoch) + [new_epoch] * n_new
 
-        # Replace data + extend cached paths.
-        self.data = joint_data
-        self._frame_paths = joint_paths
-        # Invalidate the "skip preprocessing on re-init" cache marker:
+        # Append each new frame to self.data + extend init.train_mask in
+        # lock-step (same per-frame mask gates the original init used).
+        for i in range(n_new):
+            depth_i = joint_data.depth[n_orig + i]
+            sky_i = (joint_data.sky[n_orig + i]
+                     if joint_data.sky is not None else None)
+            conf_i = (joint_data.conf[n_orig + i]
+                      if joint_data.conf is not None else None)
+            self.data.append_frame(
+                rgb=joint_data.rgb[n_orig + i],
+                depth=depth_i,
+                K=joint_data.K[n_orig + i],
+                c2w=new_c2w_aligned[i],
+                conf=conf_i,
+                sky=sky_i,
+                epoch=new_epoch,
+            )
+            mask_i = _per_frame_train_mask(
+                depth_i, sky_i, conf_i,
+                self.init.conf_thresh, self.init.remove_sky,
+            )
+            self.init.append_train_mask(mask_i)
+
+        # Extend cached paths + invalidate the prepare_and_init cache marker.
+        self._frame_paths = list(self._frame_paths) + list(new_frame_paths)
         # `self.data` no longer matches the single `_last_video` signature
         # (it now spans both clips). Without this, Reset → Initialize on
         # the original video would skip preprocessing AND silently seed
-        # splats from the appended-clip frames still living in self.data.
+        # splats from the appended frames still living in self.data.
         self._last_video = None
 
-        # Rebuild train_mask across ALL frames with the checkpoint's gating
-        # (same conf_thresh / remove_sky that supervised the existing splats).
-        self.init.train_mask = _per_frame_train_mask(
-            self.data.depth, self.data.sky, self.data.conf,
-            self.init.conf_thresh, self.init.remove_sky,
-        )
-
-        # Recompute DA3 normals over the joint set in 2DGS mode.
+        # Recompute DA3 normals over the (extended) set in 2DGS mode.
         if self.mode == "2dgs" and self.da3_normal_weight > 0.0:
             with torch.no_grad():
                 self._da3_normals = depth_to_normal(
                     self.data.depth[..., None], self.data.c2w, self.data.K,
                 )
-        else:
-            self._da3_normals = None
 
         first_new = n_orig
         added = n_new
@@ -1671,12 +1745,129 @@ class SplatTrainer:
         new_tags = torch.full((G,), int(new_epoch), dtype=torch.int32, device=device)
         self._splat_epoch = torch.cat([self._splat_epoch, new_tags], dim=0)
 
+        # ---- Extend the per-splat freeze mask (Phase 4) ----------------- #
+        # New splats default to trainable (True). If the user wants the new
+        # splats also frozen relative to the latest cameras, they can click
+        # Recompute after seeding to rebuild the mask from visibility.
+        if self._frozen_mask is not None and int(self._frozen_mask.numel()) == existing_count:
+            new_trainable = torch.ones((G,), dtype=torch.bool, device=device)
+            self._frozen_mask = torch.cat([self._frozen_mask, new_trainable], dim=0)
+
         self._publish_to_scene()
         info = {"n_candidates": M_cand, "n_after_dedup": M_after_dedup,
                 "n_seeded": G, "epoch": new_epoch}
         print(f"_seed_splats: epoch={new_epoch} cand={M_cand} after_dedup={M_after_dedup} "
               f"seeded={G} → M={int(new_params['means'].shape[0])}")
         return info
+
+    # ---- Phase 4: spatial freezing of irrelevant splats --------------- #
+
+    FREEZE_MODES = ("off", "new_frustums")
+
+    def set_freeze_mode(self, mode: str) -> dict:
+        """GUI hook to flip the freeze policy at runtime.
+
+        `mode`:
+          - "off" (default) — current behaviour, train every splat.
+          - "new_frustums" — after `recompute_freeze_mask`, splats invisible
+            to every camera in the latest epoch are frozen (gradient zeroed
+            before optim.step). Densify is auto-disabled while a freeze
+            mask is active so the splat-count can't desync the mask.
+
+        Flipping to "off" clears any existing mask. Flipping the other way
+        leaves the mask alone — you still need to click Recompute for it
+        to take effect (lets you stage the change before applying).
+        Returns a small status dict.
+        """
+        if mode not in self.FREEZE_MODES:
+            raise ValueError(f"mode must be one of {self.FREEZE_MODES}, got {mode!r}")
+        self._freeze_mode = mode
+        if mode == "off":
+            self._frozen_mask = None
+        return {
+            "mode": self._freeze_mode,
+            "mask_active": self._frozen_mask is not None,
+            "n_trainable": int(self._frozen_mask.sum().item()) if self._frozen_mask is not None else None,
+            "n_total": int(self.train.params["means"].shape[0]) if self.train is not None else 0,
+        }
+
+    def recompute_freeze_mask(self) -> dict:
+        """Project all `train.params["means"]` into every latest-epoch
+        camera and mark splats visible to at least one as trainable. Other
+        splats are frozen. Cheap (~O(N_cam × M) batched matmuls); takes a
+        fraction of a second for a 3M-splat scene + 32 cameras.
+
+        "Visible" is the rectangular-frustum test: positive z in camera
+        space AND projected pixel inside (0, 0) – (W, H). NO occlusion
+        test — splats hidden behind geometry are treated as visible
+        (we *want* to update those, since they may be the wrong geometry
+        that's hiding what the new cameras see). Phase 5 will offer an
+        occlusion-aware variant if needed.
+
+        No-op if `_freeze_mode == "off"`. Returns counts.
+        """
+        if self.train is None or self.data is None:
+            return {"mode": self._freeze_mode, "n_total": 0,
+                    "n_trainable": 0, "n_frozen": 0, "n_cameras": 0}
+        M = int(self.train.params["means"].shape[0])
+        if self._freeze_mode == "off":
+            self._frozen_mask = None
+            print("recompute_freeze_mask: mode=off → mask cleared (train all splats)")
+            return {"mode": "off", "n_total": M, "n_trainable": M,
+                    "n_frozen": 0, "n_cameras": 0, "latest_epoch": None}
+
+        d = self.data
+        epochs = d.frame_epoch or []
+        if not epochs:
+            self._frozen_mask = None
+            return {"mode": self._freeze_mode, "n_total": M, "n_trainable": M,
+                    "n_frozen": 0, "n_cameras": 0, "latest_epoch": None}
+        latest = max(int(e) for e in epochs)
+        cam_idxs = [i for i, e in enumerate(epochs) if int(e) == latest]
+        if not cam_idxs:
+            self._frozen_mask = None
+            return {"mode": self._freeze_mode, "n_total": M, "n_trainable": M,
+                    "n_frozen": 0, "n_cameras": 0, "latest_epoch": latest}
+
+        sel = torch.as_tensor(cam_idxs, dtype=torch.long, device=self.device)
+        w2c_cams = d.w2c[sel]                                 # (N_cam, 4, 4)
+        K_cams = d.K[sel]                                     # (N_cam, 3, 3)
+        H, W = int(d.H), int(d.W)
+
+        p = self.train.params["means"].detach()               # (M, 3)
+        p_h = torch.cat(
+            [p, torch.ones((M, 1), device=p.device, dtype=p.dtype)],
+            dim=1,
+        )                                                     # (M, 4)
+        # Transform: (N_cam, 4, 4) · (M, 4)^T → (N_cam, M, 4)
+        p_cam = torch.einsum("nij,mj->nmi", w2c_cams, p_h)[..., :3]
+        z = p_cam[..., 2]
+        in_front = z > 0
+        z_safe = z.clamp_min(1e-6)
+        fx = K_cams[:, 0, 0:1]                                 # (N_cam, 1)
+        fy = K_cams[:, 1, 1:2]
+        cx = K_cams[:, 0, 2:3]
+        cy = K_cams[:, 1, 2:3]
+        pix_x = fx * (p_cam[..., 0] / z_safe) + cx             # (N_cam, M)
+        pix_y = fy * (p_cam[..., 1] / z_safe) + cy
+        in_bounds = (pix_x >= 0) & (pix_x < W) & (pix_y >= 0) & (pix_y < H)
+        visible = in_front & in_bounds                          # (N_cam, M)
+        trainable = visible.any(dim=0)                          # (M,) bool
+
+        self._frozen_mask = trainable
+        n_trainable = int(trainable.sum().item())
+        n_frozen = M - n_trainable
+        print(f"recompute_freeze_mask: mode={self._freeze_mode} latest_epoch={latest} "
+              f"cameras={len(cam_idxs)} M={M} trainable={n_trainable} frozen={n_frozen} "
+              f"({100.0 * n_trainable / max(M, 1):.1f}% trainable)")
+        return {
+            "mode": self._freeze_mode,
+            "n_total": M,
+            "n_trainable": n_trainable,
+            "n_frozen": n_frozen,
+            "n_cameras": len(cam_idxs),
+            "latest_epoch": int(latest),
+        }
 
     # ---- Phase 3: epoch-aware frame sampling -------------------------- #
 
@@ -1807,6 +1998,7 @@ class SplatTrainer:
         self.init = None
         self._da3_normals = None
         self._splat_epoch = None
+        self._frozen_mask = None
         if self.scene is not None:
             with self.scene.write() as s:
                 s.means = s.quats = s.scales = None
@@ -1922,6 +2114,8 @@ class SplatTrainer:
         # stays in lock-step with the trainable params (Phase 2 bookkeeping).
         if self._splat_epoch is not None and self._splat_epoch.numel() == M:
             self._splat_epoch = self._splat_epoch[keep].contiguous()
+        if self._frozen_mask is not None and self._frozen_mask.numel() == M:
+            self._frozen_mask = self._frozen_mask[keep].contiguous()
         self._publish_to_scene()
         return counts
 
@@ -1958,7 +2152,14 @@ class SplatTrainer:
                 sh_degree=cur_sh, packed=False)
             pred = out[0]                                   # (H,W,3) float
 
-        if t.strategy is not None:
+        # Phase 4: skip densify entirely while a freeze mask is in effect
+        # so the splat count can't change underneath the mask. `freeze_active`
+        # is checked at *both* pre-backward and post-backward to keep the
+        # strategy's internal state consistent (skip both halves of the pair
+        # — the strategy expects matched calls).
+        freeze_active = (self._frozen_mask is not None
+                         and self._frozen_mask.numel() == p["means"].shape[0])
+        if t.strategy is not None and not freeze_active:
             t.strategy.step_pre_backward(p, t.opts, t.strategy_state,
                                          self._step_count, info)
 
@@ -2038,11 +2239,20 @@ class SplatTrainer:
                     components["da3_normal"] = float(da3_term.detach().item())
 
         loss.backward()
+        # Phase 4: zero gradients for frozen splats so their params stay
+        # exactly put (Adam moments also stay 0 because of zero_grad below).
+        # Cheaper than torch.no_grad-detaching the rows because we only need
+        # to act on `.grad`, not the params themselves.
+        if freeze_active:
+            keep = self._frozen_mask
+            for param in t.params.values():
+                if param.grad is not None and param.shape[0] == keep.shape[0]:
+                    param.grad[~keep] = 0
         for o in t.opts.values():
             o.step()
             o.zero_grad(set_to_none=True)
 
-        if t.strategy is not None:
+        if t.strategy is not None and not freeze_active:
             t.strategy.step_post_backward(p, t.opts, t.strategy_state,
                                           self._step_count, info, packed=False)
 
