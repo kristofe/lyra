@@ -180,6 +180,9 @@ def main() -> None:
     def compute_voxel_overlap(voxel_mult: float) -> dict:
         return trainer.compute_voxel_overlap_layer(voxel_mult=voxel_mult)
 
+    def compute_coverage(scope: str) -> dict:
+        return trainer.compute_coverage_layer(camera_scope=scope)
+
     def append_frames(directory: str, seed_new_splats: bool) -> dict:
         from pathlib import Path as _P
         import json as _json
@@ -229,6 +232,7 @@ def main() -> None:
         recompute_freeze_mask=recompute_freeze_mask,
         on_seed_dedup_mult_change=trainer.set_seed_dedup_multiplier,
         compute_voxel_overlap=compute_voxel_overlap,
+        compute_coverage=compute_coverage,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

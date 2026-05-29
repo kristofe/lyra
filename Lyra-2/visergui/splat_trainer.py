@@ -1985,6 +1985,116 @@ class SplatTrainer:
               f"new_only={info['n_new_only']:,}, shared={info['n_shared']:,})")
         return info
 
+    def compute_coverage_layer(self, camera_scope: str = "all",
+                               max_display_points: int = 200_000) -> dict:
+        """Phase 5.3: count how many cameras see each splat (same cheap
+        projection test as `recompute_freeze_mask` — z>0 + inside image
+        rectangle, no occlusion) and color by count via a 5-stop turbo
+        approximation. Hot = many cameras see it; cold = few or none.
+        Splats with 0 cameras are the obvious "unsupervised" candidates
+        for prune.
+
+        `camera_scope`: "all" = every camera, "latest" = only the latest-
+        epoch cameras (matches what Phase 4 freezes).
+        `max_display_points`: cap for the returned point cloud to keep
+        the websocket happy on large scenes. Uniform random subsample.
+
+        Returns numpy arrays + counts for the viewer to wrap as a layer.
+        """
+        empty = {
+            "points": np.zeros((0, 3), dtype=np.float32),
+            "colors": np.zeros((0, 3), dtype=np.uint8),
+            "n_total": 0, "max_count": 0, "n_unseen": 0,
+            "n_cameras": 0, "scope": camera_scope,
+        }
+        if self.train is None or self.data is None:
+            return empty
+        d = self.data
+        epochs = d.frame_epoch or []
+        if camera_scope == "latest" and epochs:
+            latest = max(int(e) for e in epochs)
+            cam_idxs = [i for i, e in enumerate(epochs) if int(e) == latest]
+        else:
+            cam_idxs = list(range(int(d.N)))
+        if not cam_idxs:
+            return empty
+
+        sel = torch.as_tensor(cam_idxs, dtype=torch.long, device=self.device)
+        H, W = int(d.H), int(d.W)
+        p = self.train.params["means"].detach()
+        M = int(p.shape[0])
+        if M == 0:
+            return empty
+
+        p_h = torch.cat(
+            [p, torch.ones((M, 1), device=p.device, dtype=p.dtype)],
+            dim=1,
+        )
+        # Batch over cameras so peak memory stays sane for big M.
+        CHUNK = 8
+        counts = torch.zeros(M, dtype=torch.int32, device=p.device)
+        for cs in range(0, len(cam_idxs), CHUNK):
+            ce = min(cs + CHUNK, len(cam_idxs))
+            chunk_sel = sel[cs:ce]
+            w2c_chunk = d.w2c[chunk_sel]
+            K_chunk = d.K[chunk_sel]
+            p_cam = torch.einsum("nij,mj->nmi", w2c_chunk, p_h)[..., :3]
+            z = p_cam[..., 2]
+            in_front = z > 0
+            z_safe = z.clamp_min(1e-6)
+            fx = K_chunk[:, 0, 0:1]
+            fy = K_chunk[:, 1, 1:2]
+            cx = K_chunk[:, 0, 2:3]
+            cy = K_chunk[:, 1, 2:3]
+            pix_x = fx * (p_cam[..., 0] / z_safe) + cx
+            pix_y = fy * (p_cam[..., 1] / z_safe) + cy
+            in_bounds = (pix_x >= 0) & (pix_x < W) & (pix_y >= 0) & (pix_y < H)
+            counts += (in_front & in_bounds).sum(dim=0).to(torch.int32)
+
+        max_count = int(counts.max().item()) if counts.numel() > 0 else 0
+        n_unseen = int((counts == 0).sum().item())
+
+        # Turbo-ish colormap: 5-stop linear gradient cool→hot.
+        stops = torch.tensor([
+            [ 48,  18,  59],   # deep blue
+            [ 33, 156, 203],   # cyan
+            [121, 217,  99],   # green
+            [253, 192,  19],   # yellow
+            [165,  13,   7],   # red
+        ], device=p.device, dtype=torch.float32)
+        n_stops = stops.shape[0]
+        denom = max(max_count, 1)
+        t01 = (counts.float() / float(denom)).clamp(0.0, 1.0)
+        scaled = t01 * float(n_stops - 1)
+        idx0 = scaled.floor().long().clamp(0, n_stops - 1)
+        idx1 = (idx0 + 1).clamp(0, n_stops - 1)
+        frac = (scaled - scaled.floor()).unsqueeze(-1)
+        cols_f = stops[idx0] * (1.0 - frac) + stops[idx1] * frac
+        cols = cols_f.clamp(0, 255).to(torch.uint8)
+
+        # Subsample for the websocket — viser bogs down past ~200k points.
+        pts_np = p.cpu().numpy().astype(np.float32)
+        cols_np = cols.cpu().numpy()
+        if max_display_points > 0 and M > max_display_points:
+            rng = np.random.default_rng(0)
+            keep = rng.choice(M, size=max_display_points, replace=False)
+            keep.sort()
+            pts_np = pts_np[keep]
+            cols_np = cols_np[keep]
+
+        info = {
+            "points": pts_np,
+            "colors": cols_np,
+            "n_total": M,
+            "max_count": max_count,
+            "n_unseen": n_unseen,
+            "n_cameras": len(cam_idxs),
+            "scope": camera_scope,
+        }
+        print(f"compute_coverage_layer: scope={camera_scope} cameras={len(cam_idxs)} "
+              f"M={M} max_count={max_count} unseen={n_unseen}")
+        return info
+
     # ---- Phase 3: epoch-aware frame sampling -------------------------- #
 
     def set_sampling(self, mode: str = "uniform",

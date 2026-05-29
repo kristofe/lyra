@@ -770,6 +770,7 @@ class ViewerApp:
         recompute_freeze_mask: "Callable[[], dict] | None" = None,
         on_seed_dedup_mult_change: "Callable[[float], None] | None" = None,
         compute_voxel_overlap: "Callable[[float], dict] | None" = None,
+        compute_coverage: "Callable[[str], dict] | None" = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -799,6 +800,8 @@ class ViewerApp:
         self._on_seed_dedup_mult_change = on_seed_dedup_mult_change
         self._compute_voxel_overlap_cb = compute_voxel_overlap
         self._voxel_overlap_layer_name = "voxel_overlap"
+        self._compute_coverage_cb = compute_coverage
+        self._coverage_layer_name = "coverage_heatmap"
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -1159,6 +1162,31 @@ class ViewerApp:
                     "**voxel overlap:** (off)"
                 )
 
+                self.gui_inc_coverage_show = self.server.gui.add_checkbox(
+                    "show coverage heatmap",
+                    initial_value=False,
+                    hint="Phase 5.3: project every splat into the camera "
+                         "set below and color by how many see it. Hot red "
+                         "= many; cool blue = few or none. Splats at "
+                         "count 0 are obvious prune candidates. Auto-"
+                         "recomputes on toggle ON.",
+                )
+                self.gui_inc_coverage_scope = self.server.gui.add_dropdown(
+                    "coverage camera scope",
+                    options=("all", "latest"),
+                    initial_value="latest",
+                    hint="'all' = every camera in self.data; 'latest' = "
+                         "only cameras with the largest epoch. Use "
+                         "'latest' to see what the most recent append "
+                         "supervises; 'all' for the full-scene picture.",
+                )
+                self.gui_inc_coverage_btn = self.server.gui.add_button(
+                    "Recompute coverage heatmap",
+                )
+                self.gui_inc_coverage_status = self.server.gui.add_markdown(
+                    "**coverage:** (off)"
+                )
+
         self.gui_inc_save_btn.on_click(lambda _ev: self._on_save_checkpoint_click())
         self.gui_inc_load_btn.on_click(lambda _ev: self._on_load_checkpoint_click())
         self.gui_inc_video_btn.on_click(lambda _ev: self._on_append_video_click())
@@ -1188,6 +1216,12 @@ class ViewerApp:
         )
         self.gui_inc_voxel_overlap_btn.on_click(
             lambda _ev: self._on_voxel_overlap_recompute()
+        )
+        self.gui_inc_coverage_show.on_update(
+            lambda _ev: self._on_coverage_toggle()
+        )
+        self.gui_inc_coverage_btn.on_click(
+            lambda _ev: self._on_coverage_recompute()
         )
 
     def _set_inc_status(self, msg: str) -> None:
@@ -1314,19 +1348,14 @@ class ViewerApp:
             )
 
     def _on_voxel_overlap_toggle(self) -> None:
-        """Phase 5.2: when the checkbox is flipped ON, immediately recompute
-        + add the voxel-overlap point cloud layer. When OFF, remove it.
-        Auto-toggle-on-add saves a click."""
+        """Phase 5.2: ON flips the visibility of the voxel-overlap layer
+        and (re)computes if it's not already cached. OFF removes the layer
+        from both the registry and viser so display-mode switches don't
+        accidentally re-publish stale data."""
         if bool(self.gui_inc_voxel_overlap_show.value):
             self._on_voxel_overlap_recompute()
         else:
-            self.scene.remove_point_cloud(self._voxel_overlap_layer_name)
-            try:
-                self.server.scene.remove_by_name(
-                    _viser_pc_name(self._voxel_overlap_layer_name)
-                )
-            except Exception:
-                pass
+            self._teardown_debug_layer(self._voxel_overlap_layer_name)
             self.gui_inc_voxel_overlap_status.content = "**voxel overlap:** (off)"
 
     def _on_voxel_overlap_recompute(self) -> None:
@@ -1357,15 +1386,19 @@ class ViewerApp:
                 colors_rgb=cols,
                 point_size=point_size,
             )
-            self.scene.add_point_cloud(layer)
-            # Force the new layer to render now (pump's diff handles updates
-            # on next tick, but we want immediate feedback on click).
-            self._refresh_point_cloud_handles()
+            # Use the canonical layer pipeline so display-mode + per-layer
+            # visibility checkbox both work. _push_layer no-ops in modes
+            # other than "points" — that matches the existing splat_centers
+            # behaviour and avoids covering the splat render with a 3D PC.
+            self._add_or_refresh_debug_layer(layer)
+            mode_hint = ""
+            if self.display_mode != "points":
+                mode_hint = " — switch Display to 'points' to see it"
             self.gui_inc_voxel_overlap_status.content = (
                 f"**voxel overlap:** voxel={info['voxel_size']:.4f}m, "
                 f"{info['n_voxels']:,} voxels — "
                 f"old={info['n_old_only']:,}, new={info['n_new_only']:,}, "
-                f"shared={info['n_shared']:,}"
+                f"shared={info['n_shared']:,}{mode_hint}"
             )
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1375,29 +1408,101 @@ class ViewerApp:
         finally:
             self.gui_inc_voxel_overlap_btn.disabled = False
 
-    def _refresh_point_cloud_handles(self) -> None:
-        """Force the viser scene to re-publish any pending point-cloud
-        layers added/updated in `self.scene` without waiting for the pump."""
-        try:
-            with self.scene.read() as s:
-                layers = list(s.point_clouds.values())
-        except Exception:
+    def _on_coverage_toggle(self) -> None:
+        """Phase 5.3: ON (re)computes + adds the coverage point cloud; OFF
+        tears it down (registry + viser handle) so display-mode switches
+        don't reanimate it."""
+        if bool(self.gui_inc_coverage_show.value):
+            self._on_coverage_recompute()
+        else:
+            self._teardown_debug_layer(self._coverage_layer_name)
+            self.gui_inc_coverage_status.content = "**coverage:** (off)"
+
+    def _on_coverage_recompute(self) -> None:
+        if self._compute_coverage_cb is None:
+            self.gui_inc_coverage_status.content = "**coverage:** callback missing"
             return
-        for layer in layers:
-            name = _viser_pc_name(layer.name)
+        try:
+            self.gui_inc_coverage_btn.disabled = True
+            self.gui_inc_coverage_status.content = "**coverage:** computing…"
+            info = self._compute_coverage_cb(
+                str(self.gui_inc_coverage_scope.value)
+            )
+            pts = info["points"]
+            cols = info["colors"]
+            if pts.shape[0] == 0:
+                self.gui_inc_coverage_status.content = (
+                    "**coverage:** no splats — initialize first"
+                )
+                return
+            # Size each rendered point ~ the scene diag's small fraction —
+            # the splat density may be high so keep points small.
+            mn = pts.min(axis=0); mx = pts.max(axis=0)
+            diag = float(np.linalg.norm(mx - mn))
+            point_size = max(diag * 2e-3, 1e-4)
+            layer = PointCloudLayer(
+                name=self._coverage_layer_name,
+                points=pts,
+                colors_rgb=cols,
+                point_size=point_size,
+            )
+            self._add_or_refresh_debug_layer(layer)
+            mode_hint = ""
+            if self.display_mode != "points":
+                mode_hint = " — switch Display to 'points' to see it"
+            self.gui_inc_coverage_status.content = (
+                f"**coverage:** scope={info['scope']}, "
+                f"cameras={info['n_cameras']}, "
+                f"max_count={info['max_count']}, "
+                f"unseen={info['n_unseen']:,} of {info['n_total']:,}"
+                f"{mode_hint}"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_inc_coverage_status.content = (
+                f"**coverage:** error — {type(e).__name__}: {e}"
+            )
+        finally:
+            self.gui_inc_coverage_btn.disabled = False
+
+    def _add_or_refresh_debug_layer(self, layer: PointCloudLayer) -> None:
+        """Phase 5 debug-layer helper: add (or replace) `layer` in the scene
+        registry, ensure a per-layer GUI panel exists, and call _push_layer
+        so it respects display_mode + the per-layer visibility checkbox.
+
+        Matches the lifecycle `_refresh_splat_centers_layer` uses for the
+        live splat-centers debug layer, so display-mode switches clean it
+        up correctly via `_apply_display_mode` -> `_remove_pushed`. The
+        previous direct `server.scene.add_point_cloud(...)` was the bug
+        that caused debug overlays to obstruct splat rendering."""
+        self.scene.add_point_cloud(layer)
+        name = layer.name
+        if name not in self._handles:
             try:
-                self.server.scene.remove_by_name(name)
+                with self._point_clouds_folder:
+                    self._build_layer_gui(name)
+            except Exception as e:
+                print(f"_add_or_refresh_debug_layer: GUI build failed for {name}: {e}")
+        else:
+            # Refresh the count readout; layer's contents change on
+            # recompute, the existing GUI panel can stay.
+            try:
+                self._handles[name]["count"].content = (
+                    f"**count:** {len(layer.points):,}"
+                )
             except Exception:
                 pass
-            try:
-                self.server.scene.add_point_cloud(
-                    name=name,
-                    points=layer.points,
-                    colors=compute_colors(layer),
-                    point_size=float(layer.point_size),
-                )
-            except Exception as e:
-                print(f"_refresh_point_cloud_handles: add failed for {name}: {e}")
+        self._push_layer(name)
+
+    def _teardown_debug_layer(self, name: str) -> None:
+        """Phase 5 debug-layer helper: remove from the scene registry, the
+        viser scene, and the pushed-set so display-mode switches don't
+        come back to a stale viser handle."""
+        self.scene.remove_point_cloud(name)
+        try:
+            self._remove_pushed(name)
+        except Exception:
+            pass
 
     def _on_freeze_mode_change(self) -> None:
         """Phase 4: flip the freeze policy. Doesn't recompute the mask
