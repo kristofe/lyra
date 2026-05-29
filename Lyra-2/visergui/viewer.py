@@ -768,6 +768,8 @@ class ViewerApp:
         set_sampling: "Callable[[str, float, int], dict] | None" = None,
         set_freeze_mode: "Callable[[str], dict] | None" = None,
         recompute_freeze_mask: "Callable[[], dict] | None" = None,
+        on_seed_dedup_mult_change: "Callable[[float], None] | None" = None,
+        compute_voxel_overlap: "Callable[[float], dict] | None" = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -794,6 +796,9 @@ class ViewerApp:
         self._set_sampling_cb = set_sampling
         self._set_freeze_mode_cb = set_freeze_mode
         self._recompute_freeze_mask_cb = recompute_freeze_mask
+        self._on_seed_dedup_mult_change = on_seed_dedup_mult_change
+        self._compute_voxel_overlap_cb = compute_voxel_overlap
+        self._voxel_overlap_layer_name = "voxel_overlap"
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -1028,6 +1033,18 @@ class ViewerApp:
                      "Phase 1 behavior: append only, splat count "
                      "unchanged.",
             )
+            self.gui_inc_dedup_multiplier = self.server.gui.add_slider(
+                "seed dedup radius (× init voxel)",
+                min=1.0, max=6.0, step=0.5,
+                initial_value=2.0,
+                hint="Dedup-check radius for seed_new_splats, in init-voxel "
+                     "units. 1.0 = exact voxel match; 2.0 (default) = a "
+                     "candidate is occupied if any existing splat is within "
+                     "~2 init voxels (handles DA3 pose noise so new clips "
+                     "don't pile splats onto existing geometry). Raise "
+                     "(3-4) if duplicates still appear; lower if dedup is "
+                     "rejecting genuinely-new regions.",
+            )
             self.gui_inc_video_path = self.server.gui.add_text(
                 "append video",
                 initial_value="",
@@ -1112,6 +1129,36 @@ class ViewerApp:
                 "**freeze:** off (train all splats)"
             )
 
+            # Phase 5: visual debug tools.
+            with self.server.gui.add_folder("Debug viz", expand_by_default=False):
+                self.gui_inc_voxel_overlap_show = self.server.gui.add_checkbox(
+                    "show voxel overlap",
+                    initial_value=False,
+                    hint="Phase 5.2: classify every splat into its (voxel × "
+                         "epoch) bin and render a colored point cloud at "
+                         "occupied voxel centers. Red = old-only voxels, "
+                         "green = new-only, yellow = shared. Quick read on "
+                         "where two clips overlap and where they cover new "
+                         "ground.",
+                )
+                self.gui_inc_voxel_overlap_mult = self.server.gui.add_slider(
+                    "voxel overlap multiplier",
+                    min=0.5, max=10.0, step=0.5,
+                    initial_value=1.0,
+                    hint="Voxel-overlap viz cell size, as a multiple of "
+                         "init.voxel. Larger = coarser bins (faster, less "
+                         "noisy). Smaller = finer bins (more detail, more "
+                         "voxels).",
+                )
+                self.gui_inc_voxel_overlap_btn = self.server.gui.add_button(
+                    "Recompute voxel overlap",
+                    hint="Re-bin splats into voxels and re-add the colored "
+                         "point cloud. Auto-recomputes on toggle ON.",
+                )
+                self.gui_inc_voxel_overlap_status = self.server.gui.add_markdown(
+                    "**voxel overlap:** (off)"
+                )
+
         self.gui_inc_save_btn.on_click(lambda _ev: self._on_save_checkpoint_click())
         self.gui_inc_load_btn.on_click(lambda _ev: self._on_load_checkpoint_click())
         self.gui_inc_video_btn.on_click(lambda _ev: self._on_append_video_click())
@@ -1126,6 +1173,22 @@ class ViewerApp:
         # (re)computed when the user clicks the button.
         self.gui_inc_freeze_mode.on_update(lambda _ev: self._on_freeze_mode_change())
         self.gui_inc_freeze_btn.on_click(lambda _ev: self._on_recompute_freeze_click())
+
+        # Dedup multiplier auto-applies — next Append picks it up.
+        if self._on_seed_dedup_mult_change is not None:
+            self.gui_inc_dedup_multiplier.on_update(
+                lambda _ev: self._on_seed_dedup_mult_change(
+                    float(self.gui_inc_dedup_multiplier.value)
+                )
+            )
+
+        # Debug viz wiring.
+        self.gui_inc_voxel_overlap_show.on_update(
+            lambda _ev: self._on_voxel_overlap_toggle()
+        )
+        self.gui_inc_voxel_overlap_btn.on_click(
+            lambda _ev: self._on_voxel_overlap_recompute()
+        )
 
     def _set_inc_status(self, msg: str) -> None:
         try:
@@ -1249,6 +1312,92 @@ class ViewerApp:
             self.gui_inc_sampling_status.content = (
                 f"**sampling:** error — {type(e).__name__}: {e}"
             )
+
+    def _on_voxel_overlap_toggle(self) -> None:
+        """Phase 5.2: when the checkbox is flipped ON, immediately recompute
+        + add the voxel-overlap point cloud layer. When OFF, remove it.
+        Auto-toggle-on-add saves a click."""
+        if bool(self.gui_inc_voxel_overlap_show.value):
+            self._on_voxel_overlap_recompute()
+        else:
+            self.scene.remove_point_cloud(self._voxel_overlap_layer_name)
+            try:
+                self.server.scene.remove_by_name(
+                    _viser_pc_name(self._voxel_overlap_layer_name)
+                )
+            except Exception:
+                pass
+            self.gui_inc_voxel_overlap_status.content = "**voxel overlap:** (off)"
+
+    def _on_voxel_overlap_recompute(self) -> None:
+        if self._compute_voxel_overlap_cb is None:
+            self.gui_inc_voxel_overlap_status.content = (
+                "**voxel overlap:** callback missing"
+            )
+            return
+        try:
+            self.gui_inc_voxel_overlap_btn.disabled = True
+            self.gui_inc_voxel_overlap_status.content = "**voxel overlap:** computing…"
+            info = self._compute_voxel_overlap_cb(
+                float(self.gui_inc_voxel_overlap_mult.value)
+            )
+            pts = info["points"]
+            cols = info["colors"]
+            if pts.shape[0] == 0:
+                self.gui_inc_voxel_overlap_status.content = (
+                    "**voxel overlap:** no splats — initialize + train first"
+                )
+                return
+            # Size each rendered point ≈ voxel cell so the overlay looks
+            # like a low-res scene mask, not pinpricks.
+            point_size = max(float(info.get("voxel_size", 0.01)) * 0.6, 1e-4)
+            layer = PointCloudLayer(
+                name=self._voxel_overlap_layer_name,
+                points=pts,
+                colors_rgb=cols,
+                point_size=point_size,
+            )
+            self.scene.add_point_cloud(layer)
+            # Force the new layer to render now (pump's diff handles updates
+            # on next tick, but we want immediate feedback on click).
+            self._refresh_point_cloud_handles()
+            self.gui_inc_voxel_overlap_status.content = (
+                f"**voxel overlap:** voxel={info['voxel_size']:.4f}m, "
+                f"{info['n_voxels']:,} voxels — "
+                f"old={info['n_old_only']:,}, new={info['n_new_only']:,}, "
+                f"shared={info['n_shared']:,}"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_inc_voxel_overlap_status.content = (
+                f"**voxel overlap:** error — {type(e).__name__}: {e}"
+            )
+        finally:
+            self.gui_inc_voxel_overlap_btn.disabled = False
+
+    def _refresh_point_cloud_handles(self) -> None:
+        """Force the viser scene to re-publish any pending point-cloud
+        layers added/updated in `self.scene` without waiting for the pump."""
+        try:
+            with self.scene.read() as s:
+                layers = list(s.point_clouds.values())
+        except Exception:
+            return
+        for layer in layers:
+            name = _viser_pc_name(layer.name)
+            try:
+                self.server.scene.remove_by_name(name)
+            except Exception:
+                pass
+            try:
+                self.server.scene.add_point_cloud(
+                    name=name,
+                    points=layer.points,
+                    colors=compute_colors(layer),
+                    point_size=float(layer.point_size),
+                )
+            except Exception as e:
+                print(f"_refresh_point_cloud_handles: add failed for {name}: {e}")
 
     def _on_freeze_mode_change(self) -> None:
         """Phase 4: flip the freeze policy. Doesn't recompute the mask
@@ -1985,9 +2134,15 @@ class ViewerApp:
         images: np.ndarray | None,
         H: int,
         W: int,
+        colors: np.ndarray | None = None,
     ) -> None:
         """Cache the per-frame camera payload and push frustums into the
-        scene. Pass an empty c2w (shape (0, ...)) to clear."""
+        scene. Pass an empty c2w (shape (0, ...)) to clear.
+
+        `colors` is an optional (N, 3) uint8 array, one RGB per camera.
+        When provided, each frustum is drawn in its assigned color; when
+        None, all frustums fall back to the default orange. Used by
+        Phase 5.1 to tint frustums by their `frame_epoch`."""
         c2w_np = np.asarray(c2w, dtype=np.float64)
         if c2w_np.shape[0] == 0:
             self._train_cam_payload = None
@@ -2004,9 +2159,21 @@ class ViewerApp:
                     if imgs.dtype.kind == "f" else imgs.astype(np.uint8)
             else:
                 imgs_np = imgs
+        cols_np: np.ndarray | None
+        if colors is None:
+            cols_np = None
+        else:
+            cols_arr = np.asarray(colors)
+            if cols_arr.shape != (c2w_np.shape[0], 3):
+                raise ValueError(
+                    f"colors shape must be ({c2w_np.shape[0]}, 3); "
+                    f"got {tuple(cols_arr.shape)}"
+                )
+            cols_np = cols_arr.astype(np.uint8)
         self._train_cam_payload = {
             "c2w": c2w_np, "K": K_np, "images": imgs_np,
             "H": int(H), "W": int(W),
+            "colors": cols_np,
         }
         self._republish_train_cams()
 
@@ -2032,10 +2199,12 @@ class ViewerApp:
         c2w = payload["c2w"]
         K = payload["K"]
         imgs = payload["images"]
+        cols = payload.get("colors")
         H, W = payload["H"], payload["W"]
         scale = float(self.gui_train_cam_scale.value)
         with_images = bool(self.gui_train_cam_images.value) and imgs is not None
         aspect = W / max(H, 1)
+        default_color = (255, 153, 51)
         for i in range(c2w.shape[0]):
             R = c2w[i, :3, :3]
             t = c2w[i, :3, 3]
@@ -2043,12 +2212,16 @@ class ViewerApp:
             fy = float(K[i, 1, 1])
             fov_y = 2.0 * math.atan(0.5 * H / max(fy, 1e-9))
             name = f"train_cams/{i:04d}"
+            cam_color = (
+                tuple(int(x) for x in cols[i])
+                if cols is not None else default_color
+            )
             self.server.scene.add_camera_frustum(
                 name=name,
                 fov=fov_y,
                 aspect=aspect,
                 scale=scale,
-                color=(255, 153, 51),
+                color=cam_color,
                 wxyz=tuple(float(x) for x in wxyz),
                 position=tuple(float(x) for x in t),
                 image=imgs[i] if with_images else None,

@@ -97,15 +97,11 @@ def main() -> None:
             densify_total_steps=int(args.densify_total_steps),
             mode=str(opts.get("mode", "3dgs")),
         )
-        d = trainer.data
-        if d is None:
-            return
-        app.publish_training_cameras(
-            c2w=d.c2w.detach().cpu().numpy(),
-            K=d.K.detach().cpu().numpy(),
-            images=d.rgb.detach().cpu().numpy(),
-            H=int(d.H), W=int(d.W),
-        )
+        # Reuses _republish_cams below (defined after, but Python closures
+        # resolve at call time so this works as long as initializer is
+        # called after main() has finished setting up). On the empty-boot
+        # path that's true: initializer fires from the GUI button.
+        _republish_cams()
 
     def resetter() -> None:
         import numpy as _np
@@ -116,15 +112,39 @@ def main() -> None:
             images=None, H=1, W=1,
         )
 
+    # Phase 5.1: palette for coloring training-camera frustums by epoch.
+    # Wraps modulo so arbitrary epoch counts are supported. Epoch 0 keeps
+    # the historical orange the viewer used before per-camera colors.
+    _EPOCH_PALETTE = (
+        (255, 153,  51),   # 0 — orange (legacy default)
+        ( 51, 204, 204),   # 1 — teal
+        (204,  51, 204),   # 2 — magenta
+        (102, 204,  51),   # 3 — green
+        (255, 204,  51),   # 4 — yellow
+        ( 51, 153, 255),   # 5 — blue
+        (255,  85,  85),   # 6 — coral
+        (170, 102, 255),   # 7 — purple
+    )
+
+    def _epoch_colors(epochs):
+        import numpy as _np
+        arr = _np.zeros((len(epochs), 3), dtype=_np.uint8)
+        for i, e in enumerate(epochs):
+            arr[i] = _EPOCH_PALETTE[int(e) % len(_EPOCH_PALETTE)]
+        return arr
+
     def _republish_cams() -> None:
         d = trainer.data
         if d is None:
             return
+        epochs = d.frame_epoch or [0] * int(d.N)
+        cols = _epoch_colors(epochs)
         app.publish_training_cameras(
             c2w=d.c2w.detach().cpu().numpy(),
             K=d.K.detach().cpu().numpy(),
             images=d.rgb.detach().cpu().numpy(),
             H=int(d.H), W=int(d.W),
+            colors=cols,
         )
 
     def save_checkpoint(path: str) -> dict:
@@ -156,6 +176,9 @@ def main() -> None:
 
     def recompute_freeze_mask() -> dict:
         return trainer.recompute_freeze_mask()
+
+    def compute_voxel_overlap(voxel_mult: float) -> dict:
+        return trainer.compute_voxel_overlap_layer(voxel_mult=voxel_mult)
 
     def append_frames(directory: str, seed_new_splats: bool) -> dict:
         from pathlib import Path as _P
@@ -204,6 +227,8 @@ def main() -> None:
         set_sampling=set_sampling,
         set_freeze_mode=set_freeze_mode,
         recompute_freeze_mask=recompute_freeze_mask,
+        on_seed_dedup_mult_change=trainer.set_seed_dedup_multiplier,
+        compute_voxel_overlap=compute_voxel_overlap,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

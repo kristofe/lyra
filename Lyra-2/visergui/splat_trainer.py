@@ -948,6 +948,17 @@ class SplatTrainer:
         self._new_frame_weight: float = 1.0
         self._sampling_horizon: int = 1000
 
+        # Phase 2 tuning: coarse-voxel dedup radius for `_seed_splats_…`.
+        # The init voxel is ~0.5% of scene scale; joint DA3 pose noise is
+        # often a few voxels, so an exact voxel-key match misses near
+        # duplicates. We dedup at `init.voxel * _seed_dedup_multiplier` and
+        # only voxel-downsample (the compactness step) at `init.voxel`.
+        # Default 2.0 = "occupied if there's an existing splat within ~2
+        # init voxels". Bump higher (3-4) if you still see new splats
+        # piling onto existing geometry after an append; lower (1.0) if
+        # dedup is over-rejecting candidates in low-overlap regions.
+        self._seed_dedup_multiplier: float = 2.0
+
         # Phase 4: per-splat freeze mask. True = trainable (gradient + Adam
         # step applied; densify may clone/split). False = frozen (gradient
         # zeroed before optim.step). `_freeze_mode == "off"` (default) means
@@ -1088,6 +1099,12 @@ class SplatTrainer:
                 p.requires_grad_(False)
             self._lpips_net = net
         return self._lpips_net
+
+    def set_seed_dedup_multiplier(self, mult: float) -> None:
+        """Phase 2 tunable: set the coarse dedup radius for the next call to
+        `_seed_splats_for_new_frames`. Units are multiples of `init.voxel`.
+        Cheap (single attribute assign); safe to call any time."""
+        self._seed_dedup_multiplier = max(0.1, float(mult))
 
     def set_scale_clamp(self, voxel_mult: float) -> None:
         """Update the per-axis scale cap as a multiple of the init voxel edge.
@@ -1649,13 +1666,21 @@ class SplatTrainer:
                   f"(unprojection memory safety; final seeded count is still set by voxel dedup)")
 
         # ---- Voxel-dedup against existing splats ------------------------- #
+        # Use a COARSER voxel for the dedup check than for the downsample
+        # below. Joint DA3 pose noise is ~few-voxel scale at init.voxel ≈
+        # 0.5% scene scale; exact voxel-key matches miss near-duplicates.
+        # `_seed_dedup_multiplier` widens the match radius (default 2.0 ⇒
+        # candidate occupied if any existing splat is within ~2 init
+        # voxels). Downsample still uses `voxel` so spacing of *kept* new
+        # splats matches the init grid.
         existing_means = self.train.params["means"].detach()
+        dedup_voxel = float(self.init.voxel) * float(self._seed_dedup_multiplier)
         BIT = 21
         OFF = 1 << (BIT - 1)
         MASK = (1 << BIT) - 1
 
         def _scalar_keys(pts: torch.Tensor) -> torch.Tensor:
-            k = torch.floor(pts / voxel).long()
+            k = torch.floor(pts / dedup_voxel).long()
             k0 = (k[:, 0] + OFF).clamp(0, MASK)
             k1 = (k[:, 1] + OFF).clamp(0, MASK)
             k2 = (k[:, 2] + OFF).clamp(0, MASK)
@@ -1666,6 +1691,9 @@ class SplatTrainer:
         occupied = torch.isin(cand_scalar, exist_scalar)
         keep = ~occupied
         M_after_dedup = int(keep.sum().item())
+        print(f"_seed_splats: dedup at {dedup_voxel:.4f}m "
+              f"({self._seed_dedup_multiplier:.1f}× init voxel {voxel:.4f}m) — "
+              f"{int(occupied.sum().item())} candidates dropped as duplicates")
         if M_after_dedup == 0:
             print(f"_seed_splats: epoch={new_epoch} cand={M_cand} after_dedup=0 — "
                   f"every candidate voxel was already occupied by an existing splat. "
@@ -1868,6 +1896,94 @@ class SplatTrainer:
             "n_cameras": len(cam_idxs),
             "latest_epoch": int(latest),
         }
+
+    # ---- Phase 5: visual debug helpers --------------------------------- #
+
+    def compute_voxel_overlap_layer(self, voxel_mult: float = 1.0) -> dict:
+        """Phase 5.2: classify every splat into its (voxel × epoch) bin
+        and return a colored point cloud where each point is one
+        occupied voxel center. Categories:
+          - old-only (red): voxel contains only epoch-0 splats
+          - new-only (green): voxel contains only epoch>0 splats
+          - shared (yellow): both old and new splats in the same voxel
+        Renders quickly into a viser point cloud and lets the user spot
+        where two clips overlap vs disjoint regions.
+
+        Uses the same bit-packed scalar voxel hash as `_seed_splats_…`.
+        Returns numpy arrays so the viewer can wrap them in a
+        `PointCloudLayer` without taking a torch dep on the GUI side.
+        """
+        empty = {
+            "points": np.zeros((0, 3), dtype=np.float32),
+            "colors": np.zeros((0, 3), dtype=np.uint8),
+            "n_old_only": 0, "n_new_only": 0, "n_shared": 0,
+            "n_voxels": 0, "voxel_size": 0.0,
+        }
+        if self.train is None or self.init is None:
+            return empty
+        means = self.train.params["means"].detach()
+        M = int(means.shape[0])
+        if M == 0:
+            return empty
+        voxel = float(self.init.voxel) * max(0.1, float(voxel_mult))
+        if self._splat_epoch is None or int(self._splat_epoch.numel()) != M:
+            epochs = torch.zeros(M, dtype=torch.int32, device=means.device)
+        else:
+            epochs = self._splat_epoch
+
+        # Voxel hash — 21 bits/axis bit-packed into one int64.
+        BIT = 21
+        OFF = 1 << (BIT - 1)
+        MASK = (1 << BIT) - 1
+        keys = torch.floor(means / voxel).long()
+        k0 = (keys[:, 0] + OFF).clamp(0, MASK)
+        k1 = (keys[:, 1] + OFF).clamp(0, MASK)
+        k2 = (keys[:, 2] + OFF).clamp(0, MASK)
+        scalar = (k0 << (2 * BIT)) | (k1 << BIT) | k2          # (M,)
+
+        is_old = epochs == 0
+        is_new = ~is_old
+        old_voxels = torch.unique(scalar[is_old]) if int(is_old.sum().item()) > 0 \
+            else torch.empty(0, dtype=scalar.dtype, device=scalar.device)
+        new_voxels = torch.unique(scalar[is_new]) if int(is_new.sum().item()) > 0 \
+            else torch.empty(0, dtype=scalar.dtype, device=scalar.device)
+        if old_voxels.numel() == 0 and new_voxels.numel() == 0:
+            return empty
+        all_voxels = torch.unique(torch.cat([old_voxels, new_voxels]))
+        in_old = torch.isin(all_voxels, old_voxels)
+        in_new = torch.isin(all_voxels, new_voxels)
+        old_only = in_old & ~in_new
+        new_only = ~in_old & in_new
+        shared   = in_old & in_new
+
+        # Per-voxel centre: mean of contained splat positions. Use
+        # searchsorted (all_voxels is unique+sorted) to map each splat to
+        # its bin index, then `_scatter_mean` for the per-bin average.
+        inv = torch.searchsorted(all_voxels, scalar)
+        V = int(all_voxels.numel())
+        pos = _scatter_mean(means, inv, V)                     # (V, 3)
+
+        red    = torch.tensor([220,  80,  80], dtype=torch.uint8, device=means.device)
+        green  = torch.tensor([ 80, 220,  80], dtype=torch.uint8, device=means.device)
+        yellow = torch.tensor([240, 220,  80], dtype=torch.uint8, device=means.device)
+        cols = torch.zeros((V, 3), dtype=torch.uint8, device=means.device)
+        cols[old_only] = red
+        cols[new_only] = green
+        cols[shared]   = yellow
+
+        info = {
+            "points": pos.cpu().numpy().astype(np.float32),
+            "colors": cols.cpu().numpy(),
+            "n_old_only": int(old_only.sum().item()),
+            "n_new_only": int(new_only.sum().item()),
+            "n_shared":   int(shared.sum().item()),
+            "n_voxels": V,
+            "voxel_size": voxel,
+        }
+        print(f"compute_voxel_overlap_layer: voxel={voxel:.4f}m → "
+              f"{V:,} voxels (old_only={info['n_old_only']:,}, "
+              f"new_only={info['n_new_only']:,}, shared={info['n_shared']:,})")
+        return info
 
     # ---- Phase 3: epoch-aware frame sampling -------------------------- #
 
