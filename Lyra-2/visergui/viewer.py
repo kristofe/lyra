@@ -761,6 +761,11 @@ class ViewerApp:
         default_init_args: dict | None = None,
         on_scale_mult_change: "Callable[[float], None] | None" = None,
         trainer: "object | None" = None,
+        save_checkpoint: "Callable[[str], dict] | None" = None,
+        load_checkpoint: "Callable[[str], dict] | None" = None,
+        append_video: "Callable[[str, int, bool], dict] | None" = None,
+        append_frames: "Callable[[str, bool], dict] | None" = None,
+        set_sampling: "Callable[[str, float, int], dict] | None" = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -780,6 +785,11 @@ class ViewerApp:
         self._resetter = resetter
         self._default_init_args = default_init_args or {}
         self._on_scale_mult_change = on_scale_mult_change
+        self._save_checkpoint_cb = save_checkpoint
+        self._load_checkpoint_cb = load_checkpoint
+        self._append_video_cb = append_video
+        self._append_frames_cb = append_frames
+        self._set_sampling_cb = set_sampling
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -972,7 +982,259 @@ class ViewerApp:
                     float(self.gui_init_scale_mult.value)
                 )
             )
+
+        self._build_incremental_panel()
         # Mesh + Inpaint panels are now their own tabs (see _build_panel).
+
+    def _build_incremental_panel(self) -> None:
+        """Phase-1 incremental-training controls: save/load checkpoint and
+        append additional frames from either another video or a directory
+        of (frame, camera-json) pairs. All actions pause training first.
+        Hidden when the host didn't wire up incremental callbacks (trainer
+        re-use without train_and_view.py)."""
+        if (self._save_checkpoint_cb is None
+                and self._load_checkpoint_cb is None
+                and self._append_video_cb is None
+                and self._append_frames_cb is None):
+            return
+        with self.server.gui.add_folder("Incremental", expand_by_default=False):
+            self.gui_inc_ckpt_path = self.server.gui.add_text(
+                "checkpoint path",
+                initial_value="checkpoints/splats_ckpt.ply",
+                hint="PLY file written by Save / read by Load. A sidecar "
+                     "JSON (same stem, .json) carries step count + voxel.",
+            )
+            self.gui_inc_save_btn = self.server.gui.add_button(
+                "Save checkpoint",
+                hint="Pause training, save PLY + sidecar JSON.",
+            )
+            self.gui_inc_load_btn = self.server.gui.add_button(
+                "Load checkpoint",
+                hint="Pause training, replace current splats with the PLY. "
+                     "Requires Initialize to have run first so data + masks "
+                     "are loaded for the source video.",
+            )
+            self.gui_inc_seed_splats = self.server.gui.add_checkbox(
+                "seed new splats from added frames",
+                initial_value=True,
+                hint="Phase 2: after appending, RGBD-unproject the new "
+                     "frames and add splats wherever the existing splat "
+                     "distribution doesn't already cover (voxel-deduped "
+                     "against existing splats at init.voxel). Off = "
+                     "Phase 1 behavior: append only, splat count "
+                     "unchanged.",
+            )
+            self.gui_inc_video_path = self.server.gui.add_text(
+                "append video",
+                initial_value="",
+                hint="MP4 of a second clip of the SAME scene from new "
+                     "camera positions. Runs DA3 + appends each frame.",
+            )
+            self.gui_inc_video_max = self.server.gui.add_number(
+                "append max_frames",
+                initial_value=32, min=1, max=1000, step=1,
+                hint="Frame-stride cap for the appended clip (same meaning "
+                     "as Setup→max_frames).",
+            )
+            self.gui_inc_video_btn = self.server.gui.add_button(
+                "Append from video",
+            )
+            self.gui_inc_frames_dir = self.server.gui.add_text(
+                "append frames dir",
+                initial_value="",
+                hint="Directory of frame_NNNN.png + cam_NNNN.json files. "
+                     "Each JSON has {K:3x3, c2w:4x4, depth?:relative .npy path}.",
+            )
+            self.gui_inc_frames_btn = self.server.gui.add_button(
+                "Append from supplied frames",
+            )
+            self.gui_inc_status = self.server.gui.add_markdown(
+                "**incremental:** (no action yet)"
+            )
+
+            # Phase 3: epoch-aware frame sampling.
+            self.gui_inc_sampling_mode = self.server.gui.add_dropdown(
+                "sampling mode",
+                options=("uniform", "stratified", "scheduled"),
+                initial_value="uniform",
+                hint="Per-step frame sampler. Uniform = original behavior "
+                     "(every frame equally likely). Stratified = sample "
+                     "epoch first using new-frame-weight, then a frame in "
+                     "that epoch. Scheduled = bias toward newest epoch "
+                     "early, decay to stratified by 'horizon' steps.",
+            )
+            self.gui_inc_new_frame_weight = self.server.gui.add_slider(
+                "new-frame weight",
+                min=0.1, max=10.0, step=0.1,
+                initial_value=1.0,
+                hint="Relative weight of the *latest* epoch vs every other "
+                     "epoch. 1.0 = uniform within stratified (no bias). "
+                     "2.0 = latest epoch sampled 2x as often per frame as "
+                     "each other epoch. Only matters in stratified / "
+                     "scheduled modes.",
+            )
+            self.gui_inc_sampling_horizon = self.server.gui.add_number(
+                "schedule horizon (steps)",
+                initial_value=1000, min=10, max=100000, step=10,
+                hint="Scheduled mode only: number of steps over which the "
+                     "sampler interpolates from 'newest epoch only' (step 0) "
+                     "to the stratified target (step ≥ horizon).",
+            )
+            self.gui_inc_sampling_status = self.server.gui.add_markdown(
+                "**sampling:** uniform (epoch counts populate after init)"
+            )
+
+        self.gui_inc_save_btn.on_click(lambda _ev: self._on_save_checkpoint_click())
+        self.gui_inc_load_btn.on_click(lambda _ev: self._on_load_checkpoint_click())
+        self.gui_inc_video_btn.on_click(lambda _ev: self._on_append_video_click())
+        self.gui_inc_frames_btn.on_click(lambda _ev: self._on_append_frames_click())
+        # Sampling controls auto-apply on change — calls the host's sampling
+        # callback with current widget values, which forwards to the trainer.
+        self.gui_inc_sampling_mode.on_update(lambda _ev: self._on_sampling_change())
+        self.gui_inc_new_frame_weight.on_update(lambda _ev: self._on_sampling_change())
+        self.gui_inc_sampling_horizon.on_update(lambda _ev: self._on_sampling_change())
+
+    def _set_inc_status(self, msg: str) -> None:
+        try:
+            self.gui_inc_status.content = msg
+        except Exception:
+            pass
+
+    def _pause_training_quietly(self) -> None:
+        if self.training_control is None:
+            return
+        try:
+            self.training_control.pause()
+        except Exception:
+            pass
+
+    def _on_save_checkpoint_click(self) -> None:
+        if self._save_checkpoint_cb is None:
+            self._set_inc_status("**incremental:** save callback missing")
+            return
+        try:
+            self.gui_inc_save_btn.disabled = True
+            self._pause_training_quietly()
+            self._set_inc_status("**incremental:** saving checkpoint…")
+            meta = self._save_checkpoint_cb(str(self.gui_inc_ckpt_path.value))
+            self._set_inc_status(
+                f"**incremental:** saved → {meta['splat_count']:,} splats "
+                f"@ step {meta['step_count']} — click resume"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._set_inc_status(f"**incremental:** save error — {type(e).__name__}: {e}")
+        finally:
+            self.gui_inc_save_btn.disabled = False
+
+    def _on_load_checkpoint_click(self) -> None:
+        if self._load_checkpoint_cb is None:
+            self._set_inc_status("**incremental:** load callback missing")
+            return
+        try:
+            self.gui_inc_load_btn.disabled = True
+            self._pause_training_quietly()
+            self._set_inc_status("**incremental:** loading checkpoint…")
+            info = self._load_checkpoint_cb(str(self.gui_inc_ckpt_path.value))
+            # Recompute the home pose so 'reset camera' targets the loaded bbox.
+            if self.scene.means is not None and int(self.scene.num_splats) > 0:
+                means_np = self.scene.means.detach().cpu().numpy()
+                self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+            self._set_inc_status(
+                f"**incremental:** loaded → {info['splat_count']:,} splats "
+                f"@ step {info['step_count']} (sh={info['sh_max_deg']}, "
+                f"mode={info['mode']}, frames={info['frame_count']}) "
+                f"— click resume"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._set_inc_status(f"**incremental:** load error — {type(e).__name__}: {e}")
+        finally:
+            self.gui_inc_load_btn.disabled = False
+
+    def _format_append_status(self, action: str, info: dict) -> str:
+        parts = [
+            f"**incremental:** {action} {info['n_added']} frames",
+            f"(epoch {info['epoch']}; skipped {info['skipped']})",
+        ]
+        seeded = info.get("n_seeded", 0)
+        if seeded:
+            cand = info.get("n_candidates", 0)
+            dedup_drop = max(0, cand - info.get("n_after_dedup", 0))
+            parts.append(
+                f"+ seeded {seeded} splats (deduped {dedup_drop} vs existing voxels)"
+            )
+        parts.append("— click resume")
+        return " ".join(parts)
+
+    def _on_append_video_click(self) -> None:
+        if self._append_video_cb is None:
+            self._set_inc_status("**incremental:** append-video callback missing")
+            return
+        try:
+            self.gui_inc_video_btn.disabled = True
+            self._pause_training_quietly()
+            self._set_inc_status("**incremental:** appending video (DA3 may take a minute)…")
+            info = self._append_video_cb(
+                str(self.gui_inc_video_path.value),
+                int(self.gui_inc_video_max.value),
+                bool(self.gui_inc_seed_splats.value),
+            )
+            self._set_inc_status(self._format_append_status("appended", info))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._set_inc_status(f"**incremental:** append-video error — {type(e).__name__}: {e}")
+        finally:
+            self.gui_inc_video_btn.disabled = False
+
+    def _on_sampling_change(self) -> None:
+        """Phase 3: push the sampling mode + new-frame weight + horizon to
+        the trainer whenever any of the three widgets changes. Fires often
+        on slider drags, so the callback must be cheap (no model loads,
+        no GPU work) — `SplatTrainer.set_sampling` just assigns three
+        scalars. The result formats the per-epoch counts for the status."""
+        if self._set_sampling_cb is None:
+            return
+        try:
+            info = self._set_sampling_cb(
+                str(self.gui_inc_sampling_mode.value),
+                float(self.gui_inc_new_frame_weight.value),
+                int(self.gui_inc_sampling_horizon.value),
+            )
+            counts = info.get("epoch_counts", {}) or {}
+            count_str = ", ".join(
+                f"ep{e}={n}" for e, n in sorted(counts.items())
+            ) or "(no frames yet)"
+            self.gui_inc_sampling_status.content = (
+                f"**sampling:** {info.get('mode', '?')}, "
+                f"new_w={info.get('new_frame_weight', 1.0):.2f}, "
+                f"horizon={info.get('horizon', 0)}  | "
+                f"frames: {count_str}"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_inc_sampling_status.content = (
+                f"**sampling:** error — {type(e).__name__}: {e}"
+            )
+
+    def _on_append_frames_click(self) -> None:
+        if self._append_frames_cb is None:
+            self._set_inc_status("**incremental:** append-frames callback missing")
+            return
+        try:
+            self.gui_inc_frames_btn.disabled = True
+            self._pause_training_quietly()
+            self._set_inc_status("**incremental:** appending supplied frames…")
+            info = self._append_frames_cb(
+                str(self.gui_inc_frames_dir.value),
+                bool(self.gui_inc_seed_splats.value),
+            )
+            self._set_inc_status(self._format_append_status("appended", info))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._set_inc_status(f"**incremental:** append-frames error — {type(e).__name__}: {e}")
+        finally:
+            self.gui_inc_frames_btn.disabled = False
 
     def _build_mesh_panel(self) -> None:
         """Mesh generation controls (Phase 4)."""

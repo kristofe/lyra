@@ -37,7 +37,7 @@ def main() -> None:
     )
     p.add_argument(
         "--video", type=Path,
-        default=Path("outputs/zoomgs/videos/14.mp4"),
+        default=Path("assets/ours/museum_fwd.mp4"),
         help="Default value populated into the Setup→video field at boot.",
     )
     p.add_argument("--name", type=str, default=None)
@@ -116,6 +116,71 @@ def main() -> None:
             images=None, H=1, W=1,
         )
 
+    def _republish_cams() -> None:
+        d = trainer.data
+        if d is None:
+            return
+        app.publish_training_cameras(
+            c2w=d.c2w.detach().cpu().numpy(),
+            K=d.K.detach().cpu().numpy(),
+            images=d.rgb.detach().cpu().numpy(),
+            H=int(d.H), W=int(d.W),
+        )
+
+    def save_checkpoint(path: str) -> dict:
+        return trainer.save_checkpoint(path)
+
+    def load_checkpoint(path: str) -> dict:
+        info = trainer.load_checkpoint(path)
+        _republish_cams()
+        return info
+
+    def append_video(path: str, max_frames: int, seed_new_splats: bool) -> dict:
+        info = trainer.append_video(
+            path, max_frames=max_frames, seed_new_splats=seed_new_splats,
+        )
+        _republish_cams()
+        return info
+
+    def set_sampling(mode: str, new_frame_weight: float, horizon: int) -> dict:
+        info = trainer.set_sampling(
+            mode=mode,
+            new_frame_weight=new_frame_weight,
+            horizon=horizon,
+        )
+        info["epoch_counts"] = trainer.epoch_frame_counts()
+        return info
+
+    def append_frames(directory: str, seed_new_splats: bool) -> dict:
+        from pathlib import Path as _P
+        import json as _json
+        import numpy as _np
+        from PIL import Image as _Image
+        d = _P(directory).expanduser()
+        if not d.is_dir():
+            raise FileNotFoundError(f"frames directory not found: {d}")
+        cams = sorted(d.glob("cam_*.json"))
+        frames = []
+        for cam_path in cams:
+            stem = cam_path.stem  # cam_NNNN
+            idx = stem.split("_", 1)[1] if "_" in stem else stem
+            frame_path = d / f"frame_{idx}.png"
+            if not frame_path.exists():
+                print(f"append_frames: no image for {cam_path.name}; skipping")
+                continue
+            meta = _json.loads(cam_path.read_text())
+            K = _np.asarray(meta["K"], dtype=_np.float32)
+            c2w = _np.asarray(meta["c2w"], dtype=_np.float32)
+            rgb = _np.asarray(_Image.open(frame_path).convert("RGB"), dtype=_np.uint8)
+            depth = None
+            if "depth" in meta and meta["depth"]:
+                dp = (d / meta["depth"]).resolve()
+                depth = _np.load(str(dp)).astype(_np.float32)
+            frames.append({"rgb": rgb, "K": K, "c2w": c2w, "depth": depth})
+        info = trainer.append_supplied_frames(frames, seed_new_splats=seed_new_splats)
+        _republish_cams()
+        return info
+
     app = ViewerApp(
         ply_path=None,
         host=args.host,
@@ -126,6 +191,11 @@ def main() -> None:
         resetter=resetter,
         on_scale_mult_change=trainer.set_scale_clamp,
         trainer=trainer,
+        save_checkpoint=save_checkpoint,
+        load_checkpoint=load_checkpoint,
+        append_video=append_video,
+        append_frames=append_frames,
+        set_sampling=set_sampling,
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

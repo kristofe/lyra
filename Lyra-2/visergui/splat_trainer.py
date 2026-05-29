@@ -18,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -60,11 +61,22 @@ class VideoData:
     N: int
     H: int
     W: int
+    # Per-frame epoch tag. Frames from the original `_preprocess_video` are
+    # epoch 0; frames added later via `append_frame` get a higher epoch so
+    # Phase 3 sampling + Phase 5 frustum coloring can tell them apart. Use a
+    # plain Python list (length == N) — these are tiny per-frame integers,
+    # accessed by viewer code and rarely by step().
+    frame_epoch: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.frame_epoch is None:
+            self.frame_epoch = [0] * int(self.N)
 
     def append_frame(self, rgb: torch.Tensor, depth: torch.Tensor,
                      K: torch.Tensor, c2w: torch.Tensor,
                      conf: torch.Tensor | None = None,
-                     sky: torch.Tensor | None = None) -> int:
+                     sky: torch.Tensor | None = None,
+                     epoch: int | None = None) -> int:
         """Append one frame (H, W, 3) RGB / (H, W) depth / (3, 3) K / (4, 4) c2w.
 
         Casts to the existing tensors' device + dtype, recomputes w2c, and
@@ -73,6 +85,12 @@ class VideoData:
         Resolution must match (self.H, self.W). Caller can pass conf/sky;
         if either field already has rows, the matching argument is required
         (we fill with ones / zeros if None to keep the row count aligned).
+
+        `epoch` tags the new frame's session (Phase 3 sampling / Phase 5
+        visual debug). Defaults to the current max epoch (so back-to-back
+        appends collect into one session); callers starting a new session
+        (e.g. `append_video`, `append_supplied_frames`) pass an explicit
+        `max(frame_epoch) + 1`.
         """
         if rgb.shape[:2] != (self.H, self.W) or depth.shape != (self.H, self.W):
             raise ValueError(f"frame shape must be ({self.H}, {self.W}); got rgb={tuple(rgb.shape)}, depth={tuple(depth.shape)}")
@@ -96,6 +114,12 @@ class VideoData:
                 else torch.zeros((1, self.H, self.W), device=self.sky.device, dtype=self.sky.dtype)
             self.sky = torch.cat([self.sky, sky_row], dim=0)
 
+        if self.frame_epoch is None:
+            self.frame_epoch = [0] * self.N
+        ep = int(epoch) if epoch is not None \
+            else (max(self.frame_epoch) if self.frame_epoch else 0)
+        self.frame_epoch.append(ep)
+
         self.N += 1
         return self.N - 1
 
@@ -112,6 +136,10 @@ class GaussianInit:
     scene_scale: float
     conf_thresh: float | None
     voxel: float                     # voxel edge length used for init downsampling
+    # Whether sky pixels were excluded from the init mask. Stored so that
+    # incremental-append flows can rebuild a consistent per-frame mask for
+    # the new frames without re-running the original init.
+    remove_sky: bool = True
 
     def append_train_mask(self, mask: torch.Tensor) -> None:
         """Append a per-pixel mask (H, W) bool for one new frame, keeping
@@ -167,15 +195,18 @@ def _extract_frames(video_path: Path, out_dir: Path, max_frames: int) -> list[st
     return frame_paths
 
 
-def _preprocess_video(video_path: Path, out_dir: Path, device: torch.device,
-                      max_frames: int) -> VideoData:
-    frame_paths = _extract_frames(video_path, out_dir, max_frames)
-
+def _da3_inference_on_paths(frame_paths: Sequence[str],
+                            device: torch.device) -> VideoData:
+    """Run DA3 on an already-extracted list of frame paths and pack the
+    output into a `VideoData`. Used both by `_preprocess_video` (single
+    clip) and by `append_video`'s joint pass (original + appended paths
+    in one DA3 inference call → single shared coordinate frame). Each
+    call pays the DA3 model load cost (~few seconds + VRAM)."""
     model = DepthAnything3.from_pretrained(
         "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
     ).to(device).eval()
     pred = model.inference(
-        image=frame_paths,
+        image=list(frame_paths),
         process_res=504,                        # DA3 default — here for clarity
         process_res_method="upper_bound_resize",
     )
@@ -202,10 +233,56 @@ def _preprocess_video(video_path: Path, out_dir: Path, device: torch.device,
     del model, imgs
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print(f"N={N} H={H} W={W}; depth range [{depth.min():.3f}, {depth.max():.3f}]")
+    print(f"DA3 over {N} frames: H={H} W={W}; depth range [{depth.min():.3f}, {depth.max():.3f}]")
 
     return VideoData(rgb=rgb, depth=depth, K=K, w2c=w2c, c2w=c2w,
                      conf=conf, sky=sky, N=N, H=H, W=W)
+
+
+def _preprocess_video(video_path: Path, out_dir: Path, device: torch.device,
+                      max_frames: int) -> tuple[VideoData, list[str]]:
+    """Extract frames from `video_path` to disk and run DA3 on them.
+
+    Returns `(VideoData, frame_paths)` — paths are kept around by the
+    trainer so incremental-append flows can re-run DA3 jointly over the
+    original frame paths plus the appended ones (one shared coordinate
+    frame across clips).
+    """
+    frame_paths = _extract_frames(video_path, out_dir, max_frames)
+    data = _da3_inference_on_paths(frame_paths, device)
+    return data, frame_paths
+
+
+def _kabsch_se3(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Classical Kabsch / Umeyama rigid alignment — find the 4x4 SE(3)
+    transform T such that `(T @ A^T)^T ≈ B` for paired point sets
+    `A, B: (N, 3)`. Used by `append_video` to bring the joint-DA3 poses
+    back into the original world frame (so existing splats stay valid):
+    feed in joint-pass camera centers as `A` and the old single-pass
+    camera centers as `B`; the returned `T` left-multiplies every
+    `c2w` in the joint VideoData.
+
+    Returns a 4x4 tensor on A's device + dtype. Requires N ≥ 3; for
+    fewer points the alignment is under-determined and the caller
+    should fall back to a simpler approach (per-frame copy of the
+    original c2w when available).
+    """
+    assert A.shape == B.shape and A.ndim == 2 and A.shape[1] == 3, (A.shape, B.shape)
+    A_mean = A.mean(dim=0)
+    B_mean = B.mean(dim=0)
+    Ac = A - A_mean
+    Bc = B - B_mean
+    H = Ac.T @ Bc                                         # (3, 3)
+    U, _, Vt = torch.linalg.svd(H)
+    # Reflection fix: ensure a proper rotation (det = +1).
+    d = float(torch.sign(torch.det(Vt.T @ U.T)).item())
+    D = torch.diag(torch.tensor([1.0, 1.0, d], device=A.device, dtype=A.dtype))
+    R = Vt.T @ D @ U.T
+    t = B_mean - R @ A_mean
+    T = torch.eye(4, device=A.device, dtype=A.dtype)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +300,80 @@ def _scatter_mean(vals: torch.Tensor, inv: torch.Tensor, g: int) -> torch.Tensor
     D = vals.shape[1]
     s = torch.zeros(g, D, device=vals.device).scatter_add_(0, inv[:, None].expand(-1, D), vals)
     return s / counts[:, None]
+
+
+def _to_tensor(x, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Accept a numpy array OR a torch tensor and return a torch tensor on
+    `device` with `dtype`. No-op cast if already matching. Used by
+    `append_supplied_frames` to be lenient about caller payloads."""
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=dtype)
+    return torch.as_tensor(np.asarray(x), device=device, dtype=dtype)
+
+
+def _resize_frame_to(rgb: torch.Tensor, depth: torch.Tensor, K: torch.Tensor,
+                     conf: torch.Tensor | None, sky: torch.Tensor | None,
+                     H: int, W: int) -> tuple | None:
+    """Resize a single (H, W, 3) RGB + (H, W) depth + (3, 3) K + optional
+    masks to match (H, W). Same trick the inpainter uses at inpainter.py:919
+    — INTER_AREA for RGB, INTER_NEAREST for depth/sky/conf, K rescaled by
+    the resize ratios. Returns the resized tuple, or None if the input is
+    malformed (caller treats None as a per-frame skip)."""
+    try:
+        in_H, in_W = int(rgb.shape[0]), int(rgb.shape[1])
+        if (in_H, in_W) == (H, W):
+            return rgb, depth, K, conf, sky
+        rgb_np = rgb.detach().cpu().numpy().astype(np.float32)
+        depth_np = depth.detach().cpu().numpy().astype(np.float32)
+        rgb_r = cv2.resize(rgb_np, (W, H), interpolation=cv2.INTER_AREA)
+        depth_r = cv2.resize(depth_np, (W, H), interpolation=cv2.INTER_NEAREST)
+        sx = W / float(in_W)
+        sy = H / float(in_H)
+        K_r = K.clone()
+        K_r[0, 0] *= sx
+        K_r[1, 1] *= sy
+        K_r[0, 2] *= sx
+        K_r[1, 2] *= sy
+        conf_r = None
+        if conf is not None:
+            conf_np = conf.detach().cpu().numpy().astype(np.float32)
+            conf_r = cv2.resize(conf_np, (W, H), interpolation=cv2.INTER_NEAREST)
+            conf_r = torch.from_numpy(conf_r).to(device=conf.device, dtype=conf.dtype)
+        sky_r = None
+        if sky is not None:
+            sky_np = sky.detach().cpu().numpy().astype(np.uint8)
+            sky_r = cv2.resize(sky_np, (W, H), interpolation=cv2.INTER_NEAREST)
+            sky_r = torch.from_numpy(sky_r).to(device=sky.device).bool()
+        return (
+            torch.from_numpy(rgb_r).to(device=rgb.device, dtype=rgb.dtype),
+            torch.from_numpy(depth_r).to(device=depth.device, dtype=depth.dtype),
+            K_r,
+            conf_r,
+            sky_r,
+        )
+    except Exception as e:
+        print(f"_resize_frame_to failed: {e}")
+        return None
+
+
+def _per_frame_train_mask(depth: torch.Tensor,
+                          sky: torch.Tensor | None,
+                          conf: torch.Tensor | None,
+                          conf_thresh: float | None,
+                          remove_sky: bool) -> torch.Tensor:
+    """Build the per-pixel supervision mask for a single frame (or batch).
+    Same gates `_build_initial_gaussians` writes into `init.train_mask` at
+    init time, factored out so `append_video` / `append_supplied_frames` can
+    rebuild it for newly-appended frames consistently.
+
+    Accepts (H, W) or (N, H, W) tensors — output shape matches `depth`.
+    """
+    mask = depth > 0
+    if sky is not None and remove_sky:
+        mask &= ~sky
+    if conf is not None and conf_thresh is not None:
+        mask &= conf > conf_thresh
+    return mask
 
 
 def _build_initial_gaussians(data: VideoData, max_points: int,
@@ -326,18 +477,16 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
     render_and_show(data, means_vx, quats_vx, log_s_vx, logit_o_vx, sh_vx, tag="v0 voxel init")
 
     # Per-pixel loss mask, indexed per-frame by step() as train_mask[idx].
-    train_mask = data.depth > 0
-    if data.sky is not None and remove_sky:
-        train_mask &= ~data.sky
-    if data.conf is not None and conf_thresh is not None:
-        train_mask &= data.conf > conf_thresh
+    train_mask = _per_frame_train_mask(
+        data.depth, data.sky, data.conf, conf_thresh, remove_sky,
+    )
     print(f"loss mask: {train_mask.float().mean().item()*100:.1f}% pixels kept across {data.N} frames")
 
     return GaussianInit(
         means=means_vx, quats=quats_vx, log_s=log_s_vx, logit_o=logit_o_vx,
         sh=sh_vx, train_mask=train_mask,
         scene_scale=scene_scale, conf_thresh=conf_thresh,
-        voxel=voxel,
+        voxel=voxel, remove_sky=bool(remove_sky),
     )
 
 
@@ -594,6 +743,62 @@ def save_inria_ply(path, means, sh_all, log_s, logit_o, quats):
     PlyData([PlyElement.describe(arr, "vertex")], text=False).write(path)
 
 
+def load_inria_ply(path: str | Path, device: torch.device) -> dict:
+    """Inverse of `save_inria_ply` for trainer re-ingestion.
+
+    Returns the *raw, pre-activation* tensors that go straight back into
+    `train.params` — opacity stays as logit, scales stay in log-space, quats
+    are not normalized, no coordinate flip. This is intentionally different
+    from `viewer.PlyLoader.load`, which post-activates and flips for display.
+
+    Returned dict:
+      means:    (M, 3)
+      log_s:    (M, 3)
+      quats:    (M, 4)  wxyz
+      logit_o:  (M,)
+      sh0:      (M, 1, 3)
+      shN:      (M, K_rest, 3)  K_rest = (sh_max_deg+1)**2 - 1, may be 0
+      sh_max_deg: int
+    """
+    ply = PlyData.read(str(path))
+    v = ply["vertex"].data
+    prop_names = v.dtype.names
+
+    means = np.stack([v["x"], v["y"], v["z"]], axis=-1).astype(np.float32)
+    logit_o = v["opacity"].astype(np.float32)
+    log_s = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=-1).astype(np.float32)
+    quats = np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=-1).astype(np.float32)
+    sh0 = np.stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]], axis=-1).astype(np.float32)[:, None, :]
+
+    rest_props = sorted(
+        (n for n in prop_names if n.startswith("f_rest_")),
+        key=lambda s: int(s.split("_")[-1]),
+    )
+    if rest_props:
+        assert len(rest_props) % 3 == 0
+        K_minus_1 = len(rest_props) // 3
+        K = K_minus_1 + 1
+        sh_max_deg = int(round(math.sqrt(K))) - 1
+        assert (sh_max_deg + 1) ** 2 == K, f"f_rest count {len(rest_props)} not a valid SH degree"
+        rest_np = np.stack([v[n] for n in rest_props], axis=-1).astype(np.float32)
+        # save_inria_ply wrote rest = sh_np[:, 1:, :].transpose(0,2,1).reshape(n, 3*K_rest)
+        # so to invert: reshape (n, 3, K_rest) then transpose back to (n, K_rest, 3).
+        shN = rest_np.reshape(-1, 3, K_minus_1).transpose(0, 2, 1)
+    else:
+        sh_max_deg = 0
+        shN = np.zeros((means.shape[0], 0, 3), dtype=np.float32)
+
+    return {
+        "means":    torch.from_numpy(means).to(device),
+        "log_s":    torch.from_numpy(log_s).to(device),
+        "quats":    torch.from_numpy(quats).to(device),
+        "logit_o":  torch.from_numpy(logit_o).to(device),
+        "sh0":      torch.from_numpy(sh0).to(device),
+        "shN":      torch.from_numpy(shN).to(device),
+        "sh_max_deg": sh_max_deg,
+    }
+
+
 _COMPONENT_ABBR = {
     "l1": "l1", "void": "void", "lpips": "lpips",
     "distortion": "dist", "normal_consistency": "nrm",
@@ -683,6 +888,32 @@ class SplatTrainer:
         self.init:  GaussianInit | None = None
         self.train: TrainState   | None = None
 
+        # Per-splat session tag — length M, written by `prepare_and_init`
+        # (all zeros) and extended by `_seed_splats_for_new_frames` (Phase 2)
+        # with the appended frames' epoch. Filtered through `prune_splats`
+        # and reset by `load_checkpoint` / `reset`. Used by Phase 5's
+        # voxel-overlap / coverage-by-epoch visualizations.
+        self._splat_epoch: torch.Tensor | None = None
+
+        # Disk paths of the frames currently in `self.data`, in row order.
+        # Populated by `prepare_and_init` (length N0) and extended by
+        # `append_video` after extracting the new clip; needed so we can
+        # re-run DA3 over the union (original + appended) on each append
+        # and get a single consistent coordinate frame across clips.
+        self._frame_paths: list[str] | None = None
+
+        # Phase 3: per-step frame sampler. "uniform" (default) matches the
+        # original `torch.randint(0, N, 1)` behaviour. "stratified" samples
+        # epoch first (latest epoch gets weight `_new_frame_weight`, every
+        # other epoch gets 1.0), then a frame within that epoch. "scheduled"
+        # additionally interpolates from "sample only the newest epoch" at
+        # step 0 to the stratified target by `_sampling_horizon` — biases
+        # toward freshly-appended frames early so the new region integrates
+        # before the gradient mixes back to the rest of the scene.
+        self._sampling_mode: str = "uniform"
+        self._new_frame_weight: float = 1.0
+        self._sampling_horizon: int = 1000
+
     # ---- External-compat forwarders ------------------------------------- #
     # Returned references stay valid across densify swaps because they go
     # through `self.train.params[...]` on each access — DefaultStrategy
@@ -752,7 +983,10 @@ class SplatTrainer:
         self.name = name or video.stem
         out_dir = self.output_root / self.name
         if self._last_video != signature or self.data is None:
-            self.data = _preprocess_video(video, out_dir, self.device, max_frames)
+            self.data, frame_paths = _preprocess_video(
+                video, out_dir, self.device, max_frames,
+            )
+            self._frame_paths = list(frame_paths)
             self._last_video = signature
         self.init = _build_initial_gaussians(
             self.data, self.max_points,
@@ -786,6 +1020,9 @@ class SplatTrainer:
             self._log_scale_max = None
         else:
             self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
+        # Phase 2: all initial splats belong to epoch 0.
+        M0 = int(self.train.params["means"].shape[0])
+        self._splat_epoch = torch.zeros(M0, dtype=torch.int32, device=self.device)
         self._publish_to_scene()
         self._initialized = True
 
@@ -843,6 +1080,688 @@ class SplatTrainer:
         save_inria_ply(path, p["means"], sh_all,
                        p["scales"], p["opacities"], p["quats"])
 
+    # ---- Phase 1: incremental training checkpoints --------------------- #
+
+    def save_checkpoint(self, path: str | Path) -> dict:
+        """Save trained splats as an Inria PLY plus a sidecar JSON capturing
+        the bits `load_checkpoint` needs to rebuild a consistent
+        `GaussianInit` / `TrainState` shell (step count, voxel, scene_scale,
+        conf_thresh, rasterizer mode, sh_max_deg, scale-clamp setting).
+
+        The sidecar lives next to the PLY (same stem, `.json` suffix). Adam
+        moments and densify-strategy state are NOT saved — they rebuild
+        fresh on load (Phase 6 will add full optimizer-state checkpointing).
+        Returns the metadata dict that was written.
+        """
+        if self.train is None or self.init is None:
+            raise RuntimeError("call prepare_and_init before save_checkpoint")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # PLY
+        self.save_current(str(path))
+        # Sidecar
+        meta = {
+            "schema_version": 1,
+            "step_count":     int(self._step_count),
+            "scene_scale":    float(self.init.scene_scale),
+            "voxel":          float(self.init.voxel),
+            "conf_thresh":    (None if self.init.conf_thresh is None
+                               else float(self.init.conf_thresh)),
+            "remove_sky":     bool(self.init.remove_sky),
+            "sh_max_deg":     int(self.sh_max_deg),
+            "mode":           str(self.mode),
+            "scale_clamp_voxel_mult": float(self.scale_clamp_voxel_mult),
+            "use_densify":    bool(self.use_densify),
+            "densify_total_steps":    int(self.densify_total_steps),
+            "splat_count":    int(self.train.params["means"].shape[0]),
+            "frame_count":    int(self.data.N if self.data is not None else 0),
+        }
+        sidecar = path.with_suffix(".json")
+        sidecar.write_text(json.dumps(meta, indent=2))
+        print(f"saved checkpoint: {path} (+ {sidecar.name}) — "
+              f"{meta['splat_count']:,} splats @ step {meta['step_count']}")
+        return meta
+
+    def load_checkpoint(self, ply_path: str | Path,
+                        sidecar_path: str | Path | None = None) -> dict:
+        """Replace the current trained splats with those in `ply_path`.
+
+        Requires `self.data` to already be loaded (i.e. `prepare_and_init`
+        was called on the original video). The sidecar JSON supplies the
+        `scene_scale` / `voxel` / `conf_thresh` / `remove_sky` so that the
+        existing per-frame loss mask + scale-clamp stay consistent with how
+        the saved splats were trained.
+
+        Adam state is NOT restored — splats will wobble for the first few
+        hundred steps after resume. Densify strategy state is re-initialised.
+        Sidecar is optional: if missing, we fall back to the trainer's
+        current settings (you'll get a warning if voxel was inferred).
+        """
+        if self.data is None:
+            raise RuntimeError(
+                "load_checkpoint requires data to be loaded — call "
+                "prepare_and_init on the source video first"
+            )
+        ply_path = Path(ply_path)
+        if sidecar_path is None:
+            sidecar_path = ply_path.with_suffix(".json")
+        sidecar_path = Path(sidecar_path)
+
+        loaded = load_inria_ply(ply_path, self.device)
+        meta: dict = {}
+        if sidecar_path.exists():
+            meta = json.loads(sidecar_path.read_text())
+        else:
+            print(f"warning: sidecar {sidecar_path} not found — using current trainer settings")
+
+        sh_max_deg = int(meta.get("sh_max_deg", loaded["sh_max_deg"]))
+        scene_scale = float(meta.get("scene_scale",
+                                     self.init.scene_scale if self.init else 1.0))
+        voxel = float(meta.get("voxel",
+                               self.init.voxel if self.init else 1e-2))
+        conf_thresh = meta.get("conf_thresh",
+                               self.init.conf_thresh if self.init else None)
+        if conf_thresh is not None:
+            conf_thresh = float(conf_thresh)
+        remove_sky = bool(meta.get("remove_sky",
+                                   self.init.remove_sky if self.init else True))
+        mode = str(meta.get("mode", self.mode))
+        scale_clamp = float(meta.get("scale_clamp_voxel_mult",
+                                     self.scale_clamp_voxel_mult))
+        use_densify = bool(meta.get("use_densify", self.use_densify))
+        densify_total = int(meta.get("densify_total_steps",
+                                     self.densify_total_steps))
+
+        # Trainer-level switches that affect rasterizer + step()
+        self.mode = mode
+        self.sh_max_deg = sh_max_deg
+        self.use_densify = use_densify
+        self.densify_total_steps = densify_total
+
+        # Rebuild the per-frame loss mask against the current `self.data`
+        # using the checkpoint's mask gates (so the supervision matches what
+        # produced the saved splats).
+        train_mask = _per_frame_train_mask(
+            self.data.depth, self.data.sky, self.data.conf,
+            conf_thresh, remove_sky,
+        )
+        self.init = GaussianInit(
+            means=loaded["means"], quats=loaded["quats"],
+            log_s=loaded["log_s"], logit_o=loaded["logit_o"],
+            sh=loaded["sh0"], train_mask=train_mask,
+            scene_scale=scene_scale, conf_thresh=conf_thresh,
+            voxel=voxel, remove_sky=remove_sky,
+        )
+        # Build a fresh TrainState from the loaded params. Adam moments are
+        # zero — see method docstring. We then patch in the higher SH bands
+        # (`shN`) from the checkpoint since `_make_train_state` always
+        # allocates a *zeroed* shN of the requested capacity.
+        self.train = _make_train_state(
+            self.init, sh_max_deg=sh_max_deg,
+            use_densify=use_densify, densify_total_steps=densify_total,
+            mode=mode,
+        )
+        if loaded["shN"].shape[1] > 0:
+            with torch.no_grad():
+                shN_capacity = self.train.params["shN"].shape[1]
+                copy_bands = min(shN_capacity, loaded["shN"].shape[1])
+                if copy_bands > 0:
+                    self.train.params["shN"][:, :copy_bands, :] = loaded["shN"][:, :copy_bands, :]
+
+        # Restore step count + scale clamp + DA3 normals. Splat-epoch tags
+        # are not in the v1 sidecar (Phase 1 saves only PLY), so we reset to
+        # all-zeros for the loaded splat count — they'll get bumped again
+        # the next time `_seed_splats_for_new_frames` runs.
+        M_loaded = int(self.train.params["means"].shape[0])
+        self._splat_epoch = torch.zeros(M_loaded, dtype=torch.int32, device=self.device)
+        self._step_count = int(meta.get("step_count", 0))
+        self.scale_clamp_voxel_mult = scale_clamp
+        if self.mode == "2dgs":
+            self._log_scale_max = None
+        else:
+            self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
+        if self.mode == "2dgs" and self.da3_normal_weight > 0.0:
+            with torch.no_grad():
+                self._da3_normals = depth_to_normal(
+                    self.data.depth[..., None], self.data.c2w, self.data.K,
+                )
+        else:
+            self._da3_normals = None
+
+        self._publish_to_scene()
+        self._initialized = True
+        info = {
+            "splat_count":  int(self.train.params["means"].shape[0]),
+            "step_count":   int(self._step_count),
+            "sh_max_deg":   sh_max_deg,
+            "mode":         mode,
+            "frame_count":  int(self.data.N),
+            "sidecar_used": sidecar_path.exists(),
+        }
+        print(f"loaded checkpoint: {ply_path} — {info['splat_count']:,} splats "
+              f"@ step {info['step_count']} (sh={info['sh_max_deg']}, mode={info['mode']})")
+        return info
+
+    def append_video(self, video_path: str | Path, max_frames: int = -1,
+                     name: str | None = None,
+                     seed_new_splats: bool = False) -> dict:
+        """Run DA3 on a new clip and append every frame to `self.data` +
+        extend `self.init.train_mask`. New frames get a new epoch tag
+        (`max(frame_epoch) + 1`) so Phase 3 sampling + Phase 5 visual debug
+        can distinguish them.
+
+        When `seed_new_splats=True`, also runs Phase 2's
+        `_seed_splats_for_new_frames` on the freshly-appended indices, so
+        new viewpoints get splat coverage immediately rather than waiting
+        for densification (Phase 1 leaves splat count unchanged).
+
+        Returns `{"first_new_idx", "n_added", "epoch", "skipped",
+                  "n_candidates", "n_after_dedup", "n_seeded"}`. The
+        `n_*` seed fields are 0 when `seed_new_splats=False`.
+        """
+        if self.data is None or self.init is None:
+            raise RuntimeError("call prepare_and_init before append_video")
+        if not self._frame_paths:
+            raise RuntimeError(
+                "append_video needs the original clip's frame paths cached on "
+                "the trainer (set by prepare_and_init). State looks inconsistent."
+            )
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"video not found: {video_path}")
+        out_dir = self.output_root / (name or f"{video_path.stem}_append")
+
+        # Phase 2.5: run DA3 ONCE over (original + new) frame paths so we
+        # get a single coordinate frame across clips. Per-clip DA3 picks an
+        # independent reference view, so without this the new frames'
+        # c2w live in a different world frame than the existing splats →
+        # "duplicates at wrong locations" rather than dedup-and-merge.
+        new_frame_paths = _extract_frames(video_path, out_dir, max_frames)
+        n_orig = int(self.data.N)
+        n_new = len(new_frame_paths)
+        if n_new == 0:
+            print(f"append_video: no frames extracted from {video_path}; skipping")
+            return {"first_new_idx": n_orig, "n_added": 0,
+                    "epoch": max(self.data.frame_epoch) if self.data.frame_epoch else 0,
+                    "skipped": 0, "n_candidates": 0,
+                    "n_after_dedup": 0, "n_seeded": 0}
+        joint_paths = list(self._frame_paths) + list(new_frame_paths)
+        print(f"append_video: joint DA3 pass over {len(joint_paths)} frames "
+              f"({n_orig} original + {n_new} new)")
+        joint_data = _da3_inference_on_paths(joint_paths, self.device)
+
+        # If joint DA3 picked a different (H, W) than the original we'd have
+        # to resize every frame + splat space — out of scope. In practice
+        # same camera + same DA3 settings → same (H, W).
+        if (joint_data.H, joint_data.W) != (self.data.H, self.data.W):
+            raise RuntimeError(
+                f"joint DA3 produced ({joint_data.H}, {joint_data.W}); existing "
+                f"data is ({self.data.H}, {self.data.W}). Pre-resize the appended "
+                f"clip to match (same aspect ratio) and re-try."
+            )
+
+        # Kabsch-align joint pose frame → original frame using camera centers.
+        # Apply T to every joint c2w so the new VideoData lives in the SAME
+        # world frame as the existing splats. Falls back to identity if we
+        # don't have at least 3 original frames to fit a unique rotation.
+        old_centers = self.data.c2w[:n_orig, :3, 3].detach()
+        joint_centers_orig = joint_data.c2w[:n_orig, :3, 3].detach()
+        if n_orig >= 3:
+            T = _kabsch_se3(joint_centers_orig, old_centers)
+        else:
+            T = torch.eye(4, device=self.device, dtype=joint_data.c2w.dtype)
+            print(f"append_video: only {n_orig} original frames — Kabsch under-"
+                  f"determined; using identity alignment (existing splats may misalign).")
+        # Alignment quality readout — large residuals signal that DA3
+        # produced inconsistent poses for the original frames (e.g. the
+        # new clip dominated the joint solution).
+        joint_centers_aligned = (T @ torch.cat(
+            [joint_centers_orig, torch.ones((n_orig, 1), device=self.device)],
+            dim=1,
+        ).T).T[:, :3]
+        align_err = (joint_centers_aligned - old_centers).norm(dim=1)
+        print(f"append_video: Kabsch alignment residuals (m) — "
+              f"mean={align_err.mean().item():.4f} "
+              f"max={align_err.max().item():.4f} "
+              f"(scene_scale≈{self.init.scene_scale:.3f})")
+
+        # Apply T to ALL joint c2w (broadcast batch matmul).
+        c2w_aligned = T.unsqueeze(0) @ joint_data.c2w
+        w2c_aligned = torch.linalg.inv(c2w_aligned)
+        joint_data.c2w = c2w_aligned
+        joint_data.w2c = w2c_aligned
+
+        # Preserve old frame_epoch values; tag new frames with max+1.
+        cur_max_epoch = max(self.data.frame_epoch) if self.data.frame_epoch else 0
+        new_epoch = cur_max_epoch + 1
+        joint_data.frame_epoch = list(self.data.frame_epoch) + [new_epoch] * n_new
+
+        # Replace data + extend cached paths.
+        self.data = joint_data
+        self._frame_paths = joint_paths
+        # Invalidate the "skip preprocessing on re-init" cache marker:
+        # `self.data` no longer matches the single `_last_video` signature
+        # (it now spans both clips). Without this, Reset → Initialize on
+        # the original video would skip preprocessing AND silently seed
+        # splats from the appended-clip frames still living in self.data.
+        self._last_video = None
+
+        # Rebuild train_mask across ALL frames with the checkpoint's gating
+        # (same conf_thresh / remove_sky that supervised the existing splats).
+        self.init.train_mask = _per_frame_train_mask(
+            self.data.depth, self.data.sky, self.data.conf,
+            self.init.conf_thresh, self.init.remove_sky,
+        )
+
+        # Recompute DA3 normals over the joint set in 2DGS mode.
+        if self.mode == "2dgs" and self.da3_normal_weight > 0.0:
+            with torch.no_grad():
+                self._da3_normals = depth_to_normal(
+                    self.data.depth[..., None], self.data.c2w, self.data.K,
+                )
+        else:
+            self._da3_normals = None
+
+        first_new = n_orig
+        added = n_new
+        skipped = 0
+        print(f"append_video: appended +{added} frames (epoch {new_epoch}); "
+              f"seed_new_splats={seed_new_splats}, first_new_idx={first_new}")
+
+        seed_info = {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0}
+        if seed_new_splats and added > 0:
+            new_idxs = list(range(first_new, first_new + added))
+            seed_info_full = self._seed_splats_for_new_frames(new_idxs)
+            seed_info = {k: seed_info_full[k]
+                         for k in ("n_candidates", "n_after_dedup", "n_seeded")}
+        elif not seed_new_splats:
+            print("append_video: seed_new_splats=False → splat count unchanged "
+                  "(toggle 'seed new splats from added frames' to grow geometry)")
+
+        info = {"first_new_idx": first_new, "n_added": added,
+                "epoch": new_epoch, "skipped": skipped, **seed_info}
+        print(f"append_video: +{added} frames (epoch {new_epoch}; skipped {skipped}) "
+              f"→ data.N={self.data.N}; seeded={seed_info['n_seeded']} new splats")
+        return info
+
+    def append_supplied_frames(self, frames: Sequence[dict],
+                               seed_new_splats: bool = False) -> dict:
+        """Append externally-prepared frames. Each `frames[i]` is a dict:
+            {"rgb":   (H, W, 3) float/uint8 numpy or torch,
+             "K":     (3, 3) numpy or torch,
+             "c2w":   (4, 4) numpy or torch,
+             "depth": (H, W) numpy or torch — REQUIRED for Phase 1,
+             "conf":  optional (H, W) float in [0,1] — defaults to ones,
+             "sky":   optional (H, W) bool — defaults to zeros}.
+
+        Mismatched resolution is auto-resized to (self.data.H, self.data.W);
+        K is rescaled accordingly. All new frames share one epoch tag
+        (max+1). For Phase 1 the caller must supply depth — running DA3 on
+        a per-frame batch is a follow-up enhancement.
+
+        Returns `{"first_new_idx", "n_added", "epoch", "skipped"}`.
+        """
+        if self.data is None or self.init is None:
+            raise RuntimeError("call prepare_and_init before append_supplied_frames")
+        cur_max_epoch = max(self.data.frame_epoch) if self.data.frame_epoch else 0
+        new_epoch = cur_max_epoch + 1
+        first_new = self.data.N
+        added = 0
+        skipped = 0
+        H, W = self.data.H, self.data.W
+
+        for j, fr in enumerate(frames):
+            try:
+                rgb_t = _to_tensor(fr["rgb"], self.device, torch.float32)
+                if rgb_t.dtype != torch.float32:
+                    rgb_t = rgb_t.float()
+                if rgb_t.max() > 1.5:  # uint8-style payload
+                    rgb_t = rgb_t / 255.0
+                if rgb_t.ndim != 3 or rgb_t.shape[-1] != 3:
+                    raise ValueError(f"rgb must be (H, W, 3); got {tuple(rgb_t.shape)}")
+                if "depth" not in fr or fr["depth"] is None:
+                    raise ValueError("depth is required (Phase 1)")
+                depth_t = _to_tensor(fr["depth"], self.device, torch.float32)
+                K_t = _to_tensor(fr["K"], self.device, torch.float32).reshape(3, 3)
+                c2w_t = _to_tensor(fr["c2w"], self.device, torch.float32).reshape(4, 4)
+                conf_t = (_to_tensor(fr["conf"], self.device, torch.float32)
+                          if fr.get("conf") is not None else None)
+                sky_t = (_to_tensor(fr["sky"], self.device, torch.bool)
+                         if fr.get("sky") is not None else None)
+            except Exception as e:
+                print(f"append_supplied_frames: frame {j} skipped — {e}")
+                skipped += 1
+                continue
+
+            if rgb_t.shape[:2] != (H, W):
+                resized = _resize_frame_to(rgb_t, depth_t, K_t, conf_t, sky_t, H, W)
+                if resized is None:
+                    skipped += 1
+                    continue
+                rgb_t, depth_t, K_t, conf_t, sky_t = resized
+
+            self.data.append_frame(
+                rgb_t, depth_t, K_t, c2w_t,
+                conf=conf_t, sky=sky_t, epoch=new_epoch,
+            )
+            mask_t = _per_frame_train_mask(
+                depth_t, sky_t, conf_t,
+                self.init.conf_thresh, self.init.remove_sky,
+            )
+            self.init.append_train_mask(mask_t)
+            added += 1
+
+        if self.mode == "2dgs" and self.da3_normal_weight > 0.0:
+            with torch.no_grad():
+                self._da3_normals = depth_to_normal(
+                    self.data.depth[..., None], self.data.c2w, self.data.K,
+                )
+
+        print(f"append_supplied_frames: appended +{added} frames; "
+              f"seed_new_splats={seed_new_splats}, first_new_idx={first_new}")
+        seed_info = {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0}
+        if seed_new_splats and added > 0:
+            new_idxs = list(range(first_new, first_new + added))
+            seed_info_full = self._seed_splats_for_new_frames(new_idxs)
+            seed_info = {k: seed_info_full[k]
+                         for k in ("n_candidates", "n_after_dedup", "n_seeded")}
+        elif not seed_new_splats:
+            print("append_supplied_frames: seed_new_splats=False → splat count unchanged")
+
+        info = {"first_new_idx": first_new, "n_added": added,
+                "epoch": new_epoch, "skipped": skipped, **seed_info}
+        print(f"append_supplied_frames: +{added} frames (epoch {new_epoch}; "
+              f"skipped {skipped}) → data.N={self.data.N}; "
+              f"seeded={seed_info['n_seeded']} new splats")
+        return info
+
+    # ---- Phase 2: seed new splats from already-appended frames -------- #
+
+    def _seed_splats_for_new_frames(self, new_frame_idxs: Sequence[int]) -> dict:
+        """RGBD-unproject the frames at `new_frame_idxs`, voxel-dedup against
+        the existing splat distribution at `init.voxel`, voxel-downsample
+        the survivors, and concat the resulting splats into the live
+        `train.params` ParameterDict. Mirrors the inner logic of
+        `_build_initial_gaussians` (lines 236–244 + 302–325) so the new
+        seeds are produced by exactly the same recipe as the original ones.
+
+        Per-key Adam optimizers + densify-strategy state are rebuilt fresh
+        (same pattern as `prune_splats`). Adam moments for existing splats
+        are reset — momentum recovers within a few hundred steps; the
+        alternative (per-row state surgery) is brittle.
+
+        Returns `{"n_candidates", "n_after_dedup", "n_seeded", "epoch"}`.
+        Caller is responsible for pausing the training thread first
+        (the GUI handler does this; the inpainter / CLI must too).
+        """
+        if self.train is None or self.data is None or self.init is None:
+            raise RuntimeError("call prepare_and_init before _seed_splats_for_new_frames")
+        idx_list = [int(i) for i in new_frame_idxs]
+        if not idx_list:
+            print("_seed_splats: called with empty index list — skipping")
+            return {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0,
+                    "epoch": -1}
+        print(f"_seed_splats: starting — {len(idx_list)} new frames (indices "
+              f"[{idx_list[0]}..{idx_list[-1]}]); voxel={float(self.init.voxel):.5f} "
+              f"conf_thresh={self.init.conf_thresh} remove_sky={bool(self.init.remove_sky)}")
+
+        d = self.data
+        device = self.device
+        voxel = float(self.init.voxel)
+        remove_sky = bool(self.init.remove_sky)
+        conf_thresh = self.init.conf_thresh
+        H, W = int(d.H), int(d.W)
+
+        sel = torch.as_tensor(idx_list, dtype=torch.long, device=device)
+        # The epoch label for newly-seeded splats: the max epoch across the
+        # selected frames. In the common case (a single append session) all
+        # selected frames share one epoch, so this is just that epoch.
+        epochs_for_new = [d.frame_epoch[i] for i in idx_list]
+        new_epoch = max(epochs_for_new) if epochs_for_new else 0
+
+        # ---- Unproject the selected frames (same as init lines 236-244) -- #
+        ii, jj = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device), indexing="ij")
+        uv1 = torch.stack([jj, ii, torch.ones_like(ii)], -1).float()
+        K_sel = d.K[sel]
+        c2w_sel = d.c2w[sel]
+        depth_sel = d.depth[sel]
+        rgb_sel = d.rgb[sel]
+        Kinv = torch.linalg.inv(K_sel)
+        cam_pts = torch.einsum("nij,hwj->nhwi", Kinv, uv1) * depth_sel[..., None]
+        R = c2w_sel[:, :3, :3]
+        tt = c2w_sel[:, :3, 3]
+        world = torch.einsum("nij,nhwj->nhwi", R, cam_pts) + tt[:, None, None, :]
+
+        # Validity gate matches `_per_frame_train_mask`.
+        valid = depth_sel > 0
+        if d.sky is not None and remove_sky:
+            valid &= ~d.sky[sel]
+        if d.conf is not None and conf_thresh is not None:
+            valid &= d.conf[sel] > conf_thresh
+
+        if not bool(valid.any()):
+            n_depth = int((depth_sel > 0).sum().item())
+            n_sky_ok = int((~d.sky[sel]).sum().item()) if (d.sky is not None and remove_sky) else -1
+            n_conf_ok = int((d.conf[sel] > conf_thresh).sum().item()) \
+                if (d.conf is not None and conf_thresh is not None) else -1
+            print(f"_seed_splats: epoch={new_epoch} ALL CANDIDATES INVALID — "
+                  f"depth>0={n_depth}, ~sky={n_sky_ok}, conf>{conf_thresh}={n_conf_ok}; "
+                  f"check whether the new clip's depth/sky/conf gates match the originals")
+            return {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0,
+                    "epoch": new_epoch}
+
+        pts_full = world[valid]
+        cols_full = rgb_sel[valid]
+        z_full = depth_sel[valid]
+        fx_nhw = K_sel[:, 0, 0][:, None, None].expand(int(sel.numel()), H, W)
+        fx_full = fx_nhw[valid]
+        M_cand = int(pts_full.shape[0])
+
+        # Memory-safety cap on the *candidate pool* (raw unprojected pixels)
+        # before voxel dedup/downsample. Mirrors the `max_points` cap that
+        # `_build_initial_gaussians` applies at lines 269-272 — it's a guard
+        # against tens of millions of candidates eating GPU memory, NOT a
+        # cap on total splat count. Densify + prune are the right knobs for
+        # that. Use `prune_splats` first if you really need to cap total M.
+        existing_count = int(self.train.params["means"].shape[0])
+        if M_cand > int(self.max_points):
+            order = torch.randperm(M_cand, device=device)[:int(self.max_points)]
+            pts_full, cols_full = pts_full[order], cols_full[order]
+            z_full, fx_full = z_full[order], fx_full[order]
+            M_cand = int(self.max_points)
+            print(f"_seed_splats: candidate pool subsampled to max_points={self.max_points} "
+                  f"(unprojection memory safety; final seeded count is still set by voxel dedup)")
+
+        # ---- Voxel-dedup against existing splats ------------------------- #
+        existing_means = self.train.params["means"].detach()
+        BIT = 21
+        OFF = 1 << (BIT - 1)
+        MASK = (1 << BIT) - 1
+
+        def _scalar_keys(pts: torch.Tensor) -> torch.Tensor:
+            k = torch.floor(pts / voxel).long()
+            k0 = (k[:, 0] + OFF).clamp(0, MASK)
+            k1 = (k[:, 1] + OFF).clamp(0, MASK)
+            k2 = (k[:, 2] + OFF).clamp(0, MASK)
+            return (k0 << (2 * BIT)) | (k1 << BIT) | k2
+
+        cand_scalar = _scalar_keys(pts_full)
+        exist_scalar = _scalar_keys(existing_means)
+        occupied = torch.isin(cand_scalar, exist_scalar)
+        keep = ~occupied
+        M_after_dedup = int(keep.sum().item())
+        if M_after_dedup == 0:
+            print(f"_seed_splats: epoch={new_epoch} cand={M_cand} after_dedup=0 — "
+                  f"every candidate voxel was already occupied by an existing splat. "
+                  f"Either the two clips overlap spatially (expected) or the dedup "
+                  f"hash misfired (voxel={voxel} too coarse?).")
+            return {"n_candidates": M_cand, "n_after_dedup": 0, "n_seeded": 0,
+                    "epoch": new_epoch}
+
+        pts_new = pts_full[keep]
+        cols_new = cols_full[keep]
+        z_new = z_full[keep]
+        fx_new = fx_full[keep]
+
+        # ---- Voxel-downsample the survivors (mirrors init lines 302-325) -- #
+        keys_new = torch.floor(pts_new / voxel).long()
+        uniq_keys, inv = torch.unique(keys_new, dim=0, return_inverse=True)
+        G = int(uniq_keys.shape[0])
+
+        means_g = _scatter_mean(pts_new, inv, G)
+        cols_g = _scatter_mean(cols_new, inv, G)
+        z_g = _scatter_mean(z_new, inv, G)
+        fx_g = _scatter_mean(fx_new, inv, G)
+
+        inflate = max(1.0, (M_after_dedup / max(G, 1)) ** 0.5)
+        tex_g = (z_g / fx_g * inflate).clamp_min(voxel * 0.5)
+
+        C0 = 0.28209479177387814
+        means_new_t = means_g.clone()
+        f_dc_new = (cols_g - 0.5) / C0
+        log_s_new = torch.log(tex_g[:, None].expand(G, 3).contiguous())
+        logit_o_new = torch.full((G,), 2.1972, device=device)
+        quats_new_t = torch.zeros((G, 4), device=device)
+        quats_new_t[:, 0] = 1.0
+        sh0_new = f_dc_new[:, None, :]
+        K_rest = int(self.train.params["shN"].shape[1])
+        shN_new = torch.zeros(
+            (G, K_rest, 3), device=device,
+            dtype=self.train.params["shN"].dtype,
+        )
+
+        # ---- Concat into the live ParameterDict + rebuild opts ----------- #
+        ts = self.train
+        p = ts.params
+        new_params = torch.nn.ParameterDict({
+            "means":     torch.nn.Parameter(torch.cat([p["means"].detach(),     means_new_t], dim=0)),
+            "scales":    torch.nn.Parameter(torch.cat([p["scales"].detach(),    log_s_new],   dim=0)),
+            "quats":     torch.nn.Parameter(torch.cat([p["quats"].detach(),     quats_new_t], dim=0)),
+            "opacities": torch.nn.Parameter(torch.cat([p["opacities"].detach(), logit_o_new], dim=0)),
+            "sh0":       torch.nn.Parameter(torch.cat([p["sh0"].detach(),       sh0_new],     dim=0)),
+            "shN":       torch.nn.Parameter(torch.cat([p["shN"].detach(),       shN_new],     dim=0)),
+        }).to(device)
+        means_lr = 1.6e-4 * self.init.scene_scale if self.use_densify else 1.6e-4
+        lr_table = {
+            "means":     means_lr,
+            "scales":    5e-3,
+            "quats":     1e-3,
+            "opacities": 5e-2,
+            "sh0":       2.5e-3,
+            "shN":       2.5e-3 / 20.0,
+        }
+        new_opts = {
+            k: torch.optim.Adam([{"params": [new_params[k]], "lr": lr}])
+            for k, lr in lr_table.items()
+        }
+        if ts.strategy is not None:
+            ts.strategy.check_sanity(new_params, new_opts)
+            ts.strategy_state = ts.strategy.initialize_state(
+                scene_scale=self.init.scene_scale,
+            )
+        ts.params = new_params
+        ts.opts = new_opts
+
+        # ---- Extend the per-splat epoch tag (Phase 5 foundation) --------- #
+        if self._splat_epoch is None or int(self._splat_epoch.numel()) != existing_count:
+            # Backfill with zeros so old splats are tagged epoch 0.
+            self._splat_epoch = torch.zeros(existing_count, dtype=torch.int32, device=device)
+        new_tags = torch.full((G,), int(new_epoch), dtype=torch.int32, device=device)
+        self._splat_epoch = torch.cat([self._splat_epoch, new_tags], dim=0)
+
+        self._publish_to_scene()
+        info = {"n_candidates": M_cand, "n_after_dedup": M_after_dedup,
+                "n_seeded": G, "epoch": new_epoch}
+        print(f"_seed_splats: epoch={new_epoch} cand={M_cand} after_dedup={M_after_dedup} "
+              f"seeded={G} → M={int(new_params['means'].shape[0])}")
+        return info
+
+    # ---- Phase 3: epoch-aware frame sampling -------------------------- #
+
+    def set_sampling(self, mode: str = "uniform",
+                     new_frame_weight: float = 1.0,
+                     horizon: int = 1000) -> dict:
+        """GUI hook to change the per-step frame sampler at runtime.
+
+        `mode`: "uniform" | "stratified" | "scheduled".
+        `new_frame_weight`: the latest epoch's weight relative to every
+        other epoch (1.0 = uniform, 2.0 = sample latest epoch 2× as often
+        per frame as each other epoch, 0.5 = half as often).
+        `horizon`: scheduled mode only — number of steps over which the
+        sampler decays from "latest epoch only" to the stratified target.
+
+        Returns a small status dict mirroring the new state. Safe to call
+        at any time; the next `step()` picks it up.
+        """
+        if mode not in ("uniform", "stratified", "scheduled"):
+            raise ValueError(f"mode must be uniform/stratified/scheduled, got {mode!r}")
+        self._sampling_mode = mode
+        self._new_frame_weight = max(0.0, float(new_frame_weight))
+        self._sampling_horizon = max(1, int(horizon))
+        return {
+            "mode": self._sampling_mode,
+            "new_frame_weight": self._new_frame_weight,
+            "horizon": self._sampling_horizon,
+        }
+
+    def epoch_frame_counts(self) -> dict[int, int]:
+        """Per-epoch frame counts from `data.frame_epoch`. Used by the GUI
+        status panel + by `_sample_frame_idx` to decide which epoch labels
+        actually have frames in the current set."""
+        if self.data is None or not self.data.frame_epoch:
+            return {}
+        out: dict[int, int] = {}
+        for e in self.data.frame_epoch:
+            out[int(e)] = out.get(int(e), 0) + 1
+        return out
+
+    def _sample_frame_idx(self) -> int:
+        """Per-step frame sampler. `uniform` keeps the original behaviour
+        (single `torch.randint`). `stratified` picks an epoch first using
+        per-epoch weights (latest gets `new_frame_weight`, others get 1.0),
+        then a frame within that epoch. `scheduled` linearly interpolates
+        from "sample only the newest epoch" at step 0 to the stratified
+        target at step ≥ `_sampling_horizon`.
+
+        Fast-path: any time only one epoch is present, falls back to a
+        single uniform draw — saves the python loop for the common case
+        (no append yet, or single-clip session)."""
+        d = self.data
+        if d is None or d.N == 0:
+            return 0
+        # Fast path #1: uniform mode or no incremental weighting requested.
+        if self._sampling_mode == "uniform" or self._new_frame_weight == 1.0:
+            return int(torch.randint(0, d.N, (1,)).item())
+        epochs = d.frame_epoch or []
+        unique = sorted(set(int(e) for e in epochs))
+        # Fast path #2: only one epoch — no stratification possible.
+        if len(unique) <= 1:
+            return int(torch.randint(0, d.N, (1,)).item())
+        latest = unique[-1]
+        # Stratified target weights: latest gets new_frame_weight, others 1.0.
+        target_w = {e: (self._new_frame_weight if e == latest else 1.0)
+                    for e in unique}
+        if self._sampling_mode == "scheduled":
+            h = max(1, self._sampling_horizon)
+            progress = min(1.0, float(self._step_count) / h)
+            # Initial: all weight on the latest epoch (only-new sampling).
+            init_w = {e: (1.0 if e == latest else 0.0) for e in unique}
+            cur_w = {e: init_w[e] * (1.0 - progress) + target_w[e] * progress
+                     for e in unique}
+        else:  # stratified
+            cur_w = target_w
+        weights = torch.tensor([cur_w[e] for e in unique], dtype=torch.float32)
+        total = float(weights.sum().item())
+        if total <= 0.0:
+            return int(torch.randint(0, d.N, (1,)).item())
+        epoch_choice = int(torch.multinomial(weights, 1).item())
+        chosen_epoch = unique[epoch_choice]
+        # Pick a frame uniformly within the chosen epoch.
+        in_epoch = [i for i, e in enumerate(epochs) if int(e) == chosen_epoch]
+        return in_epoch[int(torch.randint(0, len(in_epoch), (1,)).item())]
+
     def refine_gaussians(self, steps: int) -> None:
         """Headless CLI training loop. Requires `prepare_and_init` first."""
         if self.train is None or self.data is None:
@@ -887,6 +1806,7 @@ class SplatTrainer:
         self.train = None
         self.init = None
         self._da3_normals = None
+        self._splat_epoch = None
         if self.scene is not None:
             with self.scene.write() as s:
                 s.means = s.quats = s.scales = None
@@ -998,6 +1918,10 @@ class SplatTrainer:
             )
         t.params = new_params
         t.opts   = new_opts
+        # Filter the per-splat epoch tag through the same `keep` mask so it
+        # stays in lock-step with the trainable params (Phase 2 bookkeeping).
+        if self._splat_epoch is not None and self._splat_epoch.numel() == M:
+            self._splat_epoch = self._splat_epoch[keep].contiguous()
         self._publish_to_scene()
         return counts
 
@@ -1008,7 +1932,7 @@ class SplatTrainer:
             return 0.0
         t, d, i = self.train, self.data, self.init
         p = t.params
-        idx = int(torch.randint(0, d.N, (1,)).item())
+        idx = self._sample_frame_idx()
 
         # SH degree ramps 0→sh_max_deg. `cat` with a (M,0,3) shN is a no-op,
         # so the same path covers sh_max_deg=0.
