@@ -772,7 +772,7 @@ class ViewerApp:
         compute_voxel_overlap: "Callable[[float], dict] | None" = None,
         compute_coverage: "Callable[[str], dict] | None" = None,
         inpaint_preload: bool = True,
-        request_video: "Callable[[bytes, str, str, str], object] | None" = None,
+        request_video: "Callable[[bytes, str, str, str, dict], object] | None" = None,
         demo_defaults: dict | None = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
@@ -2725,6 +2725,15 @@ class ViewerApp:
         after). Settings duplicate the Train tab's and stay two-way synced.
         Built after the Train tab so the gui_init_* handles exist to link."""
         d = self._demo_defaults
+        # Resolution presets for the dropdown — queried from the server's
+        # /resolutions endpoint, with a static fallback if it isn't up yet.
+        import video_api
+        res_options, res_default = video_api.fetch_resolutions(
+            str(d.get("server_url", ""))
+        )
+        default_res = str(d.get("resolution", res_default))
+        if default_res not in res_options:
+            res_options = (default_res, *res_options)
         with self.server.gui.add_folder("Generate"):
             self.gui_demo_server = self.server.gui.add_text(
                 "server URL",
@@ -2757,6 +2766,51 @@ class ViewerApp:
             )
             self.gui_demo_count = self.server.gui.add_markdown(
                 "**videos processed:** 0"
+            )
+
+        with self.server.gui.add_folder("Lyra2 camera (zoom)"):
+            # These map 1:1 onto demo_server's /generate form fields and the
+            # underlying lyra2_zoomgs_inference CLI (--resolution,
+            # --num_frames_zoom_in/out, --zoom_in/out_strength).
+            self.gui_demo_resolution = self.server.gui.add_dropdown(
+                "resolution",
+                options=res_options,
+                initial_value=default_res,
+                hint="Output video resolution. Smaller = faster + less VRAM. "
+                     "Presets are fetched from the server's /resolutions "
+                     "endpoint (480p is the model's native size). The server "
+                     "also accepts a raw 'H,W' if you edit a preset in.",
+            )
+            self.gui_demo_zoom_in_frames = self.server.gui.add_number(
+                "zoom-in frames",
+                initial_value=int(d.get("num_frames_zoom_in", 81)),
+                min=81, max=801, step=80,
+                hint="Frames for the zoom-IN segment. Must be 1 + 80k "
+                     "(81, 161, 241, …) to align with AR chunk boundaries. "
+                     "More frames spread the same motion over a slower, "
+                     "smoother push-in.",
+            )
+            self.gui_demo_zoom_out_frames = self.server.gui.add_number(
+                "zoom-out frames",
+                initial_value=int(d.get("num_frames_zoom_out", 241)),
+                min=81, max=801, step=80,
+                hint="Frames for the zoom-OUT segment. Must be 1 + 80k. The "
+                     "final clip is zoom-out (reversed) + zoom-in.",
+            )
+            self.gui_demo_zoom_in_strength = self.server.gui.add_slider(
+                "zoom-in strength",
+                min=0.0, max=3.0, step=0.1,
+                initial_value=float(d.get("zoom_in_strength", 0.5)),
+                hint="How far the camera dollies forward. A built-in collision "
+                     "check can cap the actual motion, so larger values don't "
+                     "always push further.",
+            )
+            self.gui_demo_zoom_out_strength = self.server.gui.add_slider(
+                "zoom-out strength",
+                min=0.0, max=3.0, step=0.1,
+                initial_value=float(d.get("zoom_out_strength", 1.5)),
+                hint="How far the camera dollies backward before the clip "
+                     "reverses into the zoom-in.",
             )
 
         with self.server.gui.add_folder("Settings (synced with Train)"):
@@ -2895,6 +2949,17 @@ class ViewerApp:
             mode=str(self.gui_init_mode.value),
         )
 
+    def _collect_demo_gen_opts(self) -> dict:
+        """Lyra2 zoom/resolution options forwarded to the generation server
+        (maps onto demo_server's /generate form fields)."""
+        return dict(
+            resolution=str(self.gui_demo_resolution.value),
+            num_frames_zoom_in=int(self.gui_demo_zoom_in_frames.value),
+            num_frames_zoom_out=int(self.gui_demo_zoom_out_frames.value),
+            zoom_in_strength=float(self.gui_demo_zoom_in_strength.value),
+            zoom_out_strength=float(self.gui_demo_zoom_out_strength.value),
+        )
+
     def _on_demo_request_click(self) -> None:
         """Fetch one video from the generation server and turn it into splats:
         prepare_and_init for the very first video, append_video (incremental)
@@ -2906,10 +2971,8 @@ class ViewerApp:
         if self._demo_image is None:
             self.gui_demo_status.content = "**demo:** upload an image first"
             return
+        # Prompt is optional — the server falls back to a generic caption.
         prompt = str(self.gui_demo_prompt.value).strip()
-        if not prompt:
-            self.gui_demo_status.content = "**demo:** enter a prompt first"
-            return
         # Serialize against any other trainer-mutating handler (a Reset from
         # either tab, Initialize, Append…) so they can't free/replace the
         # param tensors while we're mid append/init on this pool thread.
@@ -2932,6 +2995,7 @@ class ViewerApp:
             self.gui_demo_status.content = "**demo:** requesting video (~30 s)…"
             video_path = str(self._request_video_cb(
                 image_bytes, name, prompt, str(self.gui_demo_server.value),
+                self._collect_demo_gen_opts(),
             ))
 
             if not had_splats:

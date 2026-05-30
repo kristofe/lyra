@@ -65,18 +65,42 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument(
-        "--demo-server-url", type=str, default="http://localhost:8000/generate",
-        help="Default endpoint for the Demo tab's video-generation server. "
-             "Editable live in the GUI. POST image+prompt → video (~30 s).",
+        "--demo-server-url", type=str, default="http://localhost:8080/generate",
+        help="Default endpoint for the Demo tab's video-generation server "
+             "(Lyra2 demo_server, default port 8080). Editable live in the "
+             "GUI. POST image+prompt → mp4.",
     )
     p.add_argument(
         "--demo-prompt", type=str, default="",
-        help="Default text populated into the Demo→prompt field at boot.",
+        help="Default text populated into the Demo→prompt field at boot. "
+             "Optional — the server uses a generic caption when empty.",
     )
     p.add_argument(
         "--demo-max-frames", type=int, default=None,
         help="Default for the Demo→max_frames field. Falls back to "
              "--max-frames when unset.",
+    )
+    # Lyra2 zoom-generation defaults (Demo→'Lyra2 camera (zoom)' folder).
+    p.add_argument(
+        "--demo-resolution", type=str, default="480p",
+        help="Default Demo→resolution: a preset label (480p/360p/320p/240p) "
+             "or a raw 'H,W'. 480p is the model's native size.",
+    )
+    p.add_argument(
+        "--demo-zoom-in-frames", type=int, default=81,
+        help="Default Demo→zoom-in frames. Must be 1 + 80k (81, 161, 241, …).",
+    )
+    p.add_argument(
+        "--demo-zoom-out-frames", type=int, default=241,
+        help="Default Demo→zoom-out frames. Must be 1 + 80k.",
+    )
+    p.add_argument(
+        "--demo-zoom-in-strength", type=float, default=0.5,
+        help="Default Demo→zoom-in strength (camera push-in distance).",
+    )
+    p.add_argument(
+        "--demo-zoom-out-strength", type=float, default=1.5,
+        help="Default Demo→zoom-out strength (camera pull-back distance).",
     )
     p.add_argument(
         "--inpaint-preload", type=int, default=0,
@@ -264,10 +288,11 @@ def main() -> None:
     _demo_counter = {"n": 0}
 
     def request_demo_video(image_bytes: bytes, image_name: str, prompt: str,
-                           server_url: str) -> Path:
+                           server_url: str, gen_opts: dict | None = None) -> Path:
         import video_api
         video_bytes = video_api.request_video(
             server_url or args.demo_server_url, image_bytes, image_name, prompt,
+            gen_opts=gen_opts,
         )
         demo_dir.mkdir(parents=True, exist_ok=True)
         _demo_counter["n"] += 1
@@ -304,6 +329,11 @@ def main() -> None:
             max_frames=(args.demo_max_frames
                         if args.demo_max_frames is not None
                         else args.max_frames),
+            resolution=args.demo_resolution,
+            num_frames_zoom_in=args.demo_zoom_in_frames,
+            num_frames_zoom_out=args.demo_zoom_out_frames,
+            zoom_in_strength=args.demo_zoom_in_strength,
+            zoom_out_strength=args.demo_zoom_out_strength,
         ),
         default_init_args=dict(
             video=str(args.video),

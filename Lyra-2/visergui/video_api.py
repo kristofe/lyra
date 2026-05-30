@@ -2,30 +2,70 @@
 
 The Demo tab (viewer.py) sends an image + prompt to a generation server and
 gets a video back. The server call is *synchronous*: one HTTP request blocks
-for ~30 s and the response carries the video.
+for the duration of generation and the response carries the video.
 
-The exact request/response contract for the real server is not finalized, so
-this module isolates it in one small function. When the real spec lands, edit
-`request_video` only — the GUI and orchestration in viewer.py / train_and_view.py
-don't change.
+This targets the Lyra2 ``demo_server`` (lyra_2/_src/inference/demo_server.py):
+    POST <server_url>/generate   multipart/form-data
+        image                 = (filename, raw image bytes)
+        prompt                = <text>            # optional, generic fallback
+        resolution            = "480p" | "H,W"    # preset label or raw H,W
+        num_frames_zoom_in    = 1 + 80k           # 81, 161, 241, ...
+        num_frames_zoom_out   = 1 + 80k
+        zoom_in_strength      = float
+        zoom_out_strength     = float
+    → response Content-Type video/mp4 : body IS the mp4.
+    GET  <server_url>/resolutions → {"default": "480p", "presets": [...]}
 
-ASSUMED CONTRACT (edit here if the real server differs):
-  POST <server_url>
-    multipart/form-data:
-      image  = (filename, raw image bytes)   # the conditioning frame
-      prompt = <text>                         # the generation prompt
-  Response (either form is accepted):
-    - Content-Type video/* or application/octet-stream → body IS the video.
-    - Content-Type application/json → {"video_url": "..."} (or "url"/"video"):
-      a follow-up GET fetches the actual video bytes.
+The exact contract lives in this one module; the GUI / orchestration in
+viewer.py / train_and_view.py call through ``request_video`` /
+``fetch_resolutions`` and don't depend on the wire format.
 """
 
 from __future__ import annotations
+
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 # Response JSON keys checked, in order, for a video download URL.
 _URL_KEYS = ("video_url", "url", "video", "output_url", "result_url")
+
+# Static fallback presets (mirror demo_server.RESOLUTION_PRESETS) used when the
+# server can't be reached at GUI-build time. Labels map to "H,W" the server
+# also accepts directly.
+DEFAULT_RESOLUTION_PRESETS = ("480p", "360p", "320p", "240p")
+DEFAULT_RESOLUTION = "480p"
+
+
+def _sibling_url(server_url: str, path: str) -> str:
+    """Return ``server_url`` with its final path segment replaced by ``path``.
+
+    e.g. ('http://h:8080/generate', 'resolutions') -> 'http://h:8080/resolutions'.
+    """
+    parts = urlsplit(server_url)
+    base = parts.path.rsplit("/", 1)[0]
+    new_path = f"{base}/{path}".replace("//", "/")
+    return urlunsplit((parts.scheme, parts.netloc, new_path, "", ""))
+
+
+def fetch_resolutions(server_url: str, timeout: float = 5.0):
+    """GET <server>/resolutions → (preset_labels tuple, default_label).
+
+    Falls back to the static presets if the server is unreachable or returns an
+    unexpected payload, so the GUI can always build a dropdown.
+    """
+    try:
+        resp = requests.get(_sibling_url(server_url, "resolutions"), timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        presets = payload.get("presets") or []
+        labels = tuple(p["label"] for p in presets if "label" in p)
+        default = payload.get("default") or (labels[0] if labels else DEFAULT_RESOLUTION)
+        if labels:
+            return labels, default
+    except Exception:
+        pass
+    return DEFAULT_RESOLUTION_PRESETS, DEFAULT_RESOLUTION
 
 
 def request_video(
@@ -33,25 +73,42 @@ def request_video(
     image_bytes: bytes,
     image_name: str,
     prompt: str,
-    timeout: float = 180.0,
+    gen_opts: dict | None = None,
+    timeout: float = 600.0,
 ) -> bytes:
-    """POST image+prompt to the generation server and return raw video bytes.
+    """POST image+prompt(+zoom/resolution opts) and return raw video bytes.
 
-    Blocks until the server responds (the generation itself takes ~30 s, hence
-    the generous default timeout). Raises on a non-2xx status, an unexpected
-    content type, or an empty body so the caller can surface the failure.
+    Blocks until the server responds (generation can take from ~30 s with DMD
+    up to several minutes at full resolution, hence the generous default
+    timeout). ``gen_opts`` carries the optional Lyra2 zoom controls
+    (``resolution``, ``num_frames_zoom_in``/``out``, ``zoom_in``/``out_strength``);
+    only keys with a non-None value are sent. Raises on a non-2xx status, an
+    unexpected content type, or an empty body so the caller can surface it.
     """
     if not server_url:
         raise ValueError("server URL is empty")
     if not image_bytes:
         raise ValueError("no image bytes to send")
-    if not prompt or not prompt.strip():
-        raise ValueError("prompt is empty")
+
+    # prompt is optional on the server (generic fallback); only send if given.
+    data: dict[str, object] = {}
+    if prompt and prompt.strip():
+        data["prompt"] = prompt
+    for key in (
+        "resolution",
+        "num_frames_zoom_in",
+        "num_frames_zoom_out",
+        "zoom_in_strength",
+        "zoom_out_strength",
+    ):
+        val = (gen_opts or {}).get(key)
+        if val is not None and val != "":
+            data[key] = val
 
     resp = requests.post(
         server_url,
         files={"image": (image_name or "image.png", image_bytes)},
-        data={"prompt": prompt},
+        data=data,
         timeout=timeout,
     )
     resp.raise_for_status()
