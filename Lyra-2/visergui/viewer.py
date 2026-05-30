@@ -771,6 +771,7 @@ class ViewerApp:
         on_seed_dedup_mult_change: "Callable[[float], None] | None" = None,
         compute_voxel_overlap: "Callable[[float], dict] | None" = None,
         compute_coverage: "Callable[[str], dict] | None" = None,
+        inpaint_preload: bool = True,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -802,6 +803,7 @@ class ViewerApp:
         self._voxel_overlap_layer_name = "voxel_overlap"
         self._compute_coverage_cb = compute_coverage
         self._coverage_layer_name = "coverage_heatmap"
+        self._inpaint_preload = bool(inpaint_preload)
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -908,6 +910,7 @@ class ViewerApp:
                         server=self.server,
                         trainer_ref=self._trainer_ref,
                         viewer=self,
+                        preload=self._inpaint_preload,
                     )
                 except Exception as e:
                     import traceback
@@ -2001,7 +2004,7 @@ class ViewerApp:
             self.gui_fps_readout = self.server.gui.add_markdown("**fps:** —")
             self.gui_render_ms_readout = self.server.gui.add_markdown("**render ms:** —")
             self.gui_adaptive_res = self.server.gui.add_checkbox(
-                "adaptive_res", initial_value=True,
+                "adaptive_res", initial_value=False,
                 hint="Render at lower resolution while the camera is moving.",
             )
             self.gui_moving_scale = self.server.gui.add_slider(

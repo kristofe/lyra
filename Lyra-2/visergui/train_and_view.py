@@ -64,6 +64,16 @@ def main() -> None:
                    help="Default for the Setup→mode dropdown.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument(
+        "--inpaint-preload", type=int, default=1,
+        help="1 (default) = warm up the inpainter's diffusers pipeline in "
+             "a daemon thread at boot so the first Inpaint click doesn't "
+             "block on the ~30-60 s `from_pretrained + .to('cuda')`. "
+             "Default model (FLUX-2-Klein 9B) is ~25 GB on GPU; pass 0 if "
+             "you're VRAM-constrained alongside training, or if you "
+             "don't plan to use the inpainter this session — first click "
+             "will then pay the load cost.",
+    )
     args = p.parse_args()
 
     scene = SceneState()
@@ -102,6 +112,17 @@ def main() -> None:
         # called after main() has finished setting up). On the empty-boot
         # path that's true: initializer fires from the GUI button.
         _republish_cams()
+        # Now that DA3 has loaded cleanly inside prepare_and_init, it's
+        # safe to start the inpainter preload. Doing this earlier put
+        # accelerate / from_pretrained into a state where DA3's later
+        # construction left params on meta and `.to(device)` blew up.
+        # start_preload() is idempotent so re-init won't double-spawn.
+        inp = getattr(app, "inpainter", None)
+        if inp is not None:
+            try:
+                inp.start_preload()
+            except Exception as e:
+                print(f"initializer: inpaint preload kick failed: {e}")
 
     def resetter() -> None:
         import numpy as _np
@@ -111,6 +132,15 @@ def main() -> None:
             c2w=_np.zeros((0, 4, 4)), K=_np.zeros((0, 3, 3)),
             images=None, H=1, W=1,
         )
+        # Clear the Inpaint tab's captured screenshot / mask / neighbors /
+        # result images so they don't lie about which scene they came
+        # from. Preserves the cached diffusers pipeline (preload survives).
+        inpainter = getattr(app, "inpainter", None)
+        if inpainter is not None:
+            try:
+                inpainter.reset()
+            except Exception as e:
+                print(f"resetter: inpainter.reset() failed: {e}")
 
     # Phase 5.1: palette for coloring training-camera frustums by epoch.
     # Wraps modulo so arbitrary epoch counts are supported. Epoch 0 keeps
@@ -233,6 +263,7 @@ def main() -> None:
         on_seed_dedup_mult_change=trainer.set_seed_dedup_multiplier,
         compute_voxel_overlap=compute_voxel_overlap,
         compute_coverage=compute_coverage,
+        inpaint_preload=bool(args.inpaint_preload),
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

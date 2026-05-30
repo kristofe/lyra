@@ -21,6 +21,7 @@ instantiates it once during boot:
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,11 +48,13 @@ class InpainterPanel:
         trainer_ref: "SplatTrainer | None" = None,
         viewer: "ViewerApp | None" = None,
         out_root: Path | None = None,
+        preload: bool = True,
     ) -> None:
         self.server = server
         self._trainer_ref = trainer_ref
         self._viewer = viewer
         self._out_root = Path(out_root) if out_root is not None else Path("inpaint_outputs")
+        self._preload = bool(preload)
 
         # Phase 1 state
         self._capture_counter = 0
@@ -72,11 +75,10 @@ class InpainterPanel:
             # ---- Phase 2a: mask + neighbors
             self.gui_mode = self.server.gui.add_dropdown(
                 "mode",
-                options=["disocclusion_only", "masked_inpaint", "outpaint"],
+                options=["disocclusion_only", "outpaint"],
                 initial_value="disocclusion_only",
                 hint=(
                     "disocclusion_only = mask from low-alpha pixels of splat render. "
-                    "masked_inpaint = union of low-alpha and user rectangle. "
                     "outpaint = pad the image + mask the padding."
                 ),
             )
@@ -92,10 +94,6 @@ class InpainterPanel:
                 "pad_frac (outpaint)", initial_value=0.25, min=0.05, max=0.5, step=0.05,
                 hint="Outpaint mode: pad each side by this fraction of image size.",
             )
-            self.gui_mask_x0 = self.server.gui.add_slider("mask x0", initial_value=0.30, min=0.0, max=1.0, step=0.01)
-            self.gui_mask_y0 = self.server.gui.add_slider("mask y0", initial_value=0.30, min=0.0, max=1.0, step=0.01)
-            self.gui_mask_x1 = self.server.gui.add_slider("mask x1", initial_value=0.70, min=0.0, max=1.0, step=0.01)
-            self.gui_mask_y1 = self.server.gui.add_slider("mask y1", initial_value=0.70, min=0.0, max=1.0, step=0.01)
             self.gui_neighbors_btn = self.server.gui.add_button("Find Neighbors + Build Mask")
             self.gui_mask_preview = self.server.gui.add_image(placeholder, label="mask preview")
             self.gui_neighbors_preview = self.server.gui.add_image(placeholder, label="neighbor frames")
@@ -116,7 +114,11 @@ class InpainterPanel:
                     "model with native reference-image conditioning, 9B params, ~25GB). "
                     "KV variant: black-forest-labs/FLUX.2-klein-9b-kv. "
                     "Alternatives: black-forest-labs/FLUX.1-Fill-dev (no refs), "
-                    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 (SDXL inpaint, no refs)."
+                    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 (SDXL inpaint, no refs). "
+                    "PRELOAD: at boot the default model loads in a daemon thread so the first "
+                    "Inpaint click is instant (~25GB GPU). Launch with "
+                    "`--inpaint-preload 0` to skip — the first click then blocks on the load. "
+                    "Switching model_id away from the preloaded one forces a fresh load on next click."
                 ),
             )
             self.gui_steps = self.server.gui.add_slider(
@@ -163,8 +165,28 @@ class InpainterPanel:
         self.last_inpaint: dict | None = None        # {'rgb','mask','K','c2w','H','W','path','meta'}
         self._kontext_pipeline = None                # lazy-loaded diffusers pipeline
         self._kontext_model_id = None                # which model_id the cached pipeline is for
+        # Lock around the pipeline cache: preload runs in a daemon thread
+        # and the user can still click Inpaint mid-load. The lock serialises
+        # them so we never double-load, and the second caller sees the
+        # already-cached pipeline once the first finishes.
+        self._pipeline_lock = threading.Lock()
         # Phase 3 state — provenance ledger keyed on splat index ranges added by each run.
         self.gaussian_provenance: list[dict] = []    # [{'backend':..., 'start':int, 'end':int}, ...]
+
+        # Inpaint pipeline preload is deferred — see `start_preload()`. We
+        # used to spawn it from here, but loading FLUX-Klein (diffusers /
+        # accelerate) before DA3 puts `from_pretrained` into the
+        # init_empty_weights pattern globally, which leaves subsequent
+        # DA3 params as meta tensors and breaks `.to(device)`. Waiting
+        # until after the first prepare_and_init lets DA3 load cleanly
+        # first, then FLUX preloads in the background while training runs.
+        self._preload_started = False
+        if not self._preload:
+            print(
+                "[inpainter] preload disabled (preload=False) — "
+                "first Inpaint click will block on model load.",
+                file=sys.stderr,
+            )
 
     # ----------------------------------------------------------- Phase 1
 
@@ -457,18 +479,6 @@ class InpainterPanel:
             mask = (ss["alpha"] < alpha_thresh).astype(np.uint8)  # (H, W)
 
             mode = self.gui_mode.value
-            if mode == "masked_inpaint":
-                # Union with user rectangle (in normalized [0,1] image coords).
-                x0 = max(0.0, min(1.0, float(self.gui_mask_x0.value)))
-                y0 = max(0.0, min(1.0, float(self.gui_mask_y0.value)))
-                x1 = max(0.0, min(1.0, float(self.gui_mask_x1.value)))
-                y1 = max(0.0, min(1.0, float(self.gui_mask_y1.value)))
-                if x1 <= x0 or y1 <= y0:
-                    self.gui_status.content = "_invalid mask rectangle_"
-                    return
-                ix0, ix1 = int(round(x0 * W)), int(round(x1 * W))
-                iy0, iy1 = int(round(y0 * H)), int(round(y1 * H))
-                mask[iy0:iy1, ix0:ix1] = 1
             # For 'disocclusion_only' we use the alpha mask as-is.
             # For 'outpaint' we keep mask as the alpha disocclusion of the
             # original image; the padding is applied at inpaint time (Phase 2b).
@@ -957,28 +967,152 @@ class InpainterPanel:
 
     def _get_pipeline(self, model_id: str):
         """Lazy-load + cache the diffusers pipeline. Picks the right class
-        from the model id (case-insensitive) and the right dtype per family."""
-        if self._kontext_pipeline is not None and self._kontext_model_id == model_id:
-            return self._kontext_pipeline
-        import diffusers
-        mid = model_id.lower()
-        # Choose pipeline class:
-        if "klein" in mid:
-            cls = diffusers.Flux2KleinInpaintPipeline   # inpaint + image_reference
-        elif "kontext" in mid:
-            cls = diffusers.FluxKontextInpaintPipeline  # whole-image edit + mask
-        elif "flux" in mid and "fill" in mid:
-            cls = diffusers.FluxFillPipeline
-        elif "flux" in mid:
-            cls = diffusers.FluxInpaintPipeline         # schnell + dev
-        else:
-            cls = diffusers.AutoPipelineForInpainting
-        # FLUX prefers bf16; SD/SDXL run fine in fp16.
-        dtype = torch.bfloat16 if "flux" in mid else torch.float16
-        pipeline = cls.from_pretrained(model_id, torch_dtype=dtype).to("cuda")
-        self._kontext_pipeline = pipeline
-        self._kontext_model_id = model_id
-        return pipeline
+        from the model id (case-insensitive) and the right dtype per family.
+        Thread-safe: the cache + load are guarded by `_pipeline_lock` so
+        the boot-time preload and an early user click can't double-load."""
+        with self._pipeline_lock:
+            if self._kontext_pipeline is not None and self._kontext_model_id == model_id:
+                return self._kontext_pipeline
+            import diffusers
+            mid = model_id.lower()
+            # Choose pipeline class:
+            if "klein" in mid:
+                cls = diffusers.Flux2KleinInpaintPipeline   # inpaint + image_reference
+            elif "kontext" in mid:
+                cls = diffusers.FluxKontextInpaintPipeline  # whole-image edit + mask
+            elif "flux" in mid and "fill" in mid:
+                cls = diffusers.FluxFillPipeline
+            elif "flux" in mid:
+                cls = diffusers.FluxInpaintPipeline         # schnell + dev
+            else:
+                cls = diffusers.AutoPipelineForInpainting
+            # FLUX prefers bf16; SD/SDXL run fine in fp16.
+            dtype = torch.bfloat16 if "flux" in mid else torch.float16
+            pipeline = cls.from_pretrained(model_id, torch_dtype=dtype).to("cuda")
+            self._kontext_pipeline = pipeline
+            self._kontext_model_id = model_id
+            return pipeline
+
+    def reset(self) -> None:
+        """Clear all captured / generated images + status lines + on-disk
+        artifacts so the Inpaint tab matches the freshly-booted state.
+        Called from `train_and_view.resetter()` when the user clicks
+        Reset on the Setup panel — keeping stale captures around would
+        lie about which scene the inpaint references belong to.
+
+        Does NOT touch the cached diffusers pipeline (`_kontext_pipeline`)
+        — that's session-scoped and reloading would defeat the preload.
+        The provenance ledger is also cleared since the splats those
+        entries point to no longer exist after trainer.reset()."""
+        placeholder = np.zeros((64, 64, 3), dtype=np.uint8)
+        # Image fields
+        for h in (
+            getattr(self, "gui_screenshot", None),
+            getattr(self, "gui_mask_preview", None),
+            getattr(self, "gui_neighbors_preview", None),
+            getattr(self, "gui_inpaint_preview", None),
+        ):
+            if h is not None:
+                try:
+                    h.image = placeholder
+                except Exception:
+                    pass
+        # Status lines back to boot defaults
+        for h, msg in (
+            (getattr(self, "gui_status", None), "_no capture yet_"),
+            (getattr(self, "gui_instainpaint_status", None),
+                "_no instainpaint run yet_"),
+            (getattr(self, "gui_add_frame_status", None),
+                "_no frame appended_"),
+        ):
+            if h is not None:
+                try:
+                    h.content = msg
+                except Exception:
+                    pass
+        # Captured / generated state
+        self.last_screenshot = None
+        self.last_neighbors = None
+        self.last_inpaint = None
+        self.gaussian_provenance = []
+        self._capture_counter = 0
+
+        # On-disk artifacts written by capture + inpaint runs. We only
+        # delete files matching our own glob patterns so user-placed
+        # files in the same directory survive. Captured + masked +
+        # generated images + the debug pipe intermediates + per-run
+        # JSON metadata sidecars.
+        try:
+            out_dir = self._out_dir()
+            if out_dir.is_dir():
+                patterns = (
+                    "screenshot_*.png",
+                    "inpaint_*.png",
+                    "inpaint_*.mask.png",
+                    "inpaint_*.meta.json",
+                    "_dbg_pipe_*.png",
+                )
+                removed = 0
+                for pat in patterns:
+                    for p in out_dir.glob(pat):
+                        try:
+                            p.unlink()
+                            removed += 1
+                        except Exception as e:
+                            print(f"[inpainter.reset] unlink {p} failed: {e}",
+                                  file=sys.stderr)
+                print(f"[inpainter.reset] removed {removed} on-disk "
+                      f"artifact(s) from {out_dir}",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[inpainter.reset] disk cleanup skipped: {e}",
+                  file=sys.stderr)
+
+    def start_preload(self) -> None:
+        """Public hook to kick off the inpainter pipeline preload.
+        Idempotent — only spawns the daemon thread on the first call (per
+        session). No-op when `preload=False` was passed at construction.
+
+        Why deferred: loading FLUX-Klein via diffusers before DA3 leaves
+        accelerate's `init_empty_weights` global state active for the next
+        `from_pretrained`; DA3 then constructs with meta params that fail
+        the subsequent `.to(device)` call. Letting DA3 load first
+        (inside the first `trainer.prepare_and_init`) keeps DA3 well-
+        formed. Call this from the host after Initialize completes."""
+        if not self._preload:
+            return
+        if self._preload_started:
+            return
+        self._preload_started = True
+        try:
+            self._spawn_preload(str(self.gui_model_id.value))
+        except Exception as e:
+            print(f"[inpainter] preload spawn skipped: {e}", file=sys.stderr)
+            self._preload_started = False  # let caller retry on next init
+
+    def _spawn_preload(self, model_id: str) -> None:
+        """Run `_get_pipeline(model_id)` in a daemon thread so the user's
+        first click on Inpaint doesn't block on the ~30-60 s model load.
+        If the user changes `gui_model_id` between boot and the first
+        click, the click pays for the new model — preload only warms the
+        default. Idempotent: if the lock-protected cache already matches,
+        the worker returns immediately."""
+        def _worker() -> None:
+            try:
+                t0 = time.time()
+                print(f"[inpainter] preloading {model_id!r} on a background thread…",
+                      file=sys.stderr, flush=True)
+                self._get_pipeline(model_id)
+                dt = time.time() - t0
+                print(f"[inpainter] preload of {model_id!r} done in {dt:.1f}s",
+                      file=sys.stderr, flush=True)
+            except Exception as e:
+                import traceback
+                print(f"[inpainter] preload failed: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+                traceback.print_exc()
+        t = threading.Thread(target=_worker, daemon=True, name="inpainter-preload")
+        t.start()
 
     # ------------------------------------------------------------ helpers
 
