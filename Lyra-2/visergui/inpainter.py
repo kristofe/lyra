@@ -115,11 +115,21 @@ class InpainterPanel:
                     "KV variant: black-forest-labs/FLUX.2-klein-9b-kv. "
                     "Alternatives: black-forest-labs/FLUX.1-Fill-dev (no refs), "
                     "diffusers/stable-diffusion-xl-1.0-inpainting-0.1 (SDXL inpaint, no refs). "
-                    "PRELOAD: at boot the default model loads in a daemon thread so the first "
-                    "Inpaint click is instant (~25GB GPU). Launch with "
-                    "`--inpaint-preload 0` to skip — the first click then blocks on the load. "
-                    "Switching model_id away from the preloaded one forces a fresh load on next click."
+                    "The model is NOT auto-loaded (it's ~25GB and OOMs alongside training). "
+                    "Click 'Load model' to warm it once you've initialized a scene, or just "
+                    "click Inpaint and the load happens lazily on first use."
                 ),
+            )
+            self.gui_load_model_btn = self.server.gui.add_button(
+                "Load model",
+                hint="Load the diffusers pipeline for the model_id above into "
+                     "GPU memory now (~25GB, ~30-60 s), so the first Inpaint "
+                     "click is instant. Initialize a scene first — FLUX must "
+                     "load AFTER DA3 or DA3's weight-init breaks. Off by "
+                     "default; this is the manual replacement for boot preload.",
+            )
+            self.gui_model_status = self.server.gui.add_markdown(
+                "**model:** not loaded"
             )
             self.gui_steps = self.server.gui.add_slider(
                 "steps", initial_value=20, min=1, max=50, step=1,
@@ -156,6 +166,7 @@ class InpainterPanel:
 
         self.gui_capture_btn.on_click(lambda _ev: self._on_capture_click())
         self.gui_neighbors_btn.on_click(lambda _ev: self._on_neighbors_click())
+        self.gui_load_model_btn.on_click(lambda _ev: self._on_load_model_click())
         self.gui_inpaint_btn.on_click(lambda _ev: self._on_inpaint_click())
         self.gui_instainpaint_btn.on_click(lambda _ev: self._on_instainpaint_click())
         self.gui_add_frame_btn.on_click(lambda _ev: self._on_add_frame_click())
@@ -181,10 +192,12 @@ class InpainterPanel:
         # until after the first prepare_and_init lets DA3 load cleanly
         # first, then FLUX preloads in the background while training runs.
         self._preload_started = False
+        self._model_loading = False  # guards the manual 'Load model' button
         if not self._preload:
             print(
-                "[inpainter] preload disabled (preload=False) — "
-                "first Inpaint click will block on model load.",
+                "[inpainter] auto-preload disabled — click 'Load model' in the "
+                "Inpaint tab to warm FLUX, or the first Inpaint click loads it "
+                "lazily.",
                 file=sys.stderr,
             )
 
@@ -1067,6 +1080,55 @@ class InpainterPanel:
         except Exception as e:
             print(f"[inpainter.reset] disk cleanup skipped: {e}",
                   file=sys.stderr)
+
+    def _on_load_model_click(self) -> None:
+        """Manual 'Load model' button: warm the diffusers pipeline on demand.
+
+        Unlike `start_preload`, this is NOT gated on the `_preload` flag, so it
+        works when auto-preload is off (the default — FLUX is ~25GB and OOMs
+        alongside training, so we no longer load it at boot). Loads in a daemon
+        thread so the UI stays responsive, and mirrors progress into the status
+        markdown. Requires DA3 to have loaded first (initialize a scene),
+        because loading FLUX before DA3 leaves accelerate's init_empty_weights
+        active and breaks DA3's `.to(device)` — see `start_preload`."""
+        model_id = str(self.gui_model_id.value)
+        if not getattr(self._trainer_ref, "_initialized", False):
+            self.gui_model_status.content = (
+                "**model:** initialize a scene first — FLUX must load after "
+                "DA3 or DA3's weight-init breaks"
+            )
+            return
+        with self._pipeline_lock:
+            already = (self._kontext_pipeline is not None
+                       and self._kontext_model_id == model_id)
+        if already:
+            self.gui_model_status.content = f"**model:** already loaded ({model_id})"
+            return
+        if self._model_loading:
+            self.gui_model_status.content = "**model:** load already in progress…"
+            return
+        self._model_loading = True
+        self.gui_model_status.content = (
+            f"**model:** loading {model_id} (~25GB, ~30-60 s)…"
+        )
+
+        def _worker() -> None:
+            try:
+                t0 = time.time()
+                self._get_pipeline(model_id)  # lock-guarded cache + load
+                self.gui_model_status.content = (
+                    f"**model:** loaded ({model_id}) in {time.time() - t0:.0f}s"
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.gui_model_status.content = (
+                    f"**model:** load failed — {type(e).__name__}: {e}"
+                )
+            finally:
+                self._model_loading = False
+
+        threading.Thread(target=_worker, daemon=True, name="inpainter-load").start()
 
     def start_preload(self) -> None:
         """Public hook to kick off the inpainter pipeline preload.

@@ -65,14 +65,28 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument(
-        "--inpaint-preload", type=int, default=1,
-        help="1 (default) = warm up the inpainter's diffusers pipeline in "
-             "a daemon thread at boot so the first Inpaint click doesn't "
-             "block on the ~30-60 s `from_pretrained + .to('cuda')`. "
-             "Default model (FLUX-2-Klein 9B) is ~25 GB on GPU; pass 0 if "
-             "you're VRAM-constrained alongside training, or if you "
-             "don't plan to use the inpainter this session — first click "
-             "will then pay the load cost.",
+        "--demo-server-url", type=str, default="http://localhost:8000/generate",
+        help="Default endpoint for the Demo tab's video-generation server. "
+             "Editable live in the GUI. POST image+prompt → video (~30 s).",
+    )
+    p.add_argument(
+        "--demo-prompt", type=str, default="",
+        help="Default text populated into the Demo→prompt field at boot.",
+    )
+    p.add_argument(
+        "--demo-max-frames", type=int, default=None,
+        help="Default for the Demo→max_frames field. Falls back to "
+             "--max-frames when unset.",
+    )
+    p.add_argument(
+        "--inpaint-preload", type=int, default=0,
+        help="0 (default) = do NOT auto-load the inpainter's diffusers "
+             "pipeline; use the Inpaint tab's 'Load model' button (or the "
+             "first Inpaint click) to load it on demand. The default model "
+             "(FLUX-2-Klein 9B) is ~25 GB on GPU and OOMs alongside "
+             "training, which is why autoload is off. Pass 1 to restore the "
+             "old behavior: warm it in a daemon thread after the first "
+             "Initialize (DA3 must load first).",
     )
     args = p.parse_args()
 
@@ -243,6 +257,25 @@ def main() -> None:
         _republish_cams()
         return info
 
+    # Demo tab: synchronous call to the generation server, then write the
+    # returned video to disk and hand the path back to the GUI, which runs
+    # the same init/append pipeline as the Train tab.
+    demo_dir = args.out_dir / "demo"
+    _demo_counter = {"n": 0}
+
+    def request_demo_video(image_bytes: bytes, image_name: str, prompt: str,
+                           server_url: str) -> Path:
+        import video_api
+        video_bytes = video_api.request_video(
+            server_url or args.demo_server_url, image_bytes, image_name, prompt,
+        )
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        _demo_counter["n"] += 1
+        out_path = demo_dir / f"clip_{_demo_counter['n']:04d}.mp4"
+        out_path.write_bytes(video_bytes)
+        print(f"demo: server returned {len(video_bytes):,} bytes → {out_path}")
+        return out_path
+
     app = ViewerApp(
         ply_path=None,
         host=args.host,
@@ -264,6 +297,14 @@ def main() -> None:
         compute_voxel_overlap=compute_voxel_overlap,
         compute_coverage=compute_coverage,
         inpaint_preload=bool(args.inpaint_preload),
+        request_video=request_demo_video,
+        demo_defaults=dict(
+            server_url=args.demo_server_url,
+            prompt=args.demo_prompt,
+            max_frames=(args.demo_max_frames
+                        if args.demo_max_frames is not None
+                        else args.max_frames),
+        ),
         default_init_args=dict(
             video=str(args.video),
             max_frames=args.max_frames,

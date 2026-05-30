@@ -772,6 +772,8 @@ class ViewerApp:
         compute_voxel_overlap: "Callable[[float], dict] | None" = None,
         compute_coverage: "Callable[[str], dict] | None" = None,
         inpaint_preload: bool = True,
+        request_video: "Callable[[bytes, str, str, str], object] | None" = None,
+        demo_defaults: dict | None = None,
     ) -> None:
         # Install the stdout/stderr mirror before anything in __init__ prints,
         # so the GUI log captures the full boot sequence.
@@ -804,6 +806,25 @@ class ViewerApp:
         self._compute_coverage_cb = compute_coverage
         self._coverage_layer_name = "coverage_heatmap"
         self._inpaint_preload = bool(inpaint_preload)
+        # Demo tab: synchronous video-generation callback + boot defaults.
+        self._request_video_cb = request_video
+        self._demo_defaults = demo_defaults or {}
+        self._demo_image: "tuple[str, bytes] | None" = None
+        self._demo_count = 0
+        # The first fetched clip — the one that SEEDED the scene. Re-initialize
+        # re-runs init on this video so the original cameras come back. Using
+        # the most-recently-appended clip instead (the old bug) re-preprocessed
+        # only that clip and dropped the first video's cameras. append_video
+        # nulls the trainer's _last_video, so this re-init re-preprocesses the
+        # seed video cleanly (incremental appends are discarded — the designed
+        # clean re-init, see SplatTrainer.append_video / reset docstrings).
+        self._demo_init_video: "str | None" = None
+        # Serializes the long, structure-mutating trainer handlers (init,
+        # reset, append, prune, checkpoint, demo request/reset). viser runs
+        # GUI callbacks on a thread pool and `disabled` is only a UI hint, so
+        # without this lock a Reset from either tab could free the param
+        # tensors while an append/init is mid-flight on another thread.
+        self._trainer_op_lock = threading.Lock()
 
         if ply_path is not None:
             print(f"loading splat .ply {ply_path} on {device_str}...")
@@ -901,6 +922,12 @@ class ViewerApp:
                 if self._initializer is not None:
                     self._build_init_panel()
                 self._build_training_gui(with_folder=False)
+            # Demo tab is built AFTER Train so the gui_init_* handles already
+            # exist and can be two-way linked to the Demo duplicates. It also
+            # drives the initializer for the first video, so it needs both.
+            if self._request_video_cb is not None and self._initializer is not None:
+                with tabs.add_tab("Demo"):
+                    self._build_demo_panel()
             with tabs.add_tab("Mesh"):
                 self._build_mesh_panel()
             with tabs.add_tab("Inpaint"):
@@ -1245,6 +1272,9 @@ class ViewerApp:
         if self._save_checkpoint_cb is None:
             self._set_inc_status("**incremental:** save callback missing")
             return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self._set_inc_status("**incremental:** busy — another operation is running")
+            return
         try:
             self.gui_inc_save_btn.disabled = True
             self._pause_training_quietly()
@@ -1259,10 +1289,14 @@ class ViewerApp:
             self._set_inc_status(f"**incremental:** save error — {type(e).__name__}: {e}")
         finally:
             self.gui_inc_save_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _on_load_checkpoint_click(self) -> None:
         if self._load_checkpoint_cb is None:
             self._set_inc_status("**incremental:** load callback missing")
+            return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self._set_inc_status("**incremental:** busy — another operation is running")
             return
         try:
             self.gui_inc_load_btn.disabled = True
@@ -1284,6 +1318,7 @@ class ViewerApp:
             self._set_inc_status(f"**incremental:** load error — {type(e).__name__}: {e}")
         finally:
             self.gui_inc_load_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _format_append_status(self, action: str, info: dict) -> str:
         parts = [
@@ -1304,6 +1339,9 @@ class ViewerApp:
         if self._append_video_cb is None:
             self._set_inc_status("**incremental:** append-video callback missing")
             return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self._set_inc_status("**incremental:** busy — another operation is running")
+            return
         try:
             self.gui_inc_video_btn.disabled = True
             self._pause_training_quietly()
@@ -1319,6 +1357,7 @@ class ViewerApp:
             self._set_inc_status(f"**incremental:** append-video error — {type(e).__name__}: {e}")
         finally:
             self.gui_inc_video_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _on_sampling_change(self) -> None:
         """Phase 3: push the sampling mode + new-frame weight + horizon to
@@ -1567,6 +1606,9 @@ class ViewerApp:
         if self._append_frames_cb is None:
             self._set_inc_status("**incremental:** append-frames callback missing")
             return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self._set_inc_status("**incremental:** busy — another operation is running")
+            return
         try:
             self.gui_inc_frames_btn.disabled = True
             self._pause_training_quietly()
@@ -1581,6 +1623,7 @@ class ViewerApp:
             self._set_inc_status(f"**incremental:** append-frames error — {type(e).__name__}: {e}")
         finally:
             self.gui_inc_frames_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _build_mesh_panel(self) -> None:
         """Mesh generation controls (Phase 4)."""
@@ -2624,11 +2667,419 @@ class ViewerApp:
             return
         ctl.pause()
 
+    # ---- Demo tab ----------------------------------------------------- #
+
+    def _snap_home_to_scene(self) -> None:
+        """Recompute the home pose from the current splats and push it to
+        every connected client so 'reset camera' / the orbit up-axis track
+        the new bbox. No-op when the scene is empty. Shared by Init and Demo
+        so re-init from either path reorients identically."""
+        if self.scene.means is None:
+            return
+        means_np = self.scene.means.detach().cpu().numpy()
+        self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
+        for client in self.server.get_clients().values():
+            try:
+                client.camera.up_direction = self.home_up
+                client.camera.position = self.home_position
+                client.camera.look_at = self.home_look_at
+            except Exception:
+                pass
+
+    def _link_widgets(self, a, b) -> None:
+        """Two-way bind two viser input handles so editing either updates the
+        other. Setting a handle's `.value` runs the partner's on_update
+        callbacks synchronously on the same thread, so without a guard the
+        echo would recurse; we kill it with a re-entrancy flag. The flag is
+        *per pair* (closed over here), not a shared instance attribute —
+        viser dispatches callbacks on a 32-worker thread pool, so a single
+        shared flag would let a concurrent edit of a different pair see the
+        flag set and silently drop its sync. Any *other* callbacks attached
+        to the partner (e.g. the Train tab's live `_on_scale_mult_change` /
+        `_on_seed_dedup_mult_change`) still fire, so the demo duplicates get
+        those side effects for free without re-wiring them here."""
+        if a is None or b is None:
+            return
+        syncing = {"v": False}  # per-pair guard, isolated from other pairs
+
+        def _make(src, dst):
+            def _cb(_ev):
+                if syncing["v"]:
+                    return
+                syncing["v"] = True
+                try:
+                    dst.value = src.value
+                except Exception:
+                    pass
+                finally:
+                    syncing["v"] = False
+            return _cb
+
+        a.on_update(_make(a, b))
+        b.on_update(_make(b, a))
+
+    def _build_demo_panel(self) -> None:
+        """Incremental-first capture: upload an image + prompt, hit Request
+        video, and the generation server's clip is auto-run through the same
+        pose+init pipeline (first video) or an incremental append (every video
+        after). Settings duplicate the Train tab's and stay two-way synced.
+        Built after the Train tab so the gui_init_* handles exist to link."""
+        d = self._demo_defaults
+        with self.server.gui.add_folder("Generate"):
+            self.gui_demo_server = self.server.gui.add_text(
+                "server URL",
+                initial_value=str(d.get("server_url", "")),
+                hint="POST endpoint of the video-generation server. The image "
+                     "+ prompt go up as multipart/form-data; the response "
+                     "carries the video (~30 s). Live — read on each request.",
+            )
+            self.gui_demo_prompt = self.server.gui.add_text(
+                "prompt",
+                initial_value=str(d.get("prompt", "")),
+                hint="Text prompt sent alongside the image.",
+            )
+            self.gui_demo_image_btn = self.server.gui.add_upload_button(
+                "image", mime_type="image/*",
+                hint="Conditioning frame. Uploaded from your browser and "
+                     "forwarded to the server with the prompt.",
+            )
+            self.gui_demo_image_status = self.server.gui.add_markdown(
+                "**image:** none uploaded"
+            )
+            self.gui_demo_request_btn = self.server.gui.add_button(
+                "Request video",
+                hint="Send image + prompt, wait for the video, then auto-run "
+                     "pose + init (first video) or an incremental append "
+                     "(subsequent videos).",
+            )
+            self.gui_demo_status = self.server.gui.add_markdown(
+                "**demo:** upload an image + a prompt, then Request video"
+            )
+            self.gui_demo_count = self.server.gui.add_markdown(
+                "**videos processed:** 0"
+            )
+
+        with self.server.gui.add_folder("Settings (synced with Train)"):
+            # Initial values are pulled from the already-built Train widgets so
+            # the two start in sync; _link_widgets keeps them that way.
+            self.gui_demo_max_frames = self.server.gui.add_number(
+                "max_frames",
+                initial_value=int(d.get("max_frames", self.gui_init_max_frames.value)),
+                min=1, max=1000, step=1,
+            )
+            self.gui_demo_conf_q = self.server.gui.add_slider(
+                "confidence_quantile", min=0.0, max=1.0, step=0.01,
+                initial_value=float(self.gui_init_conf_q.value),
+            )
+            self.gui_demo_remove_sky = self.server.gui.add_checkbox(
+                "remove_sky", initial_value=bool(self.gui_init_remove_sky.value),
+            )
+            self.gui_demo_sh_max_deg = self.server.gui.add_number(
+                "sh_max_deg", initial_value=int(self.gui_init_sh_max_deg.value),
+                min=0, max=3, step=1,
+            )
+            self.gui_demo_lpips_weight = self.server.gui.add_slider(
+                "lpips_weight", min=0.0, max=1.0, step=0.01,
+                initial_value=float(self.gui_init_lpips_weight.value),
+            )
+            self.gui_demo_void_weight = self.server.gui.add_slider(
+                "void_weight", min=0.0, max=2.0, step=0.05,
+                initial_value=float(self.gui_init_void_weight.value),
+            )
+            self.gui_demo_scale_mult = self.server.gui.add_slider(
+                "max_scale_voxels", min=0.5, max=10.0, step=0.1,
+                initial_value=float(self.gui_init_scale_mult.value),
+            )
+            self.gui_demo_densify = self.server.gui.add_checkbox(
+                "densify", initial_value=bool(self.gui_init_densify.value),
+            )
+            self.gui_demo_mode = self.server.gui.add_dropdown(
+                "mode", options=("3dgs", "2dgs"),
+                initial_value=str(self.gui_init_mode.value),
+            )
+            # The seed-dedup slider lives in the Train tab's Incremental folder
+            # and only exists when incremental callbacks were wired.
+            self.gui_demo_dedup = None
+            if getattr(self, "gui_inc_dedup_multiplier", None) is not None:
+                self.gui_demo_dedup = self.server.gui.add_slider(
+                    "seed dedup radius (× init voxel)",
+                    min=1.0, max=6.0, step=0.5,
+                    initial_value=float(self.gui_inc_dedup_multiplier.value),
+                    hint="Dedup-check radius for new-video splats, in init-"
+                         "voxel units (same control as Train→Incremental).",
+                )
+
+        with self.server.gui.add_folder("Incremental"):
+            self.gui_demo_freeze = self.server.gui.add_checkbox(
+                "freeze old splats on new video",
+                initial_value=True,
+                hint="After appending a new video, freeze splats not visible "
+                     "to the new cameras (set freeze mode = new_frustums + "
+                     "recompute) so only the new region refines. Off = train "
+                     "every splat.",
+            )
+            self.gui_demo_autotrain = self.server.gui.add_checkbox(
+                "auto-train after each video",
+                initial_value=False,
+                hint="Off (default): a loaded video is processed into splats "
+                     "but training stays paused until you click Train. On: "
+                     "resume optimization automatically once a video is "
+                     "processed.",
+            )
+
+        with self.server.gui.add_folder("Training"):
+            self.gui_demo_train_btn = self.server.gui.add_button("Train")
+            self.gui_demo_pause_btn = self.server.gui.add_button("Pause")
+            self.gui_demo_reinit_btn = self.server.gui.add_button(
+                "Re-initialize",
+                hint="Erase the current splats and re-initialize from the "
+                     "first fetched video (the seed clip), so its cameras "
+                     "come back. Incremental appends are discarded — Request "
+                     "more videos to rebuild them. Useful after changing a "
+                     "slider to see its effect on a clean init. Does not fetch "
+                     "a new video and does not auto-train.",
+            )
+            self.gui_demo_reset_btn = self.server.gui.add_button("Reset")
+            self.gui_demo_train_status = self.server.gui.add_markdown(
+                "**status:** stopped"
+            )
+            self.gui_demo_step = self.server.gui.add_markdown("**step:** 0")
+            self.gui_demo_splat_count = self.server.gui.add_markdown(
+                f"**splats:** {int(self.scene.num_splats):,}"
+            )
+
+        # Action wiring.
+        self.gui_demo_image_btn.on_upload(lambda _ev: self._on_demo_image_upload())
+        self.gui_demo_request_btn.on_click(lambda _ev: self._on_demo_request_click())
+        self.gui_demo_train_btn.on_click(lambda _ev: self._on_resume_training())
+        self.gui_demo_pause_btn.on_click(lambda _ev: self._on_pause_training())
+        self.gui_demo_reinit_btn.on_click(lambda _ev: self._on_demo_reinit_click())
+        self.gui_demo_reset_btn.on_click(lambda _ev: self._on_demo_reset_click())
+
+        # Two-way sync each duplicate with its Train-tab twin.
+        self._link_widgets(self.gui_demo_max_frames, self.gui_init_max_frames)
+        self._link_widgets(self.gui_demo_conf_q, self.gui_init_conf_q)
+        self._link_widgets(self.gui_demo_remove_sky, self.gui_init_remove_sky)
+        self._link_widgets(self.gui_demo_sh_max_deg, self.gui_init_sh_max_deg)
+        self._link_widgets(self.gui_demo_lpips_weight, self.gui_init_lpips_weight)
+        self._link_widgets(self.gui_demo_void_weight, self.gui_init_void_weight)
+        self._link_widgets(self.gui_demo_scale_mult, self.gui_init_scale_mult)
+        self._link_widgets(self.gui_demo_densify, self.gui_init_densify)
+        self._link_widgets(self.gui_demo_mode, self.gui_init_mode)
+        if self.gui_demo_dedup is not None:
+            self._link_widgets(self.gui_demo_dedup, self.gui_inc_dedup_multiplier)
+
+    def _on_demo_image_upload(self) -> None:
+        f = self.gui_demo_image_btn.value
+        content = getattr(f, "content", None)
+        if not content:
+            return
+        self._demo_image = (getattr(f, "name", "image.png"), content)
+        self.gui_demo_image_status.content = (
+            f"**image:** {self._demo_image[0]} ({len(content) / 1024.0:,.0f} KB)"
+        )
+
+    def _collect_demo_init_opts(self, video_path: str) -> dict:
+        """Build the initializer opts dict from the (synced) Train-tab widgets.
+        Same keys/shape as _on_init_click so the existing initializer closure
+        handles it unchanged."""
+        return dict(
+            video=Path(video_path),
+            max_frames=int(self.gui_init_max_frames.value),
+            confidence_quantile=float(self.gui_init_conf_q.value),
+            remove_sky=bool(self.gui_init_remove_sky.value),
+            sh_max_deg=int(self.gui_init_sh_max_deg.value),
+            lpips_weight=float(self.gui_init_lpips_weight.value),
+            void_weight=float(self.gui_init_void_weight.value),
+            use_densify=bool(self.gui_init_densify.value),
+            mode=str(self.gui_init_mode.value),
+        )
+
+    def _on_demo_request_click(self) -> None:
+        """Fetch one video from the generation server and turn it into splats:
+        prepare_and_init for the very first video, append_video (incremental)
+        for every one after. Runs in viser's thread pool, so the ~30 s server
+        call + DA3 may block here."""
+        if self._request_video_cb is None:
+            self.gui_demo_status.content = "**demo:** no generation server wired"
+            return
+        if self._demo_image is None:
+            self.gui_demo_status.content = "**demo:** upload an image first"
+            return
+        prompt = str(self.gui_demo_prompt.value).strip()
+        if not prompt:
+            self.gui_demo_status.content = "**demo:** enter a prompt first"
+            return
+        # Serialize against any other trainer-mutating handler (a Reset from
+        # either tab, Initialize, Append…) so they can't free/replace the
+        # param tensors while we're mid append/init on this pool thread.
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_demo_status.content = "**demo:** busy — another operation is running"
+            return
+        try:
+            self.gui_demo_request_btn.disabled = True
+            self.gui_demo_reset_btn.disabled = True
+            self.gui_demo_reinit_btn.disabled = True
+            # Pause while we generate + run DA3 so the optimizer isn't racing
+            # the param-tensor surgery that append_video does.
+            self._pause_training_quietly()
+            # Use the same conservative "is there a finished scene" signal the
+            # rest of the app uses. `trainer.train` is set mid-init (before
+            # _initialized flips True), so a prior failed init could otherwise
+            # mis-route the next request into an incremental append.
+            had_splats = bool(getattr(self._trainer_ref, "_initialized", False))
+            name, image_bytes = self._demo_image
+            self.gui_demo_status.content = "**demo:** requesting video (~30 s)…"
+            video_path = str(self._request_video_cb(
+                image_bytes, name, prompt, str(self.gui_demo_server.value),
+            ))
+
+            if not had_splats:
+                self.gui_demo_status.content = "**demo:** first video — pose + init (DA3)…"
+                self._initializer(self._collect_demo_init_opts(video_path))
+                # Remember the seed video so Re-initialize re-inits from it
+                # (not from a later appended clip).
+                self._demo_init_video = video_path
+                self._snap_home_to_scene()
+            elif self._append_video_cb is None:
+                self.gui_demo_status.content = "**demo:** append-video callback missing"
+                return
+            else:
+                self.gui_demo_status.content = (
+                    "**demo:** new video — incremental append (DA3)…"
+                )
+                self._append_video_cb(
+                    video_path, int(self.gui_init_max_frames.value), True,
+                )
+                # Freeze toggle drives the trainer in BOTH directions so
+                # unchecking it actually unfreezes (otherwise a stale
+                # new_frustums mask keeps freezing old splats forever).
+                freeze_on = bool(self.gui_demo_freeze.value)
+                if self._set_freeze_mode_cb is not None:
+                    self._set_freeze_mode_cb("new_frustums" if freeze_on else "off")
+                    fm = getattr(self, "gui_inc_freeze_mode", None)
+                    if fm is not None:
+                        try:
+                            fm.value = "new_frustums" if freeze_on else "off"
+                        except Exception:
+                            pass
+                if freeze_on and self._recompute_freeze_mask_cb is not None:
+                    self._recompute_freeze_mask_cb()
+
+            auto = bool(self.gui_demo_autotrain.value)
+            if auto:
+                self._on_resume_training()
+            self._demo_count += 1
+            self.gui_demo_count.content = f"**videos processed:** {self._demo_count}"
+            self.gui_demo_status.content = (
+                f"**demo:** ready ({self.scene.num_splats:,} splats) — "
+                + ("training" if auto else "click Train")
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_demo_status.content = f"**demo:** error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_demo_request_btn.disabled = False
+            self.gui_demo_reset_btn.disabled = False
+            self.gui_demo_reinit_btn.disabled = False
+            self._trainer_op_lock.release()
+
+    def _on_demo_reset_click(self) -> None:
+        """Erase everything (same teardown as the Train-tab Reset), then clear
+        the demo counter. Keeps the uploaded image + prompt so the user can
+        immediately re-generate."""
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_demo_status.content = "**demo:** busy — wait for the current operation"
+            return
+        try:
+            self.gui_demo_reset_btn.disabled = True
+            if self.training_control is not None:
+                try:
+                    self.training_control.pause()
+                except Exception:
+                    pass
+            if self._resetter is not None:
+                self._resetter()
+            self._demo_count = 0
+            # Forget the seed so Re-initialize has nothing to rebuild until a
+            # new video is fetched (Reset is a clean start-over).
+            self._demo_init_video = None
+            self.gui_demo_count.content = "**videos processed:** 0"
+            self.gui_demo_splat_count.content = "**splats:** 0"
+            self.gui_demo_status.content = (
+                "**demo:** reset — upload + Request video to start over"
+            )
+        except Exception as e:
+            self.gui_demo_status.content = f"**demo:** reset error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_demo_reset_btn.disabled = False
+            self._trainer_op_lock.release()
+
+    def _on_demo_reinit_click(self) -> None:
+        """Erase the current splats and re-initialize from the FIRST fetched
+        video (the one that seeded the scene), so the original cameras come
+        back. Incremental appends are discarded — that's the designed clean
+        re-init (append_video nulls the trainer's _last_video so this
+        re-preprocesses the seed clip fresh rather than seeding from the
+        appended frames still in trainer.data). Does NOT fetch a new clip and
+        does NOT auto-train, so you can tweak a slider and see its effect on a
+        clean init; Request more videos to rebuild the incremental scene."""
+        if self._demo_init_video is None:
+            self.gui_demo_status.content = (
+                "**demo:** no video yet — click Request video first"
+            )
+            return
+        if self._initializer is None:
+            self.gui_demo_status.content = "**demo:** initializer not wired"
+            return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_demo_status.content = "**demo:** busy — another operation is running"
+            return
+        try:
+            self.gui_demo_reinit_btn.disabled = True
+            self.gui_demo_reset_btn.disabled = True
+            self.gui_demo_request_btn.disabled = True
+            if self.training_control is not None:
+                try:
+                    self.training_control.pause()
+                except Exception:
+                    pass
+            # Tear down current splats, then re-init on the seed video with the
+            # current slider values. After any append the trainer's
+            # _last_video is None, so prepare_and_init re-preprocesses the seed
+            # clip fresh → trainer.data + cameras are exactly the first video's.
+            self.gui_demo_status.content = "**demo:** re-initializing — clearing splats…"
+            if self._resetter is not None:
+                self._resetter()
+            self.gui_demo_status.content = "**demo:** re-initializing — pose + init (DA3)…"
+            self._initializer(self._collect_demo_init_opts(self._demo_init_video))
+            self._snap_home_to_scene()
+            # Back to a single-clip scene; appends were discarded.
+            self._demo_count = 1
+            self.gui_demo_count.content = "**videos processed:** 1"
+            self.gui_demo_status.content = (
+                f"**demo:** re-initialized from {Path(self._demo_init_video).name} "
+                f"({self.scene.num_splats:,} splats; appends cleared) — click Train"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_demo_status.content = f"**demo:** re-init error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_demo_reinit_btn.disabled = False
+            self.gui_demo_reset_btn.disabled = False
+            self.gui_demo_request_btn.disabled = False
+            self._trainer_op_lock.release()
+
     def _on_init_click(self) -> None:
         """Run the user-supplied initializer with the current Init-panel
         values. Updates status + recomputes the home pose so 'reset camera'
         targets the new bbox."""
         if self._initializer is None:
+            return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_init_status.content = "**init:** busy — another operation is running"
             return
         try:
             self.gui_init_btn.disabled = True
@@ -2661,21 +3112,10 @@ class ViewerApp:
                     self.gui_mesh_shell.value = float(p["shell_thickness"])
                 except Exception:
                     pass
-            # Recompute home pose from the newly-populated scene so the
-            # camera-reset button lands somewhere sensible. Push the new
-            # up/position/look_at to every connected client — otherwise the
-            # orbit controls keep the empty-boot up axis and splats appear
-            # upside down until the page is refreshed.
-            if self.scene.means is not None:
-                means_np = self.scene.means.detach().cpu().numpy()
-                self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
-                for client in self.server.get_clients().values():
-                    try:
-                        client.camera.up_direction = self.home_up
-                        client.camera.position = self.home_position
-                        client.camera.look_at = self.home_look_at
-                    except Exception:
-                        pass
+            # Recompute home pose from the newly-populated scene + push it to
+            # every connected client so 'reset camera' / the orbit up-axis
+            # track the new bbox.
+            self._snap_home_to_scene()
             self.gui_init_status.content = (
                 f"**init:** ready ({self.scene.num_splats:,} splats) — click resume"
             )
@@ -2686,10 +3126,14 @@ class ViewerApp:
         finally:
             self.gui_init_btn.disabled = False
             self.gui_init_reset_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _on_reset_click(self) -> None:
         """Pause training (caller's responsibility actually pauses; we also
         try via training_control) and ask the user's resetter to tear down."""
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_init_status.content = "**init:** busy — another operation is running"
+            return
         try:
             self.gui_init_reset_btn.disabled = True
             if self.training_control is not None:
@@ -2704,6 +3148,7 @@ class ViewerApp:
             self.gui_init_status.content = f"**init:** reset error — {type(e).__name__}: {e}"
         finally:
             self.gui_init_reset_btn.disabled = False
+            self._trainer_op_lock.release()
 
     def _on_prune_click(self) -> None:
         """Pause training, run `trainer.prune_splats()`, report counts, and
@@ -2714,6 +3159,9 @@ class ViewerApp:
             return
         if not getattr(t, "_initialized", False):
             self.gui_init_status.content = "**prune:** initialize training first"
+            return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_init_status.content = "**prune:** busy — another operation is running"
             return
         try:
             self.gui_init_prune_btn.disabled = True
@@ -2741,6 +3189,7 @@ class ViewerApp:
             self.gui_init_status.content = f"**prune:** error — {type(e).__name__}: {e}"
         finally:
             self.gui_init_prune_btn.disabled = False
+            self._trainer_op_lock.release()
 
     @staticmethod
     def _make_loss_figure(
@@ -2852,6 +3301,11 @@ class ViewerApp:
                 self.gui_splat_count_readout.content = (
                     f"**splat_count:** {int(splats):,}"
                 )
+                # Mirror the live readouts into the Demo tab when it's built.
+                if getattr(self, "gui_demo_train_status", None) is not None:
+                    self.gui_demo_train_status.content = f"**status:** {ctl.status()}"
+                    self.gui_demo_step.content = f"**step:** {int(step):,}"
+                    self.gui_demo_splat_count.content = f"**splats:** {int(splats):,}"
             except Exception:
                 # Server may have shut down; tolerate races on exit.
                 continue

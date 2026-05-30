@@ -154,6 +154,24 @@ A "Training" folder appears in the GUI with `resume`/`pause` buttons,
 live `step` / `loss` / `splat_count` readouts, and a plotly loss chart
 updated at 2 Hz.
 
+### Inpaint model preload
+
+`train_and_view.py` warms the inpainter's diffusers pipeline in a daemon
+thread at boot so the first **Inpaint** click doesn't block on the
+~30-60 s `from_pretrained + .to("cuda")` load. The default model
+(FLUX-2-Klein 9B) eats ~25 GB of GPU memory just to sit idle.
+
+If you're VRAM-constrained alongside training, or you don't plan to
+use the inpainter this session, disable the preload:
+
+```bash
+$PY visergui/train_and_view.py --port 8080 --inpaint-preload 0
+```
+
+With preload off, the first Inpaint click pays the load cost
+(synchronously, in the click handler) and subsequent clicks hit the
+cache. The `model_id` field on the Inpaint tab carries the same note.
+
 ## Remote use (SSH tunnel)
 
 ```bash
