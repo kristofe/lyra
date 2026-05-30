@@ -57,7 +57,6 @@ import torch.nn.functional as F
 
 from lyra_2._ext.imaginaire.utils import log, misc
 from lyra_2._ext.imaginaire.visualize.video import save_img_or_video
-from lyra_2._src.inference.lyra2_ar_inference import save_output
 from lyra_2._src.utils.model_loader import load_model_from_checkpoint
 
 # Leaf helpers reused verbatim from the zoom CLI (no duplication of inference logic).
@@ -67,6 +66,12 @@ from lyra_2._src.inference.lyra2_zoomgs_inference import (
     _fit_ground_normal_from_depth,
     _generate_one_direction,
 )
+from lyra_2._src.inference.camera_traj_utils import CAMERA_TRAJECTORY_CHOICES
+
+# Camera-move directions the trajectory builder accepts.
+DIRECTION_CHOICES = ("left", "right", "up", "down")
+DEFAULT_TRAJECTORY = "horizontal_zoom"
+DEFAULT_DIRECTION = "right"
 
 torch.enable_grad(False)
 torch.backends.cudnn.enabled = False
@@ -82,7 +87,7 @@ RESOLUTION_PRESETS = {
     "320p": (320, 576),
     "240p": (256, 448),
 }
-DEFAULT_RESOLUTION = "480p"
+DEFAULT_RESOLUTION = "240p"
 
 
 def resolve_resolution(value: Optional[str]) -> str:
@@ -124,6 +129,23 @@ def validate_num_frames(n: int, name: str) -> int:
     return n
 
 
+def validate_trajectory(name: str) -> str:
+    if name not in CAMERA_TRAJECTORY_CHOICES:
+        raise ValueError(
+            f"Invalid trajectory '{name}'. Choices: "
+            f"{', '.join(CAMERA_TRAJECTORY_CHOICES)}."
+        )
+    return name
+
+
+def validate_direction(d: str) -> str:
+    if d not in DIRECTION_CHOICES:
+        raise ValueError(
+            f"Invalid direction '{d}'. Use one of {', '.join(DIRECTION_CHOICES)}."
+        )
+    return d
+
+
 # ---------------------------------------------------------------------------
 # Default args namespace mirroring the zoomgs CLI defaults. The server overrides
 # a few fields per request (resolution, prompt, frame counts, strengths).
@@ -145,9 +167,11 @@ def build_default_args(server_args: argparse.Namespace) -> argparse.Namespace:
         num_sampling_step=50,
         seed=1,
         fps=16,
-        num_frames=161,
-        num_frames_zoom_in=81,
-        num_frames_zoom_out=241,
+        num_frames=81,
+        # Single-trajectory controls (one camera move per request).
+        trajectory=server_args.default_trajectory,
+        direction=DEFAULT_DIRECTION,
+        strength=0.5,
         resolution=server_args.default_resolution,
         context_parallel_size=1,
         lora_paths=None,
@@ -156,17 +180,9 @@ def build_default_args(server_args: argparse.Namespace) -> argparse.Namespace:
         lora_weights=None,
         offload=False,
         offload_when_prompt=False,
-        zoom_in_trajectory=server_args.default_trajectory,
-        zoom_out_trajectory=server_args.default_trajectory,
-        zoom_in_direction="right",
-        zoom_out_direction="left",
-        zoom_in_strength=0.5,
-        zoom_out_strength=1.5,
         use_moge_scale=True,
         ground_plane_align=False,
         ground_plane_bottom_frac=0.4,
-        zoom_out_upward_shift=0.05,
-        zoom_out_upward_ratio=0.15,
         depth_backend="da3",
         da3_model_name="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
         da3_model_path_custom="checkpoints/recon/model.pt",
@@ -268,16 +284,17 @@ def load_pipeline(args: argparse.Namespace) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Single generation — mirrors the per-image body of the zoomgs loop.
-# Returns the path to the combined mp4.
+# Single generation — ONE camera trajectory per call (no zoom-in/zoom-out pair).
+# Returns (mp4_path, last_frame_png_path); the last frame is the end of the
+# camera move, handy for chaining a follow-up call that continues the scene.
 # ---------------------------------------------------------------------------
-def run_zoomgs(
+def run_single(
     ctx: dict,
     args: argparse.Namespace,
     image_path: str,
     prompt: str,
     output_path: str,
-) -> str:
+) -> tuple[str, str]:
     model = ctx["model"]
     da3_model = ctx["da3_model"]
     moge_model = ctx["moge_model"]
@@ -289,11 +306,10 @@ def run_zoomgs(
     target_h, target_w = [int(x) for x in args.resolution.split(",")]
 
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    per_image_dir = os.path.join(output_path, base_name)
-    os.makedirs(per_image_dir, exist_ok=True)
     videos_dir = os.path.join(output_path, "videos")
     os.makedirs(videos_dir, exist_ok=True)
-    combined_video_path = os.path.join(videos_dir, f"{base_name}.mp4")
+    video_path = os.path.join(videos_dir, f"{base_name}.mp4")
+    last_frame_path = os.path.join(videos_dir, f"{base_name}_last.png")
 
     misc.set_random_seed(seed=args.seed, by_rank=True)
 
@@ -370,8 +386,7 @@ def run_zoomgs(
         t5 = t5[:1]
     neg_t5 = misc.to(negative_prompt_data["t5_text_embeddings"], **model.tensor_kwargs)
 
-    N_in = int(args.num_frames_zoom_in or args.num_frames)
-    N_out = int(args.num_frames_zoom_out or args.num_frames)
+    N = int(args.num_frames)
 
     # Step 2c: Optionally fit ground plane
     ground_normal = None
@@ -382,73 +397,50 @@ def run_zoomgs(
         if ground_normal is None:
             log.warning("Ground plane fitting failed, using original trajectory.", rank0_only=True)
 
-    # Step 3: Zoom-in
+    # Per-trajectory strength normalization so `strength` feels consistent across
+    # presets. The rotate-in-place presets feed `rotation_angle = 1.0 * strength`
+    # in DEGREES (camera_traj_utils), whereas orbits feed `angle = strength` in
+    # RADIANS. Left as-is, strength=0.5 → a 0.5° pan (invisible). Scale by
+    # 180/pi (~57°/unit) so strength=0.5 ≈ 29° like the orbits.
+    import math as _math
+    effective_strength = args.strength
+    if args.trajectory in ("rotate_spot", "rotate_spot_noise"):
+        effective_strength = args.strength * (180.0 / _math.pi)
+
+    # Step 3: Generate the single camera trajectory.
     log.info(
-        f"=== ZOOM-IN ({args.zoom_in_trajectory} {args.zoom_in_direction} "
-        f"str={args.zoom_in_strength}, N={N_in}) ===", rank0_only=True)
-    result_in = _generate_one_direction(
+        f"=== GENERATE ({args.trajectory} {args.direction} "
+        f"str={args.strength}→{effective_strength:.2f}, N={N}) ===", rank0_only=True)
+    result = _generate_one_direction(
         model=model, args=args, img_bchw=img_bchw, depth_hw=depth_hw, mask_hw=mask_hw,
         K_33=K_33, t5_embeddings=t5, neg_t5_embeddings=neg_t5,
-        trajectory=args.zoom_in_trajectory, direction=args.zoom_in_direction,
-        strength=args.zoom_in_strength, N=N_in, da3_model=da3_model,
-        process_group=process_group, log_prefix=f"{base_name}_zoom_in",
+        trajectory=args.trajectory, direction=args.direction,
+        strength=effective_strength, N=N, da3_model=da3_model,
+        process_group=process_group, log_prefix=base_name,
         ground_normal_cam=ground_normal,
     )
+    if result is None:
+        raise RuntimeError(f"Generation failed for {image_path}")
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Save the clip: result["video"] is [B, C, T, H, W] in [-1, 1].
+    video01 = (result["video"][0].clamp(-1, 1) * 0.5 + 0.5).float().cpu()  # [C,T,H,W] in [0,1]
+    save_img_or_video(video01, video_path.replace(".mp4", ""), fps=args.fps)
+    log.info(f"Saved video ({video01.shape[1]} frames): {video_path}", rank0_only=True)
 
-    # Step 3b: Zoom-out
-    log.info(
-        f"=== ZOOM-OUT ({args.zoom_out_trajectory} {args.zoom_out_direction} "
-        f"str={args.zoom_out_strength}, N={N_out}) ===", rank0_only=True)
-    result_out = _generate_one_direction(
-        model=model, args=args, img_bchw=img_bchw, depth_hw=depth_hw, mask_hw=mask_hw,
-        K_33=K_33, t5_embeddings=t5, neg_t5_embeddings=neg_t5,
-        trajectory=args.zoom_out_trajectory, direction=args.zoom_out_direction,
-        strength=args.zoom_out_strength, N=N_out, da3_model=da3_model,
-        process_group=process_group, log_prefix=f"{base_name}_zoom_out",
-        upward_shift=args.zoom_out_upward_shift, ground_normal_cam=ground_normal,
-        zoom_out_upward_ratio=args.zoom_out_upward_ratio,
-    )
+    # Extract the LAST frame (end of the camera move) as a png so a follow-up
+    # call can continue the scene from where this clip left off.
+    last_rgb = (video01[:, -1].permute(1, 2, 0).numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+    cv2.imwrite(last_frame_path, cv2.cvtColor(last_rgb, cv2.COLOR_RGB2BGR))
+    log.info(f"Saved last frame: {last_frame_path}", rank0_only=True)
 
-    if result_in is None and result_out is None:
-        raise RuntimeError(f"Both zoom-in and zoom-out failed for {image_path}")
-
-    # Save individual direction videos
-    for tag, res in [("zoom_in", result_in), ("zoom_out", result_out)]:
-        if res is None:
-            continue
-        vid_stem = os.path.join(per_image_dir, tag)
-        to_show = []
-        if res.get("warp_video") is not None:
-            to_show.append(res["warp_video"])
-        to_show.append(res["video"])
-        save_output(to_show, vid_stem + ".mp4")
-
-    # Combine zoom-out (reversed) + zoom-in into a single video
-    videos_to_combine = []
-    if result_out is not None:
-        videos_to_combine.append(result_out["video"].flip(dims=[2]))
-    if result_in is not None:
-        videos_to_combine.append(result_in["video"])
-
-    combined_video = torch.cat(videos_to_combine, dim=2)  # [B, C, T, H, W]
-    log.info(f"Combined video: {combined_video.shape[2]} frames", rank0_only=True)
-
-    combined_01 = (combined_video[0].clamp(-1, 1) * 0.5 + 0.5).float().cpu()
-    save_img_or_video(combined_01, combined_video_path.replace(".mp4", ""), fps=args.fps)
-    log.info(f"Saved combined video: {combined_video_path}", rank0_only=True)
-
-    del combined_video, combined_01
+    del video01
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
 
-    if not os.path.exists(combined_video_path):
-        raise RuntimeError(f"Expected output not found: {combined_video_path}")
-    return combined_video_path
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"Expected output not found: {video_path}")
+    return video_path, last_frame_path
 
 
 # ===========================================================================
@@ -460,6 +452,8 @@ from fastapi.responses import FileResponse, JSONResponse
 # Module-level state populated at startup.
 STATE: dict = {"ctx": None, "args": None, "server_args": None}
 GPU_LOCK = threading.Lock()
+# job_id -> {"video": <mp4 path>, "last_frame": <png path>} for follow-up fetches.
+JOBS: dict = {}
 
 
 @asynccontextmanager
@@ -493,27 +487,44 @@ def resolutions():
     }
 
 
+@app.get("/trajectories")
+def trajectories():
+    """Camera-motion options for the GUI dropdown (one trajectory per call)."""
+    return {
+        "default": DEFAULT_TRAJECTORY,
+        "default_direction": DEFAULT_DIRECTION,
+        "directions": list(DIRECTION_CHOICES),
+        "trajectories": list(CAMERA_TRAJECTORY_CHOICES),
+    }
+
+
 @app.post("/generate")
 async def generate(
     image: UploadFile = File(...),
     prompt: str = Form(""),
     resolution: str = Form(DEFAULT_RESOLUTION),
-    trajectory: Optional[str] = Form(None),
-    num_frames_zoom_in: int = Form(81),
-    num_frames_zoom_out: int = Form(241),
-    zoom_in_strength: float = Form(0.5),
-    zoom_out_strength: float = Form(1.5),
+    trajectory: str = Form(DEFAULT_TRAJECTORY),
+    direction: str = Form(DEFAULT_DIRECTION),
+    num_frames: int = Form(81),
+    strength: float = Form(0.5),
     fps: int = Form(16),
     seed: int = Form(1),
 ):
+    """Generate ONE camera trajectory from the uploaded image and stream the mp4.
+
+    The response carries an ``X-Job-Id`` header; ``GET /last_frame/{job_id}``
+    then returns the final frame of the clip, which you can POST back as the
+    image for a follow-up call to continue the scene.
+    """
     if STATE["ctx"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
     # Validate request params before doing any heavy work.
     try:
         res = resolve_resolution(resolution)
-        n_in = validate_num_frames(num_frames_zoom_in, "num_frames_zoom_in")
-        n_out = validate_num_frames(num_frames_zoom_out, "num_frames_zoom_out")
+        n = validate_num_frames(num_frames, "num_frames")
+        traj = validate_trajectory(trajectory)
+        dirn = validate_direction(direction)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -526,7 +537,7 @@ async def generate(
     job_dir = os.path.join(server_args.output_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
     # Validate the upload is a decodable image, but persist the ORIGINAL bytes so
-    # run_zoomgs' cv2.imread reads exactly what we just verified.
+    # run_single's cv2.imread reads exactly what we just verified.
     if cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) is None:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="Could not decode uploaded image.")
@@ -540,25 +551,22 @@ async def generate(
     # Per-request args (copy of the loaded defaults with overrides).
     req_args = argparse.Namespace(**vars(STATE["args"]))
     req_args.resolution = res
-    req_args.num_frames_zoom_in = n_in
-    req_args.num_frames_zoom_out = n_out
-    req_args.zoom_in_strength = float(zoom_in_strength)
-    req_args.zoom_out_strength = float(zoom_out_strength)
+    req_args.num_frames = n
+    req_args.trajectory = traj
+    req_args.direction = dirn
+    req_args.strength = float(strength)
     req_args.fps = int(fps)
     req_args.seed = int(seed)
-    if trajectory:
-        req_args.zoom_in_trajectory = trajectory
-        req_args.zoom_out_trajectory = trajectory
 
     # Serialize GPU work (single GPU); run the blocking job in a worker thread.
     import anyio
 
-    def _job() -> str:
+    def _job():
         with GPU_LOCK:
-            return run_zoomgs(STATE["ctx"], req_args, image_path, prompt, job_dir)
+            return run_single(STATE["ctx"], req_args, image_path, prompt, job_dir)
 
     try:
-        mp4_path = await anyio.to_thread.run_sync(_job)
+        mp4_path, last_frame_path = await anyio.to_thread.run_sync(_job)
     except ValueError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
@@ -567,13 +575,33 @@ async def generate(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-    return FileResponse(mp4_path, media_type="video/mp4", filename=f"{job_id}.mp4")
+    JOBS[job_id] = {"video": mp4_path, "last_frame": last_frame_path}
+    return FileResponse(
+        mp4_path, media_type="video/mp4", filename=f"{job_id}.mp4",
+        headers={"X-Job-Id": job_id},
+    )
+
+
+@app.get("/last_frame/{job_id}")
+def last_frame(job_id: str):
+    """Return the final frame of a previous /generate job as a PNG.
+
+    POST this back as the `image` of a new /generate call to continue the scene.
+    Note: each call re-grounds (fresh depth + identity pose), so continuity is
+    visual, not a single consistent 3D frame — drift accumulates when chaining.
+    """
+    job = JOBS.get(job_id)
+    if not job or not os.path.exists(job.get("last_frame", "")):
+        raise HTTPException(status_code=404, detail=f"No last frame for job_id {job_id!r}.")
+    return FileResponse(
+        job["last_frame"], media_type="image/png", filename=f"{job_id}_last.png"
+    )
 
 
 def parse_server_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Lyra2 zoom video REST server")
     p.add_argument("--host", type=str, default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints/model")
     p.add_argument("--experiment", type=str, default="lyra2")
     p.add_argument("--use_dmd", action=argparse.BooleanOptionalAction, default=True,

@@ -810,6 +810,9 @@ class ViewerApp:
         self._request_video_cb = request_video
         self._demo_defaults = demo_defaults or {}
         self._demo_image: "tuple[str, bytes] | None" = None
+        # Last frame (PNG bytes) of the most recently generated clip; used to
+        # continue the camera move on the next Request when the toggle is on.
+        self._demo_last_frame: "tuple[str, bytes] | None" = None
         self._demo_count = 0
         # The first fetched clip — the one that SEEDED the scene. Re-initialize
         # re-runs init on this video so the original cameras come back. Using
@@ -2734,6 +2737,17 @@ class ViewerApp:
         default_res = str(d.get("resolution", res_default))
         if default_res not in res_options:
             res_options = (default_res, *res_options)
+        # Camera-motion options — queried from the server's /trajectories
+        # endpoint, with a static fallback if it isn't up yet.
+        traj_options, dir_options, traj_default, dir_default = video_api.fetch_trajectories(
+            str(d.get("server_url", ""))
+        )
+        default_traj = str(d.get("trajectory", traj_default))
+        if default_traj not in traj_options:
+            traj_options = (default_traj, *traj_options)
+        default_dir = str(d.get("direction", dir_default))
+        if default_dir not in dir_options:
+            dir_options = (default_dir, *dir_options)
         with self.server.gui.add_folder("Generate"):
             self.gui_demo_server = self.server.gui.add_text(
                 "server URL",
@@ -2768,10 +2782,10 @@ class ViewerApp:
                 "**videos processed:** 0"
             )
 
-        with self.server.gui.add_folder("Lyra2 camera (zoom)"):
-            # These map 1:1 onto demo_server's /generate form fields and the
-            # underlying lyra2_zoomgs_inference CLI (--resolution,
-            # --num_frames_zoom_in/out, --zoom_in/out_strength).
+        with self.server.gui.add_folder("Lyra2 camera"):
+            # One camera move per Request. These map 1:1 onto demo_server's
+            # /generate form fields (resolution, trajectory, direction,
+            # num_frames, strength).
             self.gui_demo_resolution = self.server.gui.add_dropdown(
                 "resolution",
                 options=res_options,
@@ -2781,36 +2795,49 @@ class ViewerApp:
                      "endpoint (480p is the model's native size). The server "
                      "also accepts a raw 'H,W' if you edit a preset in.",
             )
-            self.gui_demo_zoom_in_frames = self.server.gui.add_number(
-                "zoom-in frames",
-                initial_value=int(d.get("num_frames_zoom_in", 81)),
+            self.gui_demo_trajectory = self.server.gui.add_dropdown(
+                "trajectory",
+                options=traj_options,
+                initial_value=default_traj,
+                hint="Camera motion for this clip (one move per Request). "
+                     "Options come from the server's /trajectories endpoint, "
+                     "e.g. horizontal_zoom (dolly in), horizontal (strafe), "
+                     "orbit_horizontal, spiral, dolly_zoom, rotate_spot, back, "
+                     "original (locked-off).",
+            )
+            self.gui_demo_direction = self.server.gui.add_dropdown(
+                "direction",
+                options=dir_options,
+                initial_value=default_dir,
+                hint="Direction of the move (left/right/up/down). Meaning "
+                     "depends on the trajectory — e.g. for horizontal_zoom, "
+                     "right = forward (in), left = backward (out).",
+            )
+            self.gui_demo_num_frames = self.server.gui.add_number(
+                "num_frames",
+                initial_value=int(d.get("num_frames", 81)),
                 min=81, max=801, step=80,
-                hint="Frames for the zoom-IN segment. Must be 1 + 80k "
-                     "(81, 161, 241, …) to align with AR chunk boundaries. "
-                     "More frames spread the same motion over a slower, "
-                     "smoother push-in.",
+                hint="Frames in the clip. Must be 1 + 80k (81, 161, 241, …) to "
+                     "align with AR chunk boundaries. More frames spread the "
+                     "same motion over a slower, smoother move.",
             )
-            self.gui_demo_zoom_out_frames = self.server.gui.add_number(
-                "zoom-out frames",
-                initial_value=int(d.get("num_frames_zoom_out", 241)),
-                min=81, max=801, step=80,
-                hint="Frames for the zoom-OUT segment. Must be 1 + 80k. The "
-                     "final clip is zoom-out (reversed) + zoom-in.",
-            )
-            self.gui_demo_zoom_in_strength = self.server.gui.add_slider(
-                "zoom-in strength",
+            self.gui_demo_strength = self.server.gui.add_slider(
+                "strength",
                 min=0.0, max=3.0, step=0.1,
-                initial_value=float(d.get("zoom_in_strength", 0.5)),
-                hint="How far the camera dollies forward. A built-in collision "
-                     "check can cap the actual motion, so larger values don't "
-                     "always push further.",
+                initial_value=float(d.get("strength", 0.5)),
+                hint="Magnitude of the move (distance for dolly/strafe, angle "
+                     "for orbits). A built-in collision check can cap forward "
+                     "motion, so larger values don't always push further.",
             )
-            self.gui_demo_zoom_out_strength = self.server.gui.add_slider(
-                "zoom-out strength",
-                min=0.0, max=3.0, step=0.1,
-                initial_value=float(d.get("zoom_out_strength", 1.5)),
-                hint="How far the camera dollies backward before the clip "
-                     "reverses into the zoom-in.",
+            self.gui_demo_continue = self.server.gui.add_checkbox(
+                "continue from last clip",
+                initial_value=False,
+                hint="On: the NEXT Request seeds from the LAST FRAME of the "
+                     "previously generated clip, so the camera keeps moving "
+                     "instead of restarting from the uploaded image. Off: every "
+                     "Request restarts from the uploaded image (repeating the "
+                     "same move yields the same clip). Note: each clip re-grounds "
+                     "depth, so continuity is visual and drifts over many hops.",
             )
 
         with self.server.gui.add_folder("Settings (synced with Train)"):
@@ -2929,6 +2956,9 @@ class ViewerApp:
         if not content:
             return
         self._demo_image = (getattr(f, "name", "image.png"), content)
+        # A fresh upload starts a new scene — drop any carried-over last frame so
+        # "continue from last clip" doesn't seed from the previous image's clip.
+        self._demo_last_frame = None
         self.gui_demo_image_status.content = (
             f"**image:** {self._demo_image[0]} ({len(content) / 1024.0:,.0f} KB)"
         )
@@ -2950,15 +2980,44 @@ class ViewerApp:
         )
 
     def _collect_demo_gen_opts(self) -> dict:
-        """Lyra2 zoom/resolution options forwarded to the generation server
+        """Lyra2 single-trajectory options forwarded to the generation server
         (maps onto demo_server's /generate form fields)."""
         return dict(
             resolution=str(self.gui_demo_resolution.value),
-            num_frames_zoom_in=int(self.gui_demo_zoom_in_frames.value),
-            num_frames_zoom_out=int(self.gui_demo_zoom_out_frames.value),
-            zoom_in_strength=float(self.gui_demo_zoom_in_strength.value),
-            zoom_out_strength=float(self.gui_demo_zoom_out_strength.value),
+            trajectory=str(self.gui_demo_trajectory.value),
+            direction=str(self.gui_demo_direction.value),
+            num_frames=int(self.gui_demo_num_frames.value),
+            strength=float(self.gui_demo_strength.value),
         )
+
+    def _extract_last_frame(self, video_path: str) -> "tuple[str, bytes] | None":
+        """Read the final frame of an mp4 and return (name, PNG bytes).
+
+        Used to continue the camera move on the next Request. Returns None on any
+        failure so a read hiccup never breaks the generate flow.
+        """
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return None
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+            frame = None
+            ret, f = cap.read()
+            while ret:
+                frame = f
+                ret, f = cap.read()  # walk to the genuine last decodable frame
+            cap.release()
+            if frame is None:
+                return None
+            ok, buf = cv2.imencode(".png", frame)
+            if not ok:
+                return None
+            return ("last_frame.png", buf.tobytes())
+        except Exception:
+            return None
 
     def _on_demo_request_click(self) -> None:
         """Fetch one video from the generation server and turn it into splats:
@@ -2991,12 +3050,26 @@ class ViewerApp:
             # _initialized flips True), so a prior failed init could otherwise
             # mis-route the next request into an incremental append.
             had_splats = bool(getattr(self._trainer_ref, "_initialized", False))
-            name, image_bytes = self._demo_image
-            self.gui_demo_status.content = "**demo:** requesting video (~30 s)…"
+            # Seed image: continue from the previous clip's last frame when the
+            # toggle is on and we have one, else the uploaded image. This makes
+            # the camera actually progress across Requests instead of restarting.
+            continue_on = bool(getattr(self, "gui_demo_continue", None)
+                               and self.gui_demo_continue.value)
+            if continue_on and self._demo_last_frame is not None:
+                name, image_bytes = self._demo_last_frame
+                self.gui_demo_status.content = "**demo:** requesting video (continuing)…"
+            else:
+                name, image_bytes = self._demo_image
+                self.gui_demo_status.content = "**demo:** requesting video (~30 s)…"
             video_path = str(self._request_video_cb(
                 image_bytes, name, prompt, str(self.gui_demo_server.value),
                 self._collect_demo_gen_opts(),
             ))
+            # Capture this clip's final frame so the next Request can continue
+            # from it (used only when "continue from last clip" is on).
+            lf = self._extract_last_frame(video_path)
+            if lf is not None:
+                self._demo_last_frame = lf
 
             if not had_splats:
                 self.gui_demo_status.content = "**demo:** first video — pose + init (DA3)…"
@@ -3069,6 +3142,9 @@ class ViewerApp:
             # Forget the seed so Re-initialize has nothing to rebuild until a
             # new video is fetched (Reset is a clean start-over).
             self._demo_init_video = None
+            # Drop the carried-over last frame so "continue from last clip"
+            # starts fresh after a Reset.
+            self._demo_last_frame = None
             self.gui_demo_count.content = "**videos processed:** 0"
             self.gui_demo_splat_count.content = "**splats:** 0"
             self.gui_demo_status.content = (

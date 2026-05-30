@@ -65,9 +65,9 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument(
-        "--demo-server-url", type=str, default="http://localhost:8080/generate",
+        "--demo-server-url", type=str, default="http://localhost:8000/generate",
         help="Default endpoint for the Demo tab's video-generation server "
-             "(Lyra2 demo_server, default port 8080). Editable live in the "
+             "(Lyra2 demo_server, default port 8000). Editable live in the "
              "GUI. POST image+prompt → mp4.",
     )
     p.add_argument(
@@ -80,27 +80,31 @@ def main() -> None:
         help="Default for the Demo→max_frames field. Falls back to "
              "--max-frames when unset.",
     )
-    # Lyra2 zoom-generation defaults (Demo→'Lyra2 camera (zoom)' folder).
+    # Lyra2 single-trajectory defaults (Demo→'Lyra2 camera' folder).
     p.add_argument(
-        "--demo-resolution", type=str, default="480p",
+        "--demo-resolution", type=str, default="240p",
         help="Default Demo→resolution: a preset label (480p/360p/320p/240p) "
-             "or a raw 'H,W'. 480p is the model's native size.",
+             "or a raw 'H,W'. 480p is the model's native size; 240p is faster.",
     )
     p.add_argument(
-        "--demo-zoom-in-frames", type=int, default=81,
-        help="Default Demo→zoom-in frames. Must be 1 + 80k (81, 161, 241, …).",
+        "--demo-trajectory", type=str, default="horizontal_zoom",
+        help="Default Demo→trajectory (one camera move per request), e.g. "
+             "horizontal_zoom, horizontal, orbit_horizontal, spiral, "
+             "dolly_zoom, rotate_spot, back, original.",
     )
     p.add_argument(
-        "--demo-zoom-out-frames", type=int, default=241,
-        help="Default Demo→zoom-out frames. Must be 1 + 80k.",
+        "--demo-direction", type=str, default="right",
+        choices=["left", "right", "up", "down"],
+        help="Default Demo→direction of the camera move.",
     )
     p.add_argument(
-        "--demo-zoom-in-strength", type=float, default=0.5,
-        help="Default Demo→zoom-in strength (camera push-in distance).",
+        "--demo-num-frames", type=int, default=81,
+        help="Default Demo→num_frames. Must be 1 + 80k (81, 161, 241, …).",
     )
     p.add_argument(
-        "--demo-zoom-out-strength", type=float, default=1.5,
-        help="Default Demo→zoom-out strength (camera pull-back distance).",
+        "--demo-strength", type=float, default=0.5,
+        help="Default Demo→strength (move magnitude; distance for dolly/strafe, "
+             "angle for orbits).",
     )
     p.add_argument(
         "--inpaint-preload", type=int, default=0,
@@ -330,10 +334,10 @@ def main() -> None:
                         if args.demo_max_frames is not None
                         else args.max_frames),
             resolution=args.demo_resolution,
-            num_frames_zoom_in=args.demo_zoom_in_frames,
-            num_frames_zoom_out=args.demo_zoom_out_frames,
-            zoom_in_strength=args.demo_zoom_in_strength,
-            zoom_out_strength=args.demo_zoom_out_strength,
+            trajectory=args.demo_trajectory,
+            direction=args.demo_direction,
+            num_frames=args.demo_num_frames,
+            strength=args.demo_strength,
         ),
         default_init_args=dict(
             video=str(args.video),

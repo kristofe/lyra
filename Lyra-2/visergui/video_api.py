@@ -34,7 +34,7 @@ _URL_KEYS = ("video_url", "url", "video", "output_url", "result_url")
 # server can't be reached at GUI-build time. Labels map to "H,W" the server
 # also accepts directly.
 DEFAULT_RESOLUTION_PRESETS = ("480p", "360p", "320p", "240p")
-DEFAULT_RESOLUTION = "480p"
+DEFAULT_RESOLUTION = "240p"
 
 
 def _sibling_url(server_url: str, path: str) -> str:
@@ -68,6 +68,38 @@ def fetch_resolutions(server_url: str, timeout: float = 5.0):
     return DEFAULT_RESOLUTION_PRESETS, DEFAULT_RESOLUTION
 
 
+# Static fallback camera options (mirror demo_server) for when /trajectories
+# isn't reachable when the GUI builds the tab.
+DEFAULT_TRAJECTORIES = (
+    "horizontal_zoom", "horizontal", "horizontal_lift", "orbit_horizontal",
+    "orbit_vertical", "spiral", "dolly_zoom", "rotate_spot", "back", "original",
+)
+DEFAULT_DIRECTIONS = ("left", "right", "up", "down")
+DEFAULT_TRAJECTORY = "horizontal_zoom"
+DEFAULT_DIRECTION = "right"
+
+
+def fetch_trajectories(server_url: str, timeout: float = 5.0):
+    """GET <server>/trajectories → (trajectories, directions, default_traj, default_dir).
+
+    Falls back to the static lists if the server is unreachable, so the GUI can
+    always build the dropdowns.
+    """
+    try:
+        resp = requests.get(_sibling_url(server_url, "trajectories"), timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        trajs = tuple(payload.get("trajectories") or ())
+        dirs = tuple(payload.get("directions") or ())
+        dtraj = payload.get("default") or (trajs[0] if trajs else DEFAULT_TRAJECTORY)
+        ddir = payload.get("default_direction") or DEFAULT_DIRECTION
+        if trajs and dirs:
+            return trajs, dirs, dtraj, ddir
+    except Exception:
+        pass
+    return DEFAULT_TRAJECTORIES, DEFAULT_DIRECTIONS, DEFAULT_TRAJECTORY, DEFAULT_DIRECTION
+
+
 def request_video(
     server_url: str,
     image_bytes: bytes,
@@ -76,12 +108,12 @@ def request_video(
     gen_opts: dict | None = None,
     timeout: float = 600.0,
 ) -> bytes:
-    """POST image+prompt(+zoom/resolution opts) and return raw video bytes.
+    """POST image+prompt(+trajectory/resolution opts) and return raw video bytes.
 
-    Blocks until the server responds (generation can take from ~30 s with DMD
-    up to several minutes at full resolution, hence the generous default
-    timeout). ``gen_opts`` carries the optional Lyra2 zoom controls
-    (``resolution``, ``num_frames_zoom_in``/``out``, ``zoom_in``/``out_strength``);
+    Blocks until the server responds (generation can take from ~tens of seconds
+    with DMD up to minutes at full resolution, hence the generous default
+    timeout). ``gen_opts`` carries the single-trajectory Lyra2 controls
+    (``resolution``, ``trajectory``, ``direction``, ``num_frames``, ``strength``);
     only keys with a non-None value are sent. Raises on a non-2xx status, an
     unexpected content type, or an empty body so the caller can surface it.
     """
@@ -96,10 +128,10 @@ def request_video(
         data["prompt"] = prompt
     for key in (
         "resolution",
-        "num_frames_zoom_in",
-        "num_frames_zoom_out",
-        "zoom_in_strength",
-        "zoom_out_strength",
+        "trajectory",
+        "direction",
+        "num_frames",
+        "strength",
     ):
         val = (gen_opts or {}).get(key)
         if val is not None and val != "":
