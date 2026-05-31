@@ -822,6 +822,10 @@ class ViewerApp:
         # seed video cleanly (incremental appends are discarded — the designed
         # clean re-init, see SplatTrainer.append_video / reset docstrings).
         self._demo_init_video: "str | None" = None
+        # Every demo clip turned into splats, in order (seed first, then appended /
+        # gap-fill clips). Re-initialize replays ALL of these so the rebuilt scene
+        # matches the accumulated one rather than only the seed clip.
+        self._demo_clips: list[str] = []
         # Serializes the long, structure-mutating trainer handlers (init,
         # reset, append, prune, checkpoint, demo request/reset). viser runs
         # GUI callbacks on a thread pool and `disabled` is only a UI hint, so
@@ -2949,6 +2953,12 @@ class ViewerApp:
                      "a new video and does not auto-train.",
             )
             self.gui_demo_reset_btn = self.server.gui.add_button("Reset")
+            self.gui_demo_diag_btn = self.server.gui.add_button(
+                "Run diagnostics",
+                hint="Render the init-preview + mask + splat-stats PNGs for the "
+                     "current splats (writes to cwd). No longer runs automatically "
+                     "at init — click this when you want them.",
+            )
             self.gui_demo_train_status = self.server.gui.add_markdown(
                 "**status:** stopped"
             )
@@ -2965,6 +2975,7 @@ class ViewerApp:
         self.gui_demo_pause_btn.on_click(lambda _ev: self._on_pause_training())
         self.gui_demo_reinit_btn.on_click(lambda _ev: self._on_demo_reinit_click())
         self.gui_demo_reset_btn.on_click(lambda _ev: self._on_demo_reset_click())
+        self.gui_demo_diag_btn.on_click(lambda _ev: self._on_demo_diagnostics_click())
 
         # Two-way sync each duplicate with its Train-tab twin.
         self._link_widgets(self.gui_demo_max_frames, self.gui_init_max_frames)
@@ -3132,6 +3143,9 @@ class ViewerApp:
                 if freeze_on and self._recompute_freeze_mask_cb is not None:
                     self._recompute_freeze_mask_cb()
 
+            # Track every clip that became splats so Re-initialize can replay them.
+            if video_path not in self._demo_clips:
+                self._demo_clips.append(video_path)
             auto = bool(self.gui_demo_autotrain.value)
             if auto:
                 self._on_resume_training()
@@ -3249,6 +3263,8 @@ class ViewerApp:
 
             self.gui_demo_fill_status.content = "**gap-fill:** appending generated views (DA3)\u2026"
             self._append_video_cb(tmp.name, int(self.gui_init_max_frames.value), True)
+            if tmp.name not in self._demo_clips:
+                self._demo_clips.append(tmp.name)
 
             freeze_on = bool(self.gui_demo_freeze.value)
             if self._set_freeze_mode_cb is not None:
@@ -3273,6 +3289,34 @@ class ViewerApp:
             self.gui_demo_request_btn.disabled = False
             self._trainer_op_lock.release()
 
+    def _on_demo_diagnostics_click(self) -> None:
+        """Manually render the init-preview + mask + splat-stats diagnostics for the
+        current splats (these no longer run automatically at init). Writes PNGs to
+        cwd. Serialized against other trainer-mutating handlers."""
+        trainer = self._trainer_ref
+        if trainer is None or not bool(getattr(trainer, "_initialized", False)):
+            self.gui_demo_status.content = "**demo:** nothing to diagnose — init a scene first"
+            return
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_demo_status.content = "**demo:** busy — another operation is running"
+            return
+        try:
+            self.gui_demo_diag_btn.disabled = True
+            self.gui_demo_status.content = "**demo:** rendering diagnostics…"
+            trainer.render_init_preview("manual")
+            trainer.render_diagnostics("manual")
+            self.gui_demo_status.content = (
+                "**demo:** diagnostics written to cwd "
+                "(manual.png / manual_mask_diag.png / manual_splat_stats.png)"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_demo_status.content = f"**demo:** diagnostics error — {type(e).__name__}: {e}"
+        finally:
+            self.gui_demo_diag_btn.disabled = False
+            self._trainer_op_lock.release()
+
     def _on_demo_reset_click(self) -> None:
         """Erase everything (same teardown as the Train-tab Reset), then clear
         the demo counter. Keeps the uploaded image + prompt so the user can
@@ -3293,6 +3337,9 @@ class ViewerApp:
             # Forget the seed so Re-initialize has nothing to rebuild until a
             # new video is fetched (Reset is a clean start-over).
             self._demo_init_video = None
+            # Clear the accumulated clip list so Re-initialize after a Reset
+            # doesn't replay stale clips.
+            self._demo_clips = []
             # Drop the carried-over last frame so "continue from last clip"
             # starts fresh after a Reset.
             self._demo_last_frame = None
@@ -3344,14 +3391,23 @@ class ViewerApp:
             if self._resetter is not None:
                 self._resetter()
             self.gui_demo_status.content = "**demo:** re-initializing — pose + init (DA3)…"
-            self._initializer(self._collect_demo_init_opts(self._demo_init_video))
+            # Replay ALL accumulated clips: init on the first, append the rest, so
+            # the rebuilt scene matches the accumulated one (not just the seed).
+            _clips = [c for c in self._demo_clips if c] or (
+                [self._demo_init_video] if self._demo_init_video else [])
+            self._initializer(self._collect_demo_init_opts(_clips[0]))
+            for _extra in _clips[1:]:
+                if self._append_video_cb is not None:
+                    self.gui_demo_status.content = (
+                        f"**demo:** re-init — appending {Path(_extra).name} (DA3)…")
+                    self._append_video_cb(
+                        _extra, int(self.gui_init_max_frames.value), True)
             self._snap_home_to_scene()
-            # Back to a single-clip scene; appends were discarded.
-            self._demo_count = 1
-            self.gui_demo_count.content = "**videos processed:** 1"
+            self._demo_count = len(_clips)
+            self.gui_demo_count.content = f"**videos processed:** {len(_clips)}"
             self.gui_demo_status.content = (
-                f"**demo:** re-initialized from {Path(self._demo_init_video).name} "
-                f"({self.scene.num_splats:,} splats; appends cleared) — click Train"
+                f"**demo:** re-initialized from {len(_clips)} clip(s) "
+                f"({self.scene.num_splats:,} splats) — click Train"
             )
         except Exception as e:
             import traceback

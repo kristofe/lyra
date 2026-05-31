@@ -32,6 +32,8 @@ import torch
 from depth_anything_3.api import DepthAnything3
 
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")  # headless backend: diagnostics run from viser callback threads
 import matplotlib.pyplot as plt
 import lpips
 from tqdm.auto import tqdm
@@ -476,7 +478,8 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
     sh_init = f_dc_init[:, None, :]
     save_inria_ply("splats_init.ply", means_init, sh_init, log_s_init, logit_o_init, quats_init)
     print(f"Saved splats_init.ply: {M} gaussians")
-    render_and_show(data, means_init, quats_init, log_s_init, logit_o_init, sh_init, tag="init gaussians")
+    # NOTE: init previews are NOT rendered automatically (they were slow on every
+    # init). Use the Demo tab's "Run diagnostics" button → SplatTrainer.render_init_preview.
 
     # voxel init: typical reduction 3–10× vs v0 with comparable coverage; uses
     # the *full* valid-sample tensors, not the random-subsampled ones.
@@ -508,7 +511,8 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
     sh_vx = f_dc_vx[:, None, :]
     save_inria_ply("splats_voxel.ply", means_vx, sh_vx, log_s_vx, logit_o_vx, quats_vx)
     print("saved splats_voxel.ply")
-    render_and_show(data, means_vx, quats_vx, log_s_vx, logit_o_vx, sh_vx, tag="v0 voxel init")
+    # NOTE: voxel-init preview is NOT rendered automatically — use the "Run
+    # diagnostics" button (see note above).
 
     # Per-pixel loss mask, indexed per-frame by step() as train_mask[idx].
     train_mask = _per_frame_train_mask(
@@ -1114,6 +1118,18 @@ class SplatTrainer:
         self.scale_clamp_voxel_mult = float(voxel_mult)
         if self.init is not None and self.mode != "2dgs":
             self._log_scale_max = math.log(self.scale_clamp_voxel_mult * self.init.voxel)
+
+    def render_init_preview(self, tag: str = "manual") -> None:
+        """Render the GT-vs-render preview for the CURRENT splats (the same
+        side-by-side `render_and_show` previously emitted automatically at init).
+        Writes `{tag}.png` to cwd. Safe to call any time after prepare_and_init."""
+        if self.train is None or self.data is None:
+            return
+        p = self.train.params
+        sh_all = (p["sh0"] if p["shN"].shape[1] == 0
+                  else torch.cat([p["sh0"], p["shN"]], dim=1))
+        render_and_show(self.data, p["means"], p["quats"], p["scales"],
+                        p["opacities"], sh_all, tag=tag, mode=self.mode)
 
     def render_diagnostics(self, tag: str) -> None:
         """Render mask + splat-stats diagnostics for the current params.
