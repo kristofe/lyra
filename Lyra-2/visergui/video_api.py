@@ -183,3 +183,84 @@ def request_video(
     if not video_bytes:
         raise ValueError("server returned an empty video body")
     return video_bytes
+
+
+def _extract_video_bytes(resp, timeout: float) -> bytes:
+    """Turn a /generate(_custom) response into raw mp4 bytes.
+
+    Accepts a video/* (or octet-stream) body directly, or a JSON envelope with a
+    download URL. Raises on non-2xx, unexpected content type, or empty body.
+    """
+    resp.raise_for_status()
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "application/json" in content_type:
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"server returned JSON but not an object "
+                f"(got {type(payload).__name__}); expected {{'video_url': ...}}"
+            )
+        url = next((payload[k] for k in _URL_KEYS if payload.get(k)), None)
+        if not url:
+            raise ValueError(
+                f"server returned JSON without a video URL "
+                f"(keys tried: {_URL_KEYS}); got {list(payload)!r}"
+            )
+        dl = requests.get(url, timeout=timeout)
+        dl.raise_for_status()
+        video_bytes = dl.content
+    elif (content_type.startswith("video/")
+          or "application/octet-stream" in content_type
+          or not content_type):
+        video_bytes = resp.content
+    else:
+        raise ValueError(
+            f"server returned non-video content (Content-Type={content_type!r}); "
+            f"expected video/*, application/octet-stream, or application/json"
+        )
+    if not video_bytes:
+        raise ValueError("server returned an empty video body")
+    return video_bytes
+
+
+def request_custom_video(
+    server_url: str,
+    image_bytes: bytes,
+    image_name: str,
+    trajectory_npz_bytes: bytes,
+    multiview_npz_bytes: bytes | None = None,
+    prompt: str = "",
+    resolution: str | None = None,
+    pose_scale: float = 1.0,
+    timeout: float = 1200.0,
+) -> bytes:
+    """POST a seed image + a caller-authored trajectory npz (and optional multiview
+    anchors npz) to ``/generate_custom`` and return raw mp4 bytes.
+
+    ``server_url`` is the base /generate endpoint; this swaps the final path segment
+    to ``/generate_custom``. Used by the gap-fill workflow (see nbv_trajectory.py).
+    """
+    if not server_url:
+        raise ValueError("server URL is empty")
+    if not image_bytes:
+        raise ValueError("no image bytes to send")
+    if not trajectory_npz_bytes:
+        raise ValueError("no trajectory npz to send")
+
+    url = _sibling_url(server_url, "generate_custom")
+    files = {
+        "image": (image_name or "image.png", image_bytes),
+        "trajectory_npz": ("trajectory.npz", trajectory_npz_bytes,
+                           "application/octet-stream"),
+    }
+    if multiview_npz_bytes:
+        files["multiview_npz"] = ("multiview.npz", multiview_npz_bytes,
+                                  "application/octet-stream")
+    data: dict[str, object] = {"pose_scale": pose_scale}
+    if prompt and prompt.strip():
+        data["prompt"] = prompt
+    if resolution:
+        data["resolution"] = resolution
+
+    resp = requests.post(url, files=files, data=data, timeout=timeout)
+    return _extract_video_bytes(resp, timeout)

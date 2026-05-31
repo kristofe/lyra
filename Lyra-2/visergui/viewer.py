@@ -2829,6 +2829,34 @@ class ViewerApp:
                      "for orbits). A built-in collision check can cap forward "
                      "motion, so larger values don't always push further.",
             )
+
+        # Gap-fill (next-best-view): generate the views BETWEEN an existing scene
+        # camera and the current viewer pose, in the splat world frame, then append
+        # them. Only meaningful once a scene exists. Uses /generate_custom with a
+        # lerp trajectory + splat-rendered anchors (see nbv_trajectory.py).
+        with self.server.gui.add_folder("Gap fill (next-best-view)"):
+            self.gui_demo_fill_start = self.server.gui.add_number(
+                "start camera idx",
+                initial_value=-1, min=-1, max=100000, step=1,
+                hint="Existing scene-camera index to start the move FROM. "
+                     "-1 = use the camera nearest the current viewer pose.",
+            )
+            self.gui_demo_fill_anchors = self.server.gui.add_number(
+                "anchor views",
+                initial_value=4, min=1, max=16, step=1,
+                hint="How many existing scene cameras (nearest the target) to "
+                     "render as scale-grounding anchors for generation.",
+            )
+            self.gui_demo_fill_btn = self.server.gui.add_button(
+                "Fill from viewer camera",
+                hint="Build an N-frame path (num_frames/strength above) from the "
+                     "start camera to the CURRENT viewer pose, generate the "
+                     "in-between views grounded by anchors, and append them.",
+            )
+            self.gui_demo_fill_status = self.server.gui.add_markdown(
+                "**gap-fill:** reconstruct a scene, aim the viewer at a thin spot, "
+                "then Fill."
+            )
             self.gui_demo_continue = self.server.gui.add_checkbox(
                 "continue from last clip",
                 initial_value=False,
@@ -2932,6 +2960,7 @@ class ViewerApp:
         # Action wiring.
         self.gui_demo_image_btn.on_upload(lambda _ev: self._on_demo_image_upload())
         self.gui_demo_request_btn.on_click(lambda _ev: self._on_demo_request_click())
+        self.gui_demo_fill_btn.on_click(lambda _ev: self._on_demo_fill_click())
         self.gui_demo_train_btn.on_click(lambda _ev: self._on_resume_training())
         self.gui_demo_pause_btn.on_click(lambda _ev: self._on_pause_training())
         self.gui_demo_reinit_btn.on_click(lambda _ev: self._on_demo_reinit_click())
@@ -3120,6 +3149,128 @@ class ViewerApp:
             self.gui_demo_request_btn.disabled = False
             self.gui_demo_reset_btn.disabled = False
             self.gui_demo_reinit_btn.disabled = False
+            self._trainer_op_lock.release()
+
+    def _on_demo_fill_click(self) -> None:
+        """Gap-fill (next-best-view): generate the views between an existing scene
+        camera and the CURRENT viewer pose (both in the splat world frame), then
+        append them. Builds a lerp trajectory + splat-rendered anchors and POSTs to
+        the server's /generate_custom; registration is the same append_video path."""
+        import io
+        import tempfile
+
+        import cv2
+        import numpy as np
+        import torch
+        import video_api
+        import nbv_trajectory as nbv
+
+        trainer = self._trainer_ref
+        if trainer is None or getattr(trainer, "data", None) is None \
+                or not bool(getattr(trainer, "_initialized", False)):
+            self.gui_demo_fill_status.content = "**gap-fill:** reconstruct a scene first."
+            return
+        if self._append_video_cb is None:
+            self.gui_demo_fill_status.content = "**gap-fill:** append-video callback missing."
+            return
+        clients = list(self.server.get_clients().values())
+        if not clients:
+            self.gui_demo_fill_status.content = "**gap-fill:** no connected viewer client."
+            return
+        cam = clients[0].camera
+
+        if not self._trainer_op_lock.acquire(blocking=False):
+            self.gui_demo_fill_status.content = "**gap-fill:** busy \u2014 another operation is running."
+            return
+        try:
+            self.gui_demo_fill_btn.disabled = True
+            self.gui_demo_request_btn.disabled = True
+            self._pause_training_quietly()
+
+            data = trainer.data
+            H, W = int(data.H), int(data.W)
+            device = data.w2c.device
+
+            target_w2c = torch.from_numpy(
+                viser_camera_to_opencv_viewmat(cam.position, cam.wxyz).astype(np.float32)
+            ).to(device)
+
+            start_idx = int(self.gui_demo_fill_start.value)
+            if start_idx < 0 or start_idx >= data.N:
+                start_idx = nbv.nearest_cameras(data, target_w2c, 1)[0]
+            start_w2c = data.w2c[start_idx].to(torch.float32)
+            K = data.K[start_idx].to(torch.float32)
+
+            n_frames = int(self.gui_demo_num_frames.value)
+            n_anchors = int(self.gui_demo_fill_anchors.value)
+            prompt = str(self.gui_demo_prompt.value).strip()
+            resolution = str(self.gui_demo_resolution.value)
+
+            self.gui_demo_fill_status.content = (
+                f"**gap-fill:** building {n_frames}-frame path from cam {start_idx} \u2192 viewer\u2026"
+            )
+            traj_payload = nbv.build_lerp_trajectory(start_w2c, target_w2c, K, n_frames, H, W)
+
+            with self.scene.read() as s:
+                if s.num_splats == 0 or s.means is None:
+                    self.gui_demo_fill_status.content = "**gap-fill:** scene is empty."
+                    return
+                seed_rgb = nbv.render_seed_image(s, start_w2c, K, H, W)
+                anchor_idxs = nbv.nearest_cameras(data, target_w2c, n_anchors, include=[start_idx])
+                anchor_w2c = data.w2c[anchor_idxs].to(torch.float32)
+                anchor_K = data.K[anchor_idxs].to(torch.float32)
+                mv_payload = nbv.render_anchor_views(s, anchor_w2c, anchor_K, H, W)
+
+            ok, seed_buf = cv2.imencode(".png", cv2.cvtColor(seed_rgb, cv2.COLOR_RGB2BGR))
+            if not ok:
+                raise RuntimeError("failed to encode seed image")
+            tb = io.BytesIO(); np.savez(tb, **{
+                "w2c": traj_payload["w2c"], "intrinsics": traj_payload["intrinsics"],
+                "image_height": traj_payload["image_height"],
+                "image_width": traj_payload["image_width"]})
+            mb = io.BytesIO(); np.savez(mb, **{
+                "video": mv_payload["video"], "depth": mv_payload["depth"],
+                "camera_w2c": mv_payload["camera_w2c"],
+                "intrinsics": mv_payload["intrinsics"],
+                "image_height": mv_payload["image_height"],
+                "image_width": mv_payload["image_width"]})
+
+            self.gui_demo_fill_status.content = "**gap-fill:** generating views (server)\u2026"
+            video_bytes = video_api.request_custom_video(
+                str(self.gui_demo_server.value),
+                seed_buf.tobytes(), "seed.png",
+                trajectory_npz_bytes=tb.getvalue(),
+                multiview_npz_bytes=mb.getvalue(),
+                prompt=prompt, resolution=resolution,
+            )
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            tmp.write(video_bytes); tmp.close()
+
+            self.gui_demo_fill_status.content = "**gap-fill:** appending generated views (DA3)\u2026"
+            self._append_video_cb(tmp.name, int(self.gui_init_max_frames.value), True)
+
+            freeze_on = bool(self.gui_demo_freeze.value)
+            if self._set_freeze_mode_cb is not None:
+                self._set_freeze_mode_cb("new_frustums" if freeze_on else "off")
+            if freeze_on and self._recompute_freeze_mask_cb is not None:
+                self._recompute_freeze_mask_cb()
+            if bool(self.gui_demo_autotrain.value):
+                self._on_resume_training()
+
+            self._demo_count += 1
+            self.gui_demo_count.content = f"**videos processed:** {self._demo_count}"
+            self.gui_demo_fill_status.content = (
+                f"**gap-fill:** done from cam {start_idx} "
+                f"({self.scene.num_splats:,} splats)."
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.gui_demo_fill_status.content = f"**gap-fill:** error \u2014 {type(e).__name__}: {e}"
+        finally:
+            self.gui_demo_fill_btn.disabled = False
+            self.gui_demo_request_btn.disabled = False
             self._trainer_op_lock.release()
 
     def _on_demo_reset_click(self) -> None:

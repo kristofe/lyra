@@ -66,6 +66,9 @@ from lyra_2._src.inference.lyra2_zoomgs_inference import (
     _fit_ground_normal_from_depth,
     _generate_one_direction,
 )
+# Custom-trajectory path reuses the AR sampler + the npz loader directly.
+from lyra_2._src.inference.lyra2_ar_inference import run_lyra2_sample, safe_to
+from lyra_2._src.inference.lyra2_custom_traj_inference import load_trajectory
 from lyra_2._src.inference.camera_traj_utils import CAMERA_TRAJECTORY_CHOICES
 
 # Camera-move directions the trajectory builder accepts.
@@ -199,6 +202,8 @@ def build_default_args(server_args: argparse.Namespace) -> argparse.Namespace:
         disable_cache_update=False,
         multiview_ids=None,
         offload_da3_diffusion=False,
+        # Custom-trajectory controls (used by /generate_custom).
+        pose_scale=1.0,
     )
     _apply_dmd_defaults(a)
     return a
@@ -443,6 +448,198 @@ def run_single(
     return video_path, last_frame_path
 
 
+def _prepare_seed_depth_t5(ctx: dict, args: argparse.Namespace, image_path: str,
+                           prompt: str, target_h: int, target_w: int):
+    """Shared seed prep: read image → DA3 depth (+optional MoGe align) → T5 embeds.
+
+    Returns (img_bchw, depth_hw, K_33, mask_hw, t5, neg_t5). Mirrors the per-image
+    head of both the zoomgs and custom-traj CLIs so the server reuses one path.
+    """
+    model = ctx["model"]
+    da3_model = ctx["da3_model"]
+    moge_model = ctx["moge_model"]
+    negative_prompt_data = ctx["negative_prompt_data"]
+    desired_device = ctx["desired_device"]
+    desired_dtype = ctx["desired_dtype"]
+
+    bgr = cv2.imread(image_path)
+    if bgr is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    rgb_t = torch.from_numpy(rgb)
+
+    log.info("Running DA3 single-image depth...", rank0_only=True)
+    image_chw01, depth_hw, K_33, mask_hw = _da3_infer_depth_intrinsics_single(
+        da3_model=da3_model, img_rgb_uint8=rgb_t, target_hw=(target_h, target_w),
+    )
+
+    if args.use_moge_scale and moge_model is not None:
+        log.info("Aligning DA3 depth to MoGe scale...", rank0_only=True)
+        from lyra_2._src.inference.depth_utils import moge_infer_depth_intrinsics
+        moge_model.to(desired_device)
+        with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH]):
+            _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
+                moge_model, rgb_t, depth_pred_hw=(target_h, target_w),
+                target_hw=(target_h, target_w),
+            )
+        da3_d = depth_hw.to(moge_depth_hw.device)
+        da3_m = mask_hw.to(moge_mask_hw.device)
+        valid_mask = (da3_m > 0.5) & (moge_mask_hw > 0.5)
+        if valid_mask.sum() > 10:
+            inv_da3 = 1.0 / (da3_d[valid_mask] + 1e-6)
+            inv_moge = 1.0 / (moge_depth_hw[valid_mask] + 1e-6)
+            denominator = (inv_da3 * inv_da3).sum()
+            if denominator > 1e-8:
+                scale = (inv_da3 * inv_moge).sum() / denominator
+                if scale > 1e-6:
+                    depth_hw = depth_hw / scale.to(depth_hw.device)
+        moge_model.cpu()
+        del moge_depth_hw, moge_mask_hw, da3_d, da3_m
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0  # [-1,1]
+
+    caption = prompt.strip() if prompt and prompt.strip() else "a high quality scenic photo"
+    log.info(f"Using prompt: {caption}", rank0_only=True)
+    if args.prompt_suffix:
+        caption = caption.rstrip() + " " + args.prompt_suffix
+    from lyra_2._src.inference.get_t5_emb import get_umt5_embedding, get_umt5_embedding_offloaded
+    if args.offload_when_prompt:
+        t5 = get_umt5_embedding_offloaded(caption, device=desired_device).to(dtype=desired_dtype)
+    else:
+        t5 = get_umt5_embedding(caption, device=desired_device).to(dtype=desired_dtype)
+    if t5.dim() == 2:
+        t5 = t5.unsqueeze(0)
+    elif t5.dim() == 3 and t5.shape[0] != 1:
+        t5 = t5[:1]
+    neg_t5 = misc.to(negative_prompt_data["t5_text_embeddings"], **model.tensor_kwargs)
+    return img_bchw, depth_hw, K_33, mask_hw, t5, neg_t5
+
+
+# ---------------------------------------------------------------------------
+# Custom-trajectory generation — caller supplies per-frame w2c/intrinsics (npz)
+# in the splat world frame, plus optional multiview anchors (rendered from the
+# splats) that ground generation in that world scale. Mirrors the per-image body
+# of lyra2_custom_traj_inference using the already-loaded model + DA3.
+# Returns (mp4_path, last_frame_png_path).
+# ---------------------------------------------------------------------------
+def run_custom(
+    ctx: dict,
+    args: argparse.Namespace,
+    image_path: str,
+    prompt: str,
+    trajectory_npz_path: str,
+    output_path: str,
+    multiview_npz_path: Optional[str] = None,
+) -> tuple[str, str]:
+    model = ctx["model"]
+    da3_model = ctx["da3_model"]
+    desired_device = ctx["desired_device"]
+    desired_dtype = ctx["desired_dtype"]
+    process_group = None
+
+    target_h, target_w = [int(x) for x in args.resolution.split(",")]
+
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    videos_dir = os.path.join(output_path, "videos")
+    os.makedirs(videos_dir, exist_ok=True)
+    video_path = os.path.join(videos_dir, f"{base_name}.mp4")
+    last_frame_path = os.path.join(videos_dir, f"{base_name}_last.png")
+
+    misc.set_random_seed(seed=args.seed, by_rank=True)
+
+    # Load the authored trajectory (w2c, intrinsics) at the target resolution.
+    w2cs_T_44, Ks_T_33 = load_trajectory(
+        trajectory_npz_path, args.num_frames,
+        target_hw=(target_h, target_w), pose_scale=args.pose_scale,
+    )
+    N = int(w2cs_T_44.shape[0])
+    log.info(f"=== GENERATE custom traj (N={N}, pose_scale={args.pose_scale}) ===",
+             rank0_only=True)
+
+    img_bchw, depth_hw, _K_da3, _mask, t5, neg_t5 = _prepare_seed_depth_t5(
+        ctx, args, image_path, prompt, target_h, target_w,
+    )
+    H, W = img_bchw.shape[-2:]
+
+    w2cs_b_t_44 = w2cs_T_44.unsqueeze(0).to(dtype=torch.float32, device=desired_device)
+    Ks_b_t_33 = Ks_T_33.unsqueeze(0).to(dtype=torch.float32, device=desired_device)
+    depth_b_thw = depth_hw.unsqueeze(0).unsqueeze(0).repeat(1, N, 1, 1).to(device=desired_device)
+
+    data_batch = {
+        "video": img_bchw.unsqueeze(2),
+        "t5_text_embeddings": t5,
+        "neg_t5_text_embeddings": neg_t5,
+        "fps": torch.tensor([args.fps], dtype=torch.int32, device=desired_device),
+        "padding_mask": torch.zeros((1, 1, H, W), dtype=model.tensor_kwargs["dtype"], device=desired_device),
+        "is_preprocessed": torch.tensor([True], dtype=torch.bool, device=desired_device),
+        "camera_w2c": w2cs_b_t_44,
+        "intrinsics": Ks_b_t_33,
+        "depth": depth_b_thw,
+    }
+
+    # Optional multiview anchors (same schema/handling as the custom-traj CLI).
+    if multiview_npz_path is not None and os.path.isfile(multiview_npz_path):
+        mv = np.load(multiview_npz_path)
+        mv_video = torch.from_numpy(mv["video"]).to(device=desired_device, dtype=desired_dtype)
+        mv_depth = torch.from_numpy(mv["depth"]).to(device=desired_device, dtype=torch.float32)
+        mv_w2c = torch.from_numpy(mv["camera_w2c"]).to(device=desired_device, dtype=torch.float32)
+        mv_K = torch.from_numpy(mv["intrinsics"]).to(device=desired_device, dtype=torch.float32)
+        K_anchors = mv_video.shape[2]
+        if "image_height" in mv.files and "image_width" in mv.files:
+            orig_h, orig_w = int(mv["image_height"]), int(mv["image_width"])
+            if (orig_h, orig_w) != (target_h, target_w):
+                sx, sy = target_w / orig_w, target_h / orig_h
+                mv_K = mv_K.clone()
+                mv_K[:, :, 0, :] *= sx
+                mv_K[:, :, 1, :] *= sy
+        data_batch["multiview_video"] = mv_video
+        data_batch["multiview_depth"] = mv_depth
+        data_batch["multiview_camera_w2c"] = mv_w2c
+        data_batch["multiview_intrinsics"] = mv_K
+        args.multiview_ids = list(range(K_anchors))
+        log.info(f"Loaded {K_anchors} multiview anchors.", rank0_only=True)
+
+    data_batch = safe_to(
+        data_batch,
+        device=model.tensor_kwargs.get("device", None),
+        dtype=model.tensor_kwargs.get("dtype", None),
+        skip_keys={"camera_w2c", "intrinsics", "depth",
+                   "multiview_camera_w2c", "multiview_intrinsics", "multiview_depth"},
+    )
+
+    saved_num_frames = args.num_frames
+    args.num_frames = N
+    try:
+        result = run_lyra2_sample(
+            model, data_batch, args, process_group=process_group,
+            da3_model=da3_model, show_progress=True, log_prefix=base_name,
+        )
+    finally:
+        args.num_frames = saved_num_frames
+
+    if result is None:
+        raise RuntimeError(f"Custom-trajectory generation failed for {image_path}")
+
+    video01 = (result["video"][0].clamp(-1, 1) * 0.5 + 0.5).float().cpu()  # [C,T,H,W]
+    save_img_or_video(video01, video_path.replace(".mp4", ""), fps=args.fps)
+    log.info(f"Saved video ({video01.shape[1]} frames): {video_path}", rank0_only=True)
+
+    last_rgb = (video01[:, -1].permute(1, 2, 0).numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+    cv2.imwrite(last_frame_path, cv2.cvtColor(last_rgb, cv2.COLOR_RGB2BGR))
+    log.info(f"Saved last frame: {last_frame_path}", rank0_only=True)
+
+    del video01, data_batch, result
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"Expected output not found: {video_path}")
+    return video_path, last_frame_path
+
+
 # ===========================================================================
 # HTTP server (FastAPI)
 # ===========================================================================
@@ -572,6 +769,112 @@ async def generate(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # noqa: BLE001 - surface a clean error, keep server up
         log.error(f"Generation failed for job {job_id}: {e}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    JOBS[job_id] = {"video": mp4_path, "last_frame": last_frame_path}
+    return FileResponse(
+        mp4_path, media_type="video/mp4", filename=f"{job_id}.mp4",
+        headers={"X-Job-Id": job_id},
+    )
+
+
+@app.post("/generate_custom")
+async def generate_custom(
+    image: UploadFile = File(...),
+    trajectory_npz: UploadFile = File(...),
+    multiview_npz: Optional[UploadFile] = File(None),
+    prompt: str = Form(""),
+    resolution: str = Form(DEFAULT_RESOLUTION),
+    pose_scale: float = Form(1.0),
+    fps: int = Form(16),
+    seed: int = Form(1),
+):
+    """Generate a video along a CALLER-SUPPLIED camera trajectory (npz of w2c +
+    intrinsics, in the splat world frame), optionally grounded by multiview anchors.
+
+    Used by the gap-fill workflow: author N lerp poses from an existing scene camera
+    to a new viewpoint, render a few scene views as anchors, and synthesize the
+    in-between views. Returns the mp4 + an ``X-Job-Id`` (see ``/last_frame``).
+    """
+    if STATE["ctx"] is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+    try:
+        res = resolve_resolution(resolution)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    img_data = await image.read()
+    if not img_data:
+        raise HTTPException(status_code=400, detail="Empty image upload.")
+    traj_data = await trajectory_npz.read()
+    if not traj_data:
+        raise HTTPException(status_code=400, detail="Empty trajectory_npz upload.")
+    mv_data = await multiview_npz.read() if multiview_npz is not None else None
+
+    job_id = uuid.uuid4().hex[:12]
+    server_args = STATE["server_args"]
+    job_dir = os.path.join(server_args.output_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    if cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR) is None:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Could not decode uploaded image.")
+    suffix = os.path.splitext(image.filename or "")[1].lower()
+    if suffix not in (".png", ".jpg", ".jpeg"):
+        suffix = ".png"
+    image_path = os.path.join(job_dir, f"input{suffix}")
+    with open(image_path, "wb") as f:
+        f.write(img_data)
+
+    traj_path = os.path.join(job_dir, "trajectory.npz")
+    with open(traj_path, "wb") as f:
+        f.write(traj_data)
+
+    # Validate trajectory npz: required keys + frame count 1+80k.
+    try:
+        tnpz = np.load(traj_path)
+        if "w2c" not in tnpz.files or "intrinsics" not in tnpz.files:
+            raise ValueError("trajectory_npz must contain 'w2c' and 'intrinsics'.")
+        n_traj = int(tnpz["w2c"].shape[0])
+        validate_num_frames(n_traj, "trajectory length")
+    except ValueError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Bad trajectory_npz: {e}")
+
+    mv_path = None
+    if mv_data:
+        mv_path = os.path.join(job_dir, "multiview.npz")
+        with open(mv_path, "wb") as f:
+            f.write(mv_data)
+
+    req_args = argparse.Namespace(**vars(STATE["args"]))
+    req_args.resolution = res
+    req_args.num_frames = n_traj
+    req_args.pose_scale = float(pose_scale)
+    req_args.fps = int(fps)
+    req_args.seed = int(seed)
+    req_args.multiview_ids = None  # set inside run_custom when anchors are present
+
+    import anyio
+
+    def _job():
+        with GPU_LOCK:
+            return run_custom(STATE["ctx"], req_args, image_path, prompt,
+                              traj_path, job_dir, multiview_npz_path=mv_path)
+
+    try:
+        mp4_path, last_frame_path = await anyio.to_thread.run_sync(_job)
+    except ValueError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        import traceback as _tb
+        log.error(f"Custom generation failed for job {job_id}: {e}\n{_tb.format_exc()}")
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
