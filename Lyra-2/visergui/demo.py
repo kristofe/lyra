@@ -141,12 +141,14 @@ class DemoApp:
         tabs = self.server.gui.add_tab_group()
         with tabs.add_tab("Demo"):
             with self.server.gui.add_folder("Generate (remote server)"):
-                self.gui_server = self.server.gui.add_text(
-                    "server_url", initial_value=str(d.get("server_url", "")),
-                )
-                self.gui_token = self.server.gui.add_text(
-                    "token", initial_value=str(d.get("token", "")),
-                )
+                # Connection settings rarely change — keep them tucked away collapsed.
+                with self.server.gui.add_folder("Connection", expand_by_default=False):
+                    self.gui_server = self.server.gui.add_text(
+                        "server_url", initial_value=str(d.get("server_url", "")),
+                    )
+                    self.gui_token = self.server.gui.add_text(
+                        "token", initial_value=str(d.get("token", "")),
+                    )
                 self.gui_session = self.server.gui.add_markdown("**session:** none")
                 self.gui_prompt = self.server.gui.add_text(
                     "prompt", initial_value=str(d.get("prompt", "")),
@@ -218,6 +220,17 @@ class DemoApp:
                          "so they overlap heavily — raise this (3–5) to merge the "
                          "duplicates instead of stacking millions of splats.",
                 )
+                self.gui_scale_clamp = self.server.gui.add_number(
+                    "max splat scale (× init voxel)",
+                    initial_value=float(d.get("scale_clamp", 2.0)),
+                    min=0.5, max=100_000.0, step=0.5,
+                    hint="Caps each gaussian's per-axis size at this many init-"
+                         "voxels, every training step (2DGS mode ignores it). The "
+                         "default 2.0 keeps splats tight; raise it (10s–1000s) to "
+                         "let splats grow big and cover more per gaussian. A huge "
+                         "value is effectively unclamped. Live — takes effect on "
+                         "the next step.",
+                )
                 self.gui_conf_q = self.server.gui.add_slider(
                     "confidence_quantile", min=0.0, max=0.95, step=0.05,
                     initial_value=float(d.get("confidence_quantile", 0.6)),
@@ -254,6 +267,42 @@ class DemoApp:
                 self.gui_prune_btn = self.server.gui.add_button(
                     "Prune splats", icon=viser.Icon.FILTER,
                 )
+                with self.server.gui.add_folder("Prune settings",
+                                                expand_by_default=False):
+                    self.gui_prune_opa = self.server.gui.add_slider(
+                        "min opacity", min=0.0, max=1.0, step=0.01,
+                        initial_value=float(d.get("prune_opa_min", 0.05)),
+                        hint="Remove splats with opacity below this.",
+                    )
+                    self.gui_prune_scale = self.server.gui.add_slider(
+                        "max scale (× scene)", min=0.01, max=2.0, step=0.01,
+                        initial_value=float(d.get("prune_scale_max_frac", 0.10)),
+                        hint="Remove splats whose largest axis exceeds this "
+                             "fraction of the scene scale (kills giant blobs).",
+                    )
+                    self.gui_prune_aniso = self.server.gui.add_number(
+                        "max anisotropy", min=1.0, max=200.0, step=1.0,
+                        initial_value=float(d.get("prune_aniso_max", 10.0)),
+                        hint="Remove needle/disk splats whose long:short axis "
+                             "ratio exceeds this.",
+                    )
+                    self.gui_prune_knn = self.server.gui.add_checkbox(
+                        "KNN floater removal",
+                        initial_value=bool(d.get("prune_use_knn", True)),
+                        hint="Drop isolated floaters (mean-neighbor-distance "
+                             "outliers). Needs scipy.",
+                    )
+                    self.gui_prune_knn_k = self.server.gui.add_number(
+                        "KNN neighbors (k)", min=4, max=100, step=1,
+                        initial_value=int(d.get("prune_knn_k", 20)),
+                    )
+                    self.gui_prune_knn_std = self.server.gui.add_slider(
+                        "KNN std threshold", min=0.5, max=6.0, step=0.1,
+                        initial_value=float(d.get("prune_knn_std", 2.0)),
+                        hint="A splat is a floater if its mean neighbor distance "
+                             "is more than this many std-devs above the mean. "
+                             "Lower = more aggressive.",
+                    )
                 self.gui_reset_btn = self.server.gui.add_button("Reset")
                 self.gui_train_status = self.server.gui.add_markdown(
                     "**status:** stopped"
@@ -289,6 +338,10 @@ class DemoApp:
         self.gui_cam_scale.on_update(lambda _e: self._publish_cams())
         self.gui_seed_dedup.on_update(lambda _e: self._apply_splat_budget())
         self.gui_max_points.on_update(lambda _e: self._apply_splat_budget())
+        self.gui_scale_clamp.on_update(lambda _e: self._apply_splat_budget())
+        # lpips/void are read by the trainer every step → push them live.
+        self.gui_lpips_weight.on_update(lambda _e: self._apply_live_loss_weights())
+        self.gui_void_weight.on_update(lambda _e: self._apply_live_loss_weights())
         # Push the GUI defaults into the trainer up front so the first clip already
         # uses the chosen dedup radius / point cap (not the trainer's bare defaults).
         self._apply_splat_budget()
@@ -445,7 +498,14 @@ class DemoApp:
             self.gui_prune_btn.disabled = True
             self._on_pause_training()
             self.gui_status.content = "**demo:** pruning…"
-            counts = t.prune_splats()   # publishes to the scene → pump re-renders
+            counts = t.prune_splats(    # publishes to the scene → pump re-renders
+                opa_min=float(self.gui_prune_opa.value),
+                scale_max_frac=float(self.gui_prune_scale.value),
+                aniso_max=float(self.gui_prune_aniso.value),
+                use_knn=bool(self.gui_prune_knn.value),
+                knn_k=int(self.gui_prune_knn_k.value),
+                knn_std=float(self.gui_prune_knn_std.value),
+            )
             self._snap_home_to_scene()
             parts = [f"{k}={counts[k]}" for k in ("opacity", "scale", "aniso", "knn")
                      if k in counts and counts[k] >= 0]
@@ -594,12 +654,27 @@ class DemoApp:
         return tmp.name
 
     def _apply_splat_budget(self) -> None:
-        """Push the dedup-radius + max-points controls into the trainer. Both are
-        read at init/append time, so setting them before a Request takes effect on
-        the next clip. Keeps the splat count from ballooning across appended clips."""
+        """Push the dedup-radius, max-points, and scale-clamp controls into the
+        trainer. dedup/max-points are read at init/append time; the scale clamp is
+        read every training step. Setting them here takes effect on the next clip /
+        step. Keeps the splat count + per-splat size in check."""
         try:
             self.trainer.set_seed_dedup_multiplier(float(self.gui_seed_dedup.value))
             self.trainer.max_points = int(self.gui_max_points.value)
+            self.trainer.set_scale_clamp(float(self.gui_scale_clamp.value))
+        except Exception:
+            pass
+
+    def _apply_live_loss_weights(self) -> None:
+        """Push lpips_weight + void_weight straight into the trainer. step() reads
+        both every iteration, so a change here takes effect mid-training on the next
+        step (lpips lazily loads its net the first time the weight goes > 0). The
+        other Reconstruction settings (max_frames, confidence, remove_sky, sh_max_deg,
+        densify, mode) shape preprocessing/init structure and only apply on the next
+        Initialize / Request — not live."""
+        try:
+            self.trainer.lpips_weight = float(self.gui_lpips_weight.value)
+            self.trainer.void_weight = float(self.gui_void_weight.value)
         except Exception:
             pass
 
@@ -898,6 +973,7 @@ def main() -> None:
             max_frames=args.max_frames,
             max_points=args.max_points,
             seed_dedup=args.seed_dedup,
+            scale_clamp=args.max_scale_voxels,
             confidence_quantile=args.confidence_quantile,
             remove_sky=bool(args.remove_sky),
             sh_max_deg=args.sh_max_deg,

@@ -330,9 +330,17 @@ heavily; without dedup the appended splats stack into millions. Two knobs (in th
 |---|---|---|
 | **max_points (per-clip cap)** | `1,000,000` | Hard cap on splats added per clip — the init subsamples to this, and each appended clip seeds at most this many candidates. Caps the *trained* voxel init too (not just the unused v0 ply). Lower to bound the total. |
 | **seed dedup radius (× init voxel)** | `3.0` | A new splat is dropped if an existing one is within this many init-voxels. **Raise to 4–5** to merge the overlapping sequence clips instead of stacking duplicates. |
+| **max splat scale (× init voxel)** | `2.0` | Caps each gaussian's per-axis size, every training step (2DGS ignores it). Default 2.0 keeps splats tight; raise it (10s–1000s, range up to 100000) to let splats grow big — a huge value is effectively unclamped. Live. |
 
 Plus the usual init settings: `max_frames`, `confidence_quantile`, `remove_sky`,
 `sh_max_deg`, `lpips_weight`, `void_weight`, `densify`, `mode` (3dgs/2dgs).
+
+**Live vs. init-time:** `lpips_weight`, `void_weight`, **max splat scale**, and the
+two budget knobs apply **live** — the trainer reads them every step, so dragging them
+mid-training takes effect on the next step (lpips lazily loads its net the first time
+its weight goes above 0). The rest (`max_frames`, `confidence_quantile`, `remove_sky`,
+`sh_max_deg`, `densify`, `mode`) shape preprocessing / init structure, so they only
+take effect on the **next Initialize / Request**, not on a run already in progress.
 
 ### Other controls
 
@@ -341,7 +349,9 @@ Plus the usual init settings: `max_frames`, `confidence_quantile`, `remove_sky`,
   changing reconstruction settings or to recover from a bad append.
 - **Training** folder — **Train**, **Pause**, **Prune splats** (drop floater / spiky
   / oversized splats and report before→after counts), **Reset** (clear splats +
-  cameras and end the server session).
+  cameras and end the server session). A collapsed **Prune settings** sub-folder
+  exposes the thresholds: min opacity, max scale (× scene), max anisotropy, and KNN
+  floater removal (k + std threshold).
 - **View** folder — show cameras, camera size, max render res, Reset camera.
 
 ### CLI flags
@@ -354,6 +364,7 @@ Plus the usual init settings: `max_frames`, `confidence_quantile`, `remove_sky`,
 | `--demo-resolution` / `--demo-trajectory` / `--demo-direction` / `--demo-num-frames` / `--demo-strength` | `240p` / `horizontal_zoom` / `right` / `81` / `0.5` | Camera-move defaults. |
 | `--max-points` | `1,000,000` | Per-clip splat cap (see above). |
 | `--seed-dedup` | `3.0` | Seed dedup radius in init-voxel units. |
+| `--max-scale-voxels` | `2.0` | Initial max splat scale (× init voxel); live-adjustable in the GUI up to 100000. |
 | `--max-frames` / `--confidence-quantile` / `--remove-sky` / `--sh-max-deg` / `--lpips-weight` / `--void-weight` / `--densify` / `--mode` | as Train tab | Reconstruction defaults. |
 | `--port` / `--host` / `--out-dir` | `8080` / `0.0.0.0` / `vipe_outputs` | Server bind + output root. |
 
