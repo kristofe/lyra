@@ -11,9 +11,12 @@ Two pieces:
 | Piece | File | Role |
 |---|---|---|
 | **Server** | [`lyra_2/_src/inference/demo_server.py`](lyra_2/_src/inference/demo_server.py) | Loads the model **once**, serves `POST /generate` (image → mp4). Reuses the leaf helpers of `lyra2_zoomgs_inference.py`. |
-| **GUI client** | [`visergui/`](visergui/) (`train_and_view.py`, `viewer.py`, `video_api.py`) | The **Demo tab** POSTs the image + options to the server and runs the returned video through init/append. |
+| **GUI client** | [`visergui/`](visergui/) (`train_and_view.py`, `viewer.py`, `video_api.py`) | The full viewer's **Demo tab** POSTs the image + options to the server and runs the returned video through init/append. |
+| **Slim Demo viewer** | [`visergui/demo.py`](visergui/demo.py) | A stripped-down standalone app: **just** splat rendering + a Demo tab, talking **only** to the *remote* session server (`/sequence/generate`). See [§3](#3-slim-standalone-demo-viewer-viserguidemopy). |
 
-You can use the server on its own (curl / scripts) and add the GUI later.
+You can use the server on its own (curl / scripts) and add the GUI later. If you only
+want the remote-server demo (no local `demo_server`), skip straight to
+[§3 — the slim `demo.py` viewer](#3-slim-standalone-demo-viewer-viserguidemopy).
 
 ---
 
@@ -233,10 +236,130 @@ Boot-time defaults for the Demo tab's camera controls:
 | `--demo-direction` | `right` |
 | `--demo-num-frames` | `81` |
 | `--demo-strength` | `0.5` |
+| `--demo-backend` | `local` (`local` or `sequence`) |
+| `--demo-token` | `$LYRA_DEMO_TOKEN`, else `lai_server/lyra_token.txt` |
+| `--demo-sequence-url` | the Lightning cloudspace URL (pre-fills the URL field when backend=sequence) |
+
+### Backend switch: local vs. a collaborator's "sequence" server
+
+The Demo→**Generate** folder has a **backend** dropdown:
+
+- **local** — our `demo_server` `/generate` (the default; everything above).
+- **sequence** — a collaborator's session-based server: `POST <url>/sequence/generate`
+  with `Authorization: Bearer <token>` and **server-side scene continuity**. The GUI
+  synthesizes a trajectory `.npz` from the same camera controls (trajectory /
+  direction / num_frames / strength) and sends it as a file part. The **first**
+  Request also sends the uploaded image and captures the server's `X-Session-Id`
+  (shown in the **session** line); **subsequent** Requests send only the `session_id`
+  + a new trajectory, so the camera continues the same scene server-side. **Reset**
+  ends the session (next Request starts a fresh one).
+
+  The server URL and bearer token are pre-filled by default (URL = the Lightning
+  cloudspace; token = `lai_server/lyra_token.txt`), so usually you just switch
+  **backend → sequence** and Request. Override with `--demo-sequence-url` /
+  `--demo-token` if they change. The trajectory npz uses the lyra custom-traj schema
+  (`w2c (N,4,4)`, `intrinsics (N,3,3)`, `image_height`, `image_width`).
+
+  > **Note — Lightning URL needs the port prefix.** The reachable host is
+  > `https://8000-<id>.cloudspaces.litng.ai` (the `8000-` prefix routes to the app's
+  > port). The bare `https://<id>.cloudspaces.litng.ai` returns a plain `404 page not
+  > found` from the gateway. Verified live: `GET /health` → `{"status":"ready"}`, and
+  > a gen0 (new session) → gen1 (continue, no image) pair returns mp4s with a growing
+  > `X-Cache-Entries` (spatial memory accumulating).
+
+> The returned clips are appended into the local splat scene exactly like the local
+> backend (first = init, later = incremental append).
 
 ---
 
-## 3. Test the GUI without the GPU (mock server)
+## 3. Slim standalone Demo viewer (`visergui/demo.py`)
+
+[`visergui/demo.py`](visergui/demo.py) is a **simpler, self-contained** alternative to
+the full `train_and_view.py` + `viewer.py` for the demo workflow. It keeps only:
+
+1. **Splat rendering** — a live viser viewport of the reconstructed gaussians (it
+   reuses the proven `SceneState` + `Renderer` from `viewer.py`).
+2. **A single Demo tab** — generate clips from the **remote session server**, turn
+   them into splats, and (optionally) train.
+
+It talks to **one** backend only: the collaborator's `/sequence/generate` server
+(Bearer token, server-side scene continuity). It does **not** use the local
+`demo_server`, and it does **not** build the Train / Mesh / Inpaint / Incremental
+tabs. Use it when you just want *image → remote video → splats* with minimal UI.
+
+### Run it (in the `splat` env)
+
+`demo.py` is a viewer/trainer client — it runs in the **`splat`** conda env (the same
+env as `viewer.py`/`train_and_view.py`), **not** `lyra2`. The model lives on the
+remote server; nothing heavy loads locally except DA3 for reconstruction.
+
+```bash
+cd /path/to/Lyra-2
+conda run -n splat python visergui/demo.py \
+  --demo-sequence-url https://8000-<id>.cloudspaces.litng.ai \
+  --port 8080
+# then open http://localhost:8080  (ssh -L 8080:localhost:8080 ... if remote)
+```
+
+The server URL and Bearer token are pre-filled (URL = the Lightning cloudspace;
+token = `$LYRA_DEMO_TOKEN`, else `lai_server/lyra_token.txt`). The same **port-prefix
+gotcha** applies — the reachable host is `https://8000-<id>.cloudspaces.litng.ai`
+(see the note in [§2](#backend-switch-local-vs-a-collaborators-sequence-server)).
+
+### Workflow
+
+1. **Generate** folder — server URL + token are pre-filled; set an optional prompt,
+   then either **Upload image** (from your browser) or **Choose image…** (a popup
+   gallery of every `.jpg`/`.png` in `assets/ours/`, configurable via `--assets-dir`).
+2. **Camera trajectory** folder — pick **resolution** (480p/360p/320p/240p — this
+   sets the generated video's H×W), **trajectory** (any of the 27 camera moves),
+   **direction**, **num_frames** (`1 + 80k`), **strength**.
+3. Click **Request video**. A clip comes back from the server and is turned into
+   splats **automatically**: the **first** clip runs DA3 pose + init; each **later**
+   clip is **appended** (it continues the same server session). Nothing trains
+   automatically. Repeat Request to chain more clips.
+4. Click **Train** when you want to optimize (or tick *auto-train after each clip*).
+
+### Reconstruction controls — keeping the splat count sane
+
+The sequence server's clips all branch from the same start point, so they overlap
+heavily; without dedup the appended splats stack into millions. Two knobs (in the
+**Reconstruction** folder, live-adjustable, applied to both init and append):
+
+| Control | Default | Effect |
+|---|---|---|
+| **max_points (per-clip cap)** | `1,000,000` | Hard cap on splats added per clip — the init subsamples to this, and each appended clip seeds at most this many candidates. Caps the *trained* voxel init too (not just the unused v0 ply). Lower to bound the total. |
+| **seed dedup radius (× init voxel)** | `3.0` | A new splat is dropped if an existing one is within this many init-voxels. **Raise to 4–5** to merge the overlapping sequence clips instead of stacking duplicates. |
+
+Plus the usual init settings: `max_frames`, `confidence_quantile`, `remove_sky`,
+`sh_max_deg`, `lpips_weight`, `void_weight`, `densify`, `mode` (3dgs/2dgs).
+
+### Other controls
+
+- **Initialize from downloaded clips** (Reconstruction) — a clean **rebuild** from
+  every clip downloaded so far (init the first, append the rest). Handy after
+  changing reconstruction settings or to recover from a bad append.
+- **Training** folder — **Train**, **Pause**, **Prune splats** (drop floater / spiky
+  / oversized splats and report before→after counts), **Reset** (clear splats +
+  cameras and end the server session).
+- **View** folder — show cameras, camera size, max render res, Reset camera.
+
+### CLI flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--demo-sequence-url` | the Lightning cloudspace URL | Remote server base (or full `/sequence/generate`). |
+| `--demo-token` | `$LYRA_DEMO_TOKEN`, else `lai_server/lyra_token.txt` | Bearer token. |
+| `--assets-dir` | `<repo>/assets/ours` | Folder the **Choose image…** picker scans. |
+| `--demo-resolution` / `--demo-trajectory` / `--demo-direction` / `--demo-num-frames` / `--demo-strength` | `240p` / `horizontal_zoom` / `right` / `81` / `0.5` | Camera-move defaults. |
+| `--max-points` | `1,000,000` | Per-clip splat cap (see above). |
+| `--seed-dedup` | `3.0` | Seed dedup radius in init-voxel units. |
+| `--max-frames` / `--confidence-quantile` / `--remove-sky` / `--sh-max-deg` / `--lpips-weight` / `--void-weight` / `--densify` / `--mode` | as Train tab | Reconstruction defaults. |
+| `--port` / `--host` / `--out-dir` | `8080` / `0.0.0.0` / `vipe_outputs` | Server bind + output root. |
+
+---
+
+## 4. Test the GUI without the GPU (mock server)
 
 To exercise the Demo tab UI without loading the model, use the stdlib mock that hands
 back canned clips (it ignores the camera fields and just returns an mp4):
@@ -249,7 +372,7 @@ python visergui/mock_video_server.py            # serves assets/ours/*.mp4 on :8
 
 ---
 
-## 4. Troubleshooting
+## 5. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -259,6 +382,9 @@ python visergui/mock_video_server.py            # serves assets/ours/*.mp4 on :8
 | `CUDA out of memory` at startup | Another process holds the GPU (e.g. a running training session). Free it, or use a smaller `resolution`. |
 | `400` "must be 1 + 80k" / "multiples of 16" / "Invalid trajectory/direction" | Fix the frame count / resolution / trajectory / direction in the request or GUI. |
 | GUI dropdowns only show the static fallback options | The server wasn't reachable when the Demo tab was built. Start the server first; the listed options are still valid. |
+| `500 Server Error … /sequence/generate` | The remote server hit an error generating — usually a seed image that gives degenerate depth (e.g. a flat diagram). Use a real photo. The server's detail message (`Sequential generation error: …`) is in its own logs. |
+| Splat count balloons into the millions (`demo.py`) | The overlapping sequence clips weren't deduped enough. Raise **seed dedup radius** to 4–5 and/or lower **max_points**, then **Initialize from downloaded clips** to rebuild. |
+| `demo.py` "Choose image…" shows nothing | No `.jpg`/`.png` in the scanned folder. Point `--assets-dir` at a folder that has some. |
 
 ---
 

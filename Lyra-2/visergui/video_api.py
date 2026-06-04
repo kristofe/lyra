@@ -33,8 +33,31 @@ _URL_KEYS = ("video_url", "url", "video", "output_url", "result_url")
 # Static fallback presets (mirror demo_server.RESOLUTION_PRESETS) used when the
 # server can't be reached at GUI-build time. Labels map to "H,W" the server
 # also accepts directly.
-DEFAULT_RESOLUTION_PRESETS = ("480p", "360p", "320p", "240p")
+RESOLUTION_PRESETS = {
+    "480p": (480, 832),
+    "360p": (368, 640),
+    "320p": (320, 576),
+    "240p": (256, 448),
+}
+DEFAULT_RESOLUTION_PRESETS = tuple(RESOLUTION_PRESETS)
 DEFAULT_RESOLUTION = "240p"
+
+
+def resolve_resolution(value: str) -> str:
+    """Map a preset label ('240p') or raw 'H,W'/'HxW' to a validated 'H,W' string.
+
+    Used by backends (e.g. the sequence server) that need explicit H,W rather than a
+    label. Unknown labels fall back to the default preset.
+    """
+    v = str(value).strip()
+    if v in RESOLUTION_PRESETS:
+        h, w = RESOLUTION_PRESETS[v]
+        return f"{h},{w}"
+    parts = v.replace("x", ",").split(",")
+    if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
+        return f"{int(parts[0])},{int(parts[1])}"
+    h, w = RESOLUTION_PRESETS[DEFAULT_RESOLUTION]
+    return f"{h},{w}"
 
 
 def _sibling_url(server_url: str, path: str) -> str:
@@ -264,3 +287,69 @@ def request_custom_video(
 
     resp = requests.post(url, files=files, data=data, timeout=timeout)
     return _extract_video_bytes(resp, timeout)
+
+
+def _sequence_endpoint(server_url: str) -> str:
+    """Return the collaborator's `.../sequence/generate` endpoint.
+
+    Accepts either the full endpoint or a base URL (with/without trailing slash).
+    """
+    u = server_url.rstrip("/")
+    if u.endswith("/sequence/generate"):
+        return u
+    return u + "/sequence/generate"
+
+
+def request_sequence_video(
+    server_url: str,
+    *,
+    token: str,
+    trajectory_npz_bytes: bytes,
+    resolution: str,
+    num_frames: int,
+    prompt: str = "",
+    image_bytes: bytes | None = None,
+    image_name: str = "image.png",
+    session_id: str | None = None,
+    timeout: float = 600.0,
+) -> tuple[bytes, str | None]:
+    """POST to a collaborator's session-based `/sequence/generate` server.
+
+    First call (``session_id is None``) sends ``image`` + ``trajectory`` and the
+    server returns an ``X-Session-Id`` header. Subsequent calls send ``session_id`` +
+    ``trajectory`` (no image) to continue that server-side session. Auth is a Bearer
+    token. The trajectory is an npz in the lyra custom-traj schema (w2c/intrinsics/
+    image_height/image_width).
+
+    Returns ``(video_bytes, session_id)`` — the session id is read from the response's
+    ``X-Session-Id`` header (falls back to the one passed in).
+    """
+    if not server_url:
+        raise ValueError("sequence server URL is empty")
+    if not token:
+        raise ValueError("sequence server requires a Bearer token")
+    if not trajectory_npz_bytes:
+        raise ValueError("no trajectory npz to send")
+    if session_id is None and not image_bytes:
+        raise ValueError("first sequence call requires an image")
+
+    url = _sequence_endpoint(server_url)
+    headers = {"Authorization": f"Bearer {token}"}
+    files = {
+        "trajectory": ("trajectory.npz", trajectory_npz_bytes,
+                       "application/octet-stream"),
+    }
+    data: dict[str, object] = {"resolution": resolution, "num_frames": int(num_frames)}
+    if prompt and prompt.strip():
+        data["prompt"] = prompt
+    if session_id is None:
+        files["image"] = (image_name or "image.png", image_bytes)
+    else:
+        data["session_id"] = session_id
+
+    resp = requests.post(url, headers=headers, files=files, data=data, timeout=timeout)
+    video_bytes = _extract_video_bytes(resp, timeout)
+    new_sid = resp.headers.get("X-Session-Id") or session_id
+    if new_sid:
+        new_sid = new_sid.strip()
+    return video_bytes, new_sid

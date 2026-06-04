@@ -826,6 +826,10 @@ class ViewerApp:
         # gap-fill clips). Re-initialize replays ALL of these so the rebuilt scene
         # matches the accumulated one rather than only the seed clip.
         self._demo_clips: list[str] = []
+        # Server-side session id for the "sequence" backend (collaborator's
+        # /sequence/generate). None until the first sequence Request; reused on
+        # later Requests to continue the scene; cleared on Reset.
+        self._demo_session_id: "str | None" = None
         # Serializes the long, structure-mutating trainer handlers (init,
         # reset, append, prune, checkpoint, demo request/reset). viser runs
         # GUI callbacks on a thread pool and `disabled` is only a UI hint, so
@@ -2753,17 +2757,33 @@ class ViewerApp:
         if default_dir not in dir_options:
             dir_options = (default_dir, *dir_options)
         with self.server.gui.add_folder("Generate"):
+            self.gui_demo_backend = self.server.gui.add_dropdown(
+                "backend", options=("local", "sequence"),
+                initial_value=str(d.get("backend", "local")),
+                hint="'local' = our demo_server (/generate, preset fields). "
+                     "'sequence' = a collaborator's session server "
+                     "(/sequence/generate, Bearer token, server-side scene "
+                     "continuity; trajectory sent as a synthesized .npz).",
+            )
             self.gui_demo_server = self.server.gui.add_text(
                 "server URL",
                 initial_value=str(d.get("server_url", "")),
-                hint="POST endpoint of the video-generation server. The image "
-                     "+ prompt go up as multipart/form-data; the response "
-                     "carries the video (~30 s). Live — read on each request.",
+                hint="local: POST /generate endpoint. sequence: the collaborator's "
+                     "base URL or .../sequence/generate. Live — read on each request.",
+            )
+            self.gui_demo_token = self.server.gui.add_text(
+                "bearer token",
+                initial_value=str(d.get("token", "")),
+                hint="Authorization: Bearer <token> for the sequence backend. "
+                     "Ignored by the local backend.",
+            )
+            self.gui_demo_session = self.server.gui.add_markdown(
+                "**session:** none"
             )
             self.gui_demo_prompt = self.server.gui.add_text(
                 "prompt",
                 initial_value=str(d.get("prompt", "")),
-                hint="Text prompt sent alongside the image.",
+                hint="Text prompt sent alongside the image (local backend only).",
             )
             self.gui_demo_image_btn = self.server.gui.add_upload_button(
                 "image", mime_type="image/*",
@@ -3030,6 +3050,83 @@ class ViewerApp:
             strength=float(self.gui_demo_strength.value),
         )
 
+    def _synth_trajectory_npz_bytes(self) -> bytes:
+        """Synthesize a trajectory .npz from the current preset controls for the
+        'sequence' backend. Uses lyra's build_camera_trajectory (pure torch, importable
+        in this env) from an identity start pose; the server re-grounds depth from the
+        seed image, so a nominal center_depth is fine. Schema matches lyra custom-traj
+        (w2c (N,4,4), intrinsics (N,3,3), image_height, image_width)."""
+        import io
+        import math as _math
+        import os as _os
+        import sys as _sys
+        import numpy as np
+        import torch
+        import video_api
+
+        # build_camera_trajectory lives in the lyra_2 package (repo root). Make sure
+        # it's importable regardless of the launching CWD.
+        _repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _repo not in _sys.path:
+            _sys.path.insert(0, _repo)
+        from lyra_2._src.inference.camera_traj_utils import build_camera_trajectory
+
+        # The dropdown value is a preset LABEL (e.g. "240p"); resolve to H,W.
+        H, W = (int(x) for x in
+                video_api.resolve_resolution(self.gui_demo_resolution.value).split(","))
+        # The lyra trajectory builders default to CUDA internally, so build on the
+        # same device the viewer already renders on.
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        # Default ~60° vertical FOV → focal; principal point at center.
+        fy = 0.5 * H / _math.tan(0.5 * _math.radians(60.0))
+        K = torch.tensor([[fy, 0.0, W / 2.0], [0.0, fy, H / 2.0], [0.0, 0.0, 1.0]],
+                         dtype=torch.float32, device=dev)
+        initial_w2c = torch.eye(4, dtype=torch.float32, device=dev)
+        n = int(self.gui_demo_num_frames.value)
+        w2cs, Ks = build_camera_trajectory(
+            initial_w2c, K, 1.0, n,
+            str(self.gui_demo_trajectory.value),
+            str(self.gui_demo_direction.value),
+            float(self.gui_demo_strength.value),
+        )
+        buf = io.BytesIO()
+        np.savez(
+            buf,
+            w2c=w2cs.detach().cpu().numpy().astype(np.float32),
+            intrinsics=Ks.detach().cpu().numpy().astype(np.float32),
+            image_height=int(H),
+            image_width=int(W),
+        )
+        return buf.getvalue()
+
+    def _request_sequence_to_path(self, image_name: str,
+                                  image_bytes: bytes) -> str:
+        """Call the collaborator's /sequence/generate backend and return a path to
+        the saved mp4. First call (no session yet) sends the image; later calls send
+        the stored session_id and continue server-side. Updates the session markdown."""
+        import tempfile
+        import video_api
+
+        npz_bytes = self._synth_trajectory_npz_bytes()
+        resolution = video_api.resolve_resolution(self.gui_demo_resolution.value)
+        video_bytes, sid = video_api.request_sequence_video(
+            str(self.gui_demo_server.value),
+            token=str(self.gui_demo_token.value).strip(),
+            trajectory_npz_bytes=npz_bytes,
+            resolution=resolution,
+            num_frames=int(self.gui_demo_num_frames.value),
+            prompt=str(self.gui_demo_prompt.value).strip(),
+            image_bytes=(None if self._demo_session_id else image_bytes),
+            image_name=image_name,
+            session_id=self._demo_session_id,
+        )
+        self._demo_session_id = sid
+        self.gui_demo_session.content = f"**session:** {sid or 'none'}"
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp.write(video_bytes)
+        tmp.close()
+        return tmp.name
+
     def _extract_last_frame(self, video_path: str) -> "tuple[str, bytes] | None":
         """Read the final frame of an mp4 and return (name, PNG bytes).
 
@@ -3064,7 +3161,9 @@ class ViewerApp:
         prepare_and_init for the very first video, append_video (incremental)
         for every one after. Runs in viser's thread pool, so the ~30 s server
         call + DA3 may block here."""
-        if self._request_video_cb is None:
+        backend = str(getattr(self, "gui_demo_backend", None)
+                      and self.gui_demo_backend.value or "local")
+        if backend == "local" and self._request_video_cb is None:
             self.gui_demo_status.content = "**demo:** no generation server wired"
             return
         if self._demo_image is None:
@@ -3101,10 +3200,15 @@ class ViewerApp:
             else:
                 name, image_bytes = self._demo_image
                 self.gui_demo_status.content = "**demo:** requesting video (~30 s)…"
-            video_path = str(self._request_video_cb(
-                image_bytes, name, prompt, str(self.gui_demo_server.value),
-                self._collect_demo_gen_opts(),
-            ))
+            if backend == "sequence":
+                # Collaborator's session server: synthesize the trajectory npz, send
+                # image on the first call and session_id on later ones.
+                video_path = self._request_sequence_to_path(name, image_bytes)
+            else:
+                video_path = str(self._request_video_cb(
+                    image_bytes, name, prompt, str(self.gui_demo_server.value),
+                    self._collect_demo_gen_opts(),
+                ))
             # Capture this clip's final frame so the next Request can continue
             # from it (used only when "continue from last clip" is on).
             lf = self._extract_last_frame(video_path)
@@ -3343,6 +3447,10 @@ class ViewerApp:
             # Drop the carried-over last frame so "continue from last clip"
             # starts fresh after a Reset.
             self._demo_last_frame = None
+            # End any sequence-backend session so the next Request starts fresh.
+            self._demo_session_id = None
+            if getattr(self, "gui_demo_session", None) is not None:
+                self.gui_demo_session.content = "**session:** none"
             self.gui_demo_count.content = "**videos processed:** 0"
             self.gui_demo_splat_count.content = "**splats:** 0"
             self.gui_demo_status.content = (

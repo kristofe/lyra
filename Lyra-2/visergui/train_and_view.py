@@ -21,6 +21,7 @@ Remote use:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from splat_trainer import SplatTrainer
 from training import BackgroundTrainingThread
 from viewer import SceneState, ViewerApp
+
+
+def _default_demo_token() -> str:
+    """Bearer token for the sequence backend: $LYRA_DEMO_TOKEN, else the contents
+    of lai_server/lyra_token.txt (repo-root sibling), else empty."""
+    tok = os.environ.get("LYRA_DEMO_TOKEN", "").strip()
+    if tok:
+        return tok
+    token_file = Path(__file__).resolve().parent.parent / "lai_server" / "lyra_token.txt"
+    try:
+        return token_file.read_text().strip()
+    except Exception:
+        return ""
 
 
 def main() -> None:
@@ -69,6 +83,25 @@ def main() -> None:
         help="Default endpoint for the Demo tab's video-generation server "
              "(Lyra2 demo_server, default port 8000). Editable live in the "
              "GUI. POST image+prompt → mp4.",
+    )
+    p.add_argument(
+        "--demo-backend", type=str, default="local", choices=["local", "sequence"],
+        help="Default Demo→backend. 'local' = our demo_server (/generate). "
+             "'sequence' = a collaborator's session server (/sequence/generate, "
+             "Bearer token, server-side continuity).",
+    )
+    p.add_argument(
+        "--demo-token", type=str, default=_default_demo_token(),
+        help="Default Bearer token for the sequence backend. Defaults to "
+             "$LYRA_DEMO_TOKEN, else the contents of lai_server/lyra_token.txt. "
+             "Ignored by the local backend.",
+    )
+    p.add_argument(
+        "--demo-sequence-url", type=str,
+        default="https://8000-01kt5jzg8yj6v9xs6zajyxgm91.cloudspaces.litng.ai",
+        help="Default server URL pre-filled when Demo→backend=sequence "
+             "(the collaborator's base URL or .../sequence/generate). The client "
+             "appends /sequence/generate automatically.",
     )
     p.add_argument(
         "--demo-prompt", type=str, default="",
@@ -328,7 +361,11 @@ def main() -> None:
         inpaint_preload=bool(args.inpaint_preload),
         request_video=request_demo_video,
         demo_defaults=dict(
-            server_url=args.demo_server_url,
+            backend=args.demo_backend,
+            token=args.demo_token,
+            server_url=(args.demo_sequence_url
+                        if (args.demo_backend == "sequence" and args.demo_sequence_url)
+                        else args.demo_server_url),
             prompt=args.demo_prompt,
             max_frames=(args.demo_max_frames
                         if args.demo_max_frames is not None

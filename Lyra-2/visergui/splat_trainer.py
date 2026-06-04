@@ -508,6 +508,17 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
     quats_vx   = torch.zeros((G, 4), device=device); quats_vx[:, 0] = 1.0
     print(f"m_voxel={G} gaussians  ({100.0 * G / M:.1f}% of v0's {M}, inflate={inflate:.2f})")
 
+    # Honor the max_points budget on the voxel init too — this is the count that
+    # actually gets trained. Without this, max_points only capped the unused v0
+    # ply (splats_init.ply); a fine voxel grid could still exceed the cap (e.g.
+    # 1.6M splats under a 1M cap).
+    if G > max_points:
+        sel = torch.randperm(G, device=device)[:max_points]
+        means_vx, f_dc_vx = means_vx[sel], f_dc_vx[sel]
+        log_s_vx, logit_o_vx, quats_vx = log_s_vx[sel], logit_o_vx[sel], quats_vx[sel]
+        print(f"voxel init: {G} > max_points={max_points}, subsampling down to {max_points}")
+        G = int(means_vx.shape[0])
+
     sh_vx = f_dc_vx[:, None, :]
     save_inria_ply("splats_voxel.ply", means_vx, sh_vx, log_s_vx, logit_o_vx, quats_vx)
     print("saved splats_voxel.ply")
