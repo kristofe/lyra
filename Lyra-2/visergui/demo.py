@@ -56,7 +56,13 @@ import video_api
 from training import BackgroundTrainingThread
 from splat_trainer import SplatTrainer
 # Reuse the rendering core verbatim — no point reimplementing what already works.
-from viewer import SceneState, Renderer, _compute_home_pose, _rotmat_to_wxyz
+from viewer import (
+    SceneState,
+    Renderer,
+    _compute_home_pose,
+    _rotmat_to_wxyz,
+    viser_camera_to_opencv_viewmat,
+)
 from lyra_2._src.inference.camera_traj_utils import (
     CAMERA_TRAJECTORY_CHOICES,
     build_camera_trajectory,
@@ -114,6 +120,11 @@ class DemoApp:
         self._count = 0
         self._clips: list[str] = []
         self._train_cam_names: list[str] = []
+
+        # ---- custom target view (lerp-to-current-camera trajectory) ----- #
+        self._target_pose: "tuple[tuple, tuple] | None" = None  # (position, wxyz)
+        self._target_cam_names: list[str] = []
+        self._last_target_diag: dict | None = None  # requested geometry, for diag
 
         # ---- camera home pose ------------------------------------------- #
         self.home_position = (0.0, 0.0, 5.0)
@@ -193,6 +204,51 @@ class DemoApp:
                     "strength", min=0.0, max=2.0, step=0.05,
                     initial_value=float(d.get("strength", 0.5)),
                 )
+
+                # Collapsible: drive the next clip toward the live viewport pose
+                # instead of a preset shape. Builds a lerp+slerp path from a
+                # reference scene camera to the captured view (see nbv_trajectory).
+                with self.server.gui.add_folder("Custom target view",
+                                                expand_by_default=False):
+                    self.gui_use_target = self.server.gui.add_checkbox(
+                        "use current view as target", initial_value=False,
+                        hint="When on, ignore the preset trajectory above and "
+                             "instead build a lerp+slerp path from a reference "
+                             "scene camera to the view you capture below. Needs a "
+                             "reconstructed scene (Request one clip first).",
+                    )
+                    self.gui_target_start = self.server.gui.add_dropdown(
+                        "interpolate from",
+                        options=("scene first (seed / point A)",
+                                 "scene current (last camera)"),
+                        initial_value="scene first (seed / point A)",
+                        hint="The session server branches EVERY clip from the "
+                             "original seed ('point A'), so the trajectory must "
+                             "start there — 'scene first' is correct for it. "
+                             "'scene current' (start from the last camera) only "
+                             "fits a backend that continues from the previous "
+                             "clip's end.",
+                    )
+                    self.gui_target_scale = self.server.gui.add_slider(
+                        "target move scale", min=0.1, max=4.0, step=0.05,
+                        initial_value=1.0,
+                        hint="Multiplies the reference→target translation. The "
+                             "server re-grounds depth from the seed, so its scale "
+                             "may differ from the splat world — nudge this until "
+                             "the generated motion matches the preview.",
+                    )
+                    self.gui_target_capture_btn = self.server.gui.add_button(
+                        "Capture current view", icon=viser.Icon.CAMERA,
+                    )
+                    self.gui_target_preview_btn = self.server.gui.add_button(
+                        "Preview path", icon=viser.Icon.ROUTE,
+                    )
+                    self.gui_target_clear_btn = self.server.gui.add_button(
+                        "Clear preview", icon=viser.Icon.TRASH,
+                    )
+                    self.gui_target_status = self.server.gui.add_markdown(
+                        "**target:** off — using the preset trajectory above"
+                    )
 
             with self.server.gui.add_folder("Reconstruction"):
                 self.gui_init_btn = self.server.gui.add_button(
@@ -314,6 +370,12 @@ class DemoApp:
                 self.gui_show_cams = self.server.gui.add_checkbox(
                     "show cameras", initial_value=True,
                 )
+                self.gui_cam_images = self.server.gui.add_checkbox(
+                    "show frame in cameras", initial_value=False,
+                    hint="Overlay each scene camera's RGB frame inside its frustum "
+                         "(downscaled). Off by default — sending 30+ images can be "
+                         "heavy over the wire.",
+                )
                 self.gui_cam_scale = self.server.gui.add_slider(
                     "camera size", min=0.01, max=1.0, step=0.01,
                     initial_value=0.15,
@@ -323,6 +385,25 @@ class DemoApp:
                     initial_value=1280,
                 )
                 self.gui_reset_cam_btn = self.server.gui.add_button("Reset camera")
+
+                # Full-resolution frame inspector: scrub the reconstructed frames
+                # and view each one losslessly (PNG) to tell real generation /
+                # codec artifacts apart from the downscaled frustum overlay.
+                with self.server.gui.add_folder("Inspect frame",
+                                                expand_by_default=False):
+                    self.gui_frame_pos = self.server.gui.add_slider(
+                        "frame", min=0.0, max=1.0, step=0.001, initial_value=0.0,
+                        hint="Scrub through the reconstructed frames; the full-"
+                             "resolution RGB shows below. If artifacts are visible "
+                             "here they're in the generated video itself (try a "
+                             "higher resolution), not the viewer overlay.",
+                    )
+                    self.gui_frame_info = self.server.gui.add_markdown(
+                        "**frame:** none — reconstruct a scene"
+                    )
+                    self.gui_frame_img = self.server.gui.add_image(
+                        self._placeholder_img(), label="frame", format="png",
+                    )
 
         # ---- wiring ----------------------------------------------------- #
         self.gui_image_btn.on_upload(lambda _e: self._on_image_upload())
@@ -335,13 +416,22 @@ class DemoApp:
         self.gui_reset_btn.on_click(lambda _e: self._on_reset_click())
         self.gui_reset_cam_btn.on_click(lambda _e: self._on_reset_camera())
         self.gui_show_cams.on_update(lambda _e: self._publish_cams())
+        self.gui_cam_images.on_update(lambda _e: self._publish_cams())
         self.gui_cam_scale.on_update(lambda _e: self._publish_cams())
+        self.gui_frame_pos.on_update(lambda _e: self._show_frame())
         self.gui_seed_dedup.on_update(lambda _e: self._apply_splat_budget())
         self.gui_max_points.on_update(lambda _e: self._apply_splat_budget())
         self.gui_scale_clamp.on_update(lambda _e: self._apply_splat_budget())
         # lpips/void are read by the trainer every step → push them live.
         self.gui_lpips_weight.on_update(lambda _e: self._apply_live_loss_weights())
         self.gui_void_weight.on_update(lambda _e: self._apply_live_loss_weights())
+        # Custom target view (lerp toward the live camera).
+        self.gui_use_target.on_update(lambda _e: self._on_use_target_toggle())
+        self.gui_target_capture_btn.on_click(lambda _e: self._on_capture_target())
+        self.gui_target_preview_btn.on_click(lambda _e: self._on_preview_target())
+        self.gui_target_clear_btn.on_click(lambda _e: self._clear_target_cams())
+        self.gui_target_scale.on_update(lambda _e: self._refresh_target_preview())
+        self.gui_target_start.on_update(lambda _e: self._refresh_target_preview())
         # Push the GUI defaults into the trainer up front so the first clip already
         # uses the chosen dedup radius / point cap (not the trainer's bare defaults).
         self._apply_splat_budget()
@@ -431,15 +521,19 @@ class DemoApp:
         self.home_position, self.home_look_at, self.home_up = _compute_home_pose(means_np)
         self._on_reset_camera()
 
-    def _publish_cams(self) -> None:
-        """Draw the trainer's per-frame camera frustums so the trajectory is
-        visible. Clears + redraws each call; honors the 'show cameras' toggle."""
+    def _clear_train_cams(self) -> None:
+        """Remove the scene-camera frustums (demo_cams/*) from the viewport."""
         for n in self._train_cam_names:
             try:
                 self.server.scene.remove_by_name(n)
             except Exception:
                 pass
         self._train_cam_names.clear()
+
+    def _publish_cams(self) -> None:
+        """Draw the trainer's per-frame camera frustums so the trajectory is
+        visible. Clears + redraws each call; honors the 'show cameras' toggle."""
+        self._clear_train_cams()
         d = self.trainer.data
         if d is None or not bool(self.gui_show_cams.value):
             return
@@ -448,6 +542,7 @@ class DemoApp:
         H, W = int(d.H), int(d.W)
         aspect = W / max(H, 1)
         scale = float(self.gui_cam_scale.value)
+        show_imgs = bool(self.gui_cam_images.value)
         for i in range(c2w.shape[0]):
             R = c2w[i, :3, :3]
             t = c2w[i, :3, 3]
@@ -455,13 +550,71 @@ class DemoApp:
             fy = float(K[i, 1, 1])
             fov_y = 2.0 * math.atan(0.5 * H / max(fy, 1e-9))
             name = f"demo_cams/{i:04d}"
+            img = None
+            if show_imgs:
+                try:
+                    img = self._frame_thumb(d.rgb[i])
+                except Exception:
+                    img = None
             self.server.scene.add_camera_frustum(
                 name=name, fov=fov_y, aspect=aspect, scale=scale,
-                color=(255, 153, 51),
+                color=(255, 153, 51), image=img, format="png",
                 wxyz=tuple(float(x) for x in wxyz),
                 position=tuple(float(x) for x in t),
             )
             self._train_cam_names.append(name)
+
+    @staticmethod
+    def _frame_to_uint8(rgb_hw3: torch.Tensor) -> np.ndarray:
+        """(H,W,3) float[0,1] torch frame → full-res uint8 RGB numpy."""
+        return (rgb_hw3.detach().clamp(0.0, 1.0).mul(255.0).round()
+                .to(torch.uint8).cpu().numpy())
+
+    @classmethod
+    def _frame_thumb(cls, rgb_hw3: torch.Tensor, max_w: int = 192) -> np.ndarray:
+        """Frame → uint8 RGB thumbnail (~``max_w`` wide) for a frustum overlay.
+        Uses a LANCZOS area resize (not stride decimation, which aliased badly)
+        and is sent as lossless PNG, so the overlay no longer adds artifacts of
+        its own — what you see is the frame's true quality."""
+        from PIL import Image
+        arr = cls._frame_to_uint8(rgb_hw3)
+        h, w = arr.shape[:2]
+        if w > max_w:
+            img = Image.fromarray(arr).resize(
+                (max_w, max(1, round(h * max_w / w))), Image.LANCZOS)
+            arr = np.asarray(img, dtype=np.uint8)
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _placeholder_img() -> np.ndarray:
+        """A tiny neutral-grey image so add_image has content before any scene."""
+        return np.full((16, 16, 3), 64, dtype=np.uint8)
+
+    def _show_frame(self) -> None:
+        """Update the 'Inspect frame' panel from the scrub slider: map the 0..1
+        position to a frame index and show that frame full-resolution (lossless)."""
+        data = getattr(self.trainer, "data", None)
+        n = int(data.rgb.shape[0]) if (data is not None
+                                       and getattr(data, "rgb", None) is not None) else 0
+        if n == 0:
+            self.gui_frame_info.content = "**frame:** none — reconstruct a scene"
+            try:
+                self.gui_frame_img.image = self._placeholder_img()
+            except Exception:
+                pass
+            return
+        frac = float(self.gui_frame_pos.value)
+        idx = max(0, min(n - 1, int(round(frac * (n - 1)))))
+        try:
+            self.gui_frame_img.image = self._frame_to_uint8(data.rgb[idx])
+        except Exception:
+            pass
+        epoch = (data.frame_epoch[idx]
+                 if getattr(data, "frame_epoch", None) else 0)
+        H, W = int(data.H), int(data.W)
+        self.gui_frame_info.content = (
+            f"**frame:** {idx} / {n - 1}  ({W}×{H}, epoch {epoch})"
+        )
 
     # --------------------------------------------------------------------- #
     # Training control
@@ -603,7 +756,13 @@ class DemoApp:
         server re-grounds depth from the seed image, so a nominal center_depth is
         fine. Schema matches lyra custom-traj: w2c (N,4,4), intrinsics (N,3,3),
         image_height, image_width.
+
+        When the "use current view as target" toggle is on, the preset shape is
+        bypassed and the trajectory is a lerp from a reference scene camera to the
+        captured viewer pose instead (see ``_synth_target_npz_bytes``).
         """
+        if bool(getattr(self, "gui_use_target", None) and self.gui_use_target.value):
+            return self._synth_target_npz_bytes()
         H, W = (int(x) for x in
                 video_api.resolve_resolution(self.gui_resolution.value).split(","))
         fy = 0.5 * H / math.tan(0.5 * math.radians(60.0))  # ~60° vertical FOV
@@ -628,6 +787,228 @@ class DemoApp:
             image_width=int(W),
         )
         return buf.getvalue()
+
+    # --------------------------------------------------------------------- #
+    # Custom target view (lerp toward the live camera)
+    # --------------------------------------------------------------------- #
+
+    def _reference_w2c_tensor(self, data) -> torch.Tensor:
+        """The scene camera the lerp starts from, per the 'interpolate from'
+        dropdown. 'scene first' → data.w2c[0], the original seed ('point A').
+        The session server branches every clip from point A, so this is the
+        correct reference for it. 'scene current' → the last appended camera,
+        only right for a backend that continues from the previous clip's end."""
+        n = int(data.w2c.shape[0])
+        mode = str(self.gui_target_start.value)
+        idx = 0 if mode.startswith("scene first") else n - 1
+        return data.w2c[idx].to(torch.float32)
+
+    @staticmethod
+    def _scale_pose_about(ref_w2c: torch.Tensor, target_w2c: torch.Tensor,
+                          scale: float) -> torch.Tensor:
+        """Scale the target camera CENTER toward/away from the reference center by
+        ``scale`` (keeping the target's orientation), returned as w2c. scale=1 is a
+        no-op; <1 pulls the move shorter, >1 exaggerates it. Scaling centers (not
+        the raw w2c translation) keeps the geometry a clean camera move."""
+        ref_c = torch.linalg.inv(ref_w2c)[:3, 3]
+        target_c2w = torch.linalg.inv(target_w2c)
+        new_c2w = target_c2w.clone()
+        new_c2w[:3, 3] = ref_c + float(scale) * (target_c2w[:3, 3] - ref_c)
+        return torch.linalg.inv(new_c2w)
+
+    def _target_lerp_inputs(self):
+        """Resolve everything the lerp needs from the captured target + scene.
+
+        Returns (ref_w2c, target_w2c_scaled, K, n_frames, H, W) — all torch on the
+        scene's device. Raises ValueError (surfaced in the status line) if there's
+        no captured view or no reconstructed scene to ground the reference pose.
+        """
+        if self._target_pose is None:
+            raise ValueError("no target captured — click 'Capture current view'")
+        data = getattr(self.trainer, "data", None)
+        if data is None or not bool(getattr(self.trainer, "_initialized", False)):
+            raise ValueError(
+                "custom target needs a reconstructed scene — Request a clip first"
+            )
+        device = data.w2c.device
+        ref_w2c = self._reference_w2c_tensor(data).to(device)
+        pos, wxyz = self._target_pose
+        target_w2c = torch.from_numpy(
+            viser_camera_to_opencv_viewmat(pos, wxyz).astype(np.float32)
+        ).to(device)
+        target_w2c = self._scale_pose_about(
+            ref_w2c, target_w2c, float(self.gui_target_scale.value)
+        )
+        H, W = (int(x) for x in
+                video_api.resolve_resolution(self.gui_resolution.value).split(","))
+        fy = 0.5 * H / math.tan(0.5 * math.radians(60.0))  # match the preset path
+        K = torch.tensor(
+            [[fy, 0.0, W / 2.0], [0.0, fy, H / 2.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float32, device=device,
+        )
+        n = int(self.gui_num_frames.value)
+        return ref_w2c, target_w2c, K, n, int(H), int(W)
+
+    def _synth_target_npz_bytes(self) -> bytes:
+        """Trajectory .npz that interpolates from the reference scene camera to the
+        captured viewer pose. The poses are expressed in the reference camera's
+        frame (so frame 0 == identity), which is how the sequence server reads a
+        clip: frame 0 is 'now', the rest is the move from there."""
+        import nbv_trajectory as nbv
+        ref_w2c, target_w2c, K, n, H, W = self._target_lerp_inputs()
+        # Express the (scaled) target in the reference camera's frame → frame 0 = I.
+        rel_target = target_w2c @ torch.linalg.inv(ref_w2c)
+        eye = torch.eye(4, dtype=torch.float32, device=ref_w2c.device)
+        payload = nbv.build_lerp_trajectory(eye, rel_target, K, n, H, W)
+        # Stash the requested geometry (splat-world centers) so _log_target_result
+        # can compare it against what DA3 re-poses the returned clip to.
+        a_c = torch.linalg.inv(ref_w2c)[:3, 3].detach().cpu().numpy()
+        t_c = torch.linalg.inv(target_w2c)[:3, 3].detach().cpu().numpy()
+        self._last_target_diag = {"A": a_c, "target": t_c}
+        ss = float(getattr(self.trainer.init, "scene_scale", float("nan")))
+        print(f"[target] SEND: point A center={tuple(round(float(x),3) for x in a_c)} "
+              f"→ target center={tuple(round(float(x),3) for x in t_c)}; "
+              f"requested move dist={float(np.linalg.norm(t_c - a_c)):.3f} "
+              f"(scene_scale≈{ss:.3f}, num_frames={n}, scale_mult="
+              f"{float(self.gui_target_scale.value):.2f})")
+        buf = io.BytesIO()
+        np.savez(
+            buf,
+            w2c=payload["w2c"],
+            intrinsics=payload["intrinsics"],
+            image_height=payload["image_height"],
+            image_width=payload["image_width"],
+        )
+        return buf.getvalue()
+
+    def _on_capture_target(self) -> None:
+        """Snapshot the connected viewer's camera as the lerp target, then preview."""
+        clients = list(self.server.get_clients().values())
+        if not clients:
+            self.gui_target_status.content = "**target:** no connected viewer client"
+            return
+        cam = clients[0].camera
+        try:
+            pos = tuple(float(x) for x in np.asarray(cam.position).reshape(3))
+            wxyz = tuple(float(x) for x in np.asarray(cam.wxyz).reshape(4))
+        except Exception as e:
+            self.gui_target_status.content = (
+                f"**target:** could not read camera — {type(e).__name__}: {e}"
+            )
+            return
+        self._target_pose = (pos, wxyz)
+        self.gui_target_status.content = (
+            f"**target:** captured pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) "
+            "— previewing"
+        )
+        self._on_preview_target()
+
+    def _on_preview_target(self) -> None:
+        """Draw the planned lerp path (in the splat world) as camera frustums so the
+        move can be eyeballed before sending: magenta endpoints, cyan in between."""
+        try:
+            import nbv_trajectory as nbv
+            ref_w2c, target_w2c, K, n, H, W = self._target_lerp_inputs()
+            payload = nbv.build_lerp_trajectory(ref_w2c, target_w2c, K, n, H, W)
+            self._draw_target_cams(payload["w2c"], float(K[1, 1].item()), H, W)
+            self.gui_target_status.content = (
+                f"**target:** previewing {n}-frame path "
+                "(magenta = endpoints, cyan = between)"
+            )
+        except Exception as e:
+            self.gui_target_status.content = (
+                f"**target:** {type(e).__name__}: {e}"
+            )
+
+    def _refresh_target_preview(self) -> None:
+        """Re-draw the preview when a knob changes, but only while target mode is on
+        and a view is captured (so idle slider drags don't spam the status line)."""
+        if bool(self.gui_use_target.value) and self._target_pose is not None:
+            self._on_preview_target()
+
+    def _draw_target_cams(self, w2c_np: np.ndarray, fy: float,
+                          H: int, W: int) -> None:
+        """Render up to ~12 evenly-spaced frustums of the lerp path into the scene."""
+        self._clear_target_cams()
+        n = int(w2c_np.shape[0])
+        if n == 0:
+            return
+        idxs = sorted({int(round(x)) for x in np.linspace(0, n - 1, min(n, 12))})
+        aspect = W / max(H, 1)
+        fov_y = 2.0 * math.atan(0.5 * H / max(fy, 1e-9))
+        scale = float(self.gui_cam_scale.value)
+        for j, i in enumerate(idxs):
+            c2w = np.linalg.inv(w2c_np[i].astype(np.float64))
+            wxyz = _rotmat_to_wxyz(c2w[:3, :3])
+            t = c2w[:3, 3]
+            endpoint = (i == 0 or i == n - 1)
+            color = (255, 0, 255) if endpoint else (0, 255, 255)
+            name = f"target_traj/{j:03d}"
+            self.server.scene.add_camera_frustum(
+                name=name, fov=fov_y, aspect=aspect, scale=scale, color=color,
+                wxyz=tuple(float(x) for x in wxyz),
+                position=tuple(float(x) for x in t),
+            )
+            self._target_cam_names.append(name)
+
+    def _log_target_result(self) -> None:
+        """After a target-mode Request appends the returned clip, compare what we
+        ASKED for against what DA3 re-posed the clip to — the definitive diagnosis:
+        small direction error + scale ratio far from 1 ⇒ scale/grounding (the known
+        no-anchor limitation); large direction error ⇒ a frame bug to chase."""
+        diag = self._last_target_diag
+        data = getattr(self.trainer, "data", None)
+        if not diag or data is None or int(data.w2c.shape[0]) == 0:
+            return
+        c2w_last = np.linalg.inv(
+            data.w2c[-1].detach().cpu().numpy().astype(np.float64))
+        achieved = c2w_last[:3, 3]
+        A, tgt = np.asarray(diag["A"]), np.asarray(diag["target"])
+        req_vec, ach_vec = tgt - A, achieved - A
+        req_d = float(np.linalg.norm(req_vec))
+        ach_d = float(np.linalg.norm(ach_vec))
+        cos = float(np.dot(req_vec, ach_vec) / (req_d * ach_d + 1e-9))
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+        ratio = ach_d / (req_d + 1e-9)
+        print(f"[target] RESULT: requested move dist={req_d:.3f}, achieved (clip "
+              f"end, subsampled) dist={ach_d:.3f}  →  scale ratio={ratio:.2f}, "
+              f"direction error={ang:.1f}°")
+        print(f"[target]   end center: requested="
+              f"{tuple(round(float(x),3) for x in tgt)}, achieved="
+              f"{tuple(round(float(x),3) for x in achieved)}")
+        self.gui_target_status.content = (
+            f"**target:** result — dist {ach_d:.2f} vs {req_d:.2f} "
+            f"(×{ratio:.2f}), dir err {ang:.0f}°"
+        )
+
+    def _clear_target_cams(self) -> None:
+        for name in self._target_cam_names:
+            try:
+                self.server.scene.remove_by_name(name)
+            except Exception:
+                pass
+        self._target_cam_names.clear()
+
+    def _on_use_target_toggle(self) -> None:
+        """Toggle target mode: grey out the preset controls it overrides, and show
+        the preview (or a prompt to capture) so the mode change is obvious."""
+        on = bool(self.gui_use_target.value)
+        for w in (self.gui_trajectory, self.gui_direction, self.gui_strength):
+            try:
+                w.disabled = on
+            except Exception:
+                pass
+        if not on:
+            self._clear_target_cams()
+            self.gui_target_status.content = (
+                "**target:** off — using the preset trajectory above"
+            )
+        elif self._target_pose is not None:
+            self._on_preview_target()
+        else:
+            self.gui_target_status.content = (
+                "**target:** on — aim the viewport, then 'Capture current view'"
+            )
 
     def _request_to_path(self, image_name: str, image_bytes: bytes) -> str:
         """Call the remote /sequence/generate backend and return a path to the
@@ -692,6 +1073,7 @@ class DemoApp:
             mode=str(self.gui_mode.value),
         )
         self._publish_cams()
+        self._show_frame()
 
     def _append_from_video(self, video_path: str) -> None:
         self._apply_splat_budget()
@@ -700,6 +1082,7 @@ class DemoApp:
             seed_new_splats=True,
         )
         self._publish_cams()
+        self._show_frame()
 
     def _on_request_click(self) -> None:
         """Fetch one clip from the remote server and automatically build splats from
@@ -737,6 +1120,11 @@ class DemoApp:
             else:
                 self.gui_status.content = "**demo:** new clip — append (DA3)…"
                 self._append_from_video(video_path)
+            # In target mode keep the preview frustums (so the requested path can
+            # be eyeballed against the new scene cameras) and log requested-vs-
+            # achieved geometry to the console.
+            if bool(self.gui_use_target.value):
+                self._log_target_result()
             auto = bool(self.gui_autotrain.value)
             if auto:
                 self._on_resume_training()
@@ -775,7 +1163,7 @@ class DemoApp:
             self._on_pause_training()
             self.gui_status.content = "**demo:** clearing splats…"
             self.trainer.reset()
-            self._publish_cams()   # data is now None → clears frustums
+            self._clear_train_cams()   # reset() keeps self.data; clear directly
             n = len(clips)
             self.gui_status.content = (
                 f"**demo:** initializing from clip 1/{n} — pose + init (DA3)…"
@@ -815,7 +1203,22 @@ class DemoApp:
             self.gui_reset_btn.disabled = True
             self._on_pause_training()
             self.trainer.reset()
-            self._publish_cams()   # data is now None → clears frustums
+            # trainer.reset() PRESERVES self.data, so _publish_cams() would just
+            # remove the frustums and re-draw them — clear them directly instead.
+            self._clear_train_cams()   # remove the scene-camera frustums
+            self._clear_target_cams()  # drop the target-view preview frustums
+            self._target_pose = None   # and the captured target itself
+            self.gui_frame_pos.value = 0.0
+            self.gui_frame_info.content = "**frame:** none — reconstruct a scene"
+            try:
+                self.gui_frame_img.image = self._placeholder_img()
+            except Exception:
+                pass
+            self.gui_target_status.content = (
+                "**target:** on — aim the viewport, then 'Capture current view'"
+                if bool(self.gui_use_target.value)
+                else "**target:** off — using the preset trajectory above"
+            )
             self._count = 0
             self._clips = []
             self._session_id = None

@@ -138,6 +138,11 @@ class GaussianInit:
     scene_scale: float
     conf_thresh: float | None
     voxel: float                     # voxel edge length used for init downsampling
+    # The depth-confidence QUANTILE that produced `conf_thresh` at init time.
+    # Kept so incremental appends can re-derive a per-clip threshold from the
+    # new clip's own confidence (DA3 conf scale varies per pass, so the absolute
+    # `conf_thresh` is not comparable across clips). None ⇒ no conf gating.
+    conf_quantile: float | None = None
     # Whether sky pixels were excluded from the init mask. Stored so that
     # incremental-append flows can rebuild a consistent per-frame mask for
     # the new frames without re-running the original init.
@@ -412,6 +417,20 @@ def _per_frame_train_mask(depth: torch.Tensor,
     return mask
 
 
+def _conf_quantile_thresh(conf: torch.Tensor, q: float) -> float:
+    """Absolute confidence threshold = the ``q``-quantile of ``conf`` (flattened),
+    subsampling to 16M elements first to bound memory. Mirrors the init recipe in
+    ``_build_initial_gaussians``. DA3 confidence is on a different absolute scale
+    every pass, so a threshold must be re-derived from each clip's own conf rather
+    than carried over — otherwise a later clip's pixels all fall below the init
+    clip's bar and nothing survives the gate."""
+    flat = conf.flatten()
+    if flat.numel() > 16_000_000:
+        idx = torch.randint(0, flat.numel(), (16_000_000,), device=flat.device)
+        flat = flat[idx]
+    return float(flat.quantile(q))
+
+
 def _build_initial_gaussians(data: VideoData, max_points: int,
                              confidence: float, remove_sky: bool) -> GaussianInit:
     """Unproject RGBD pixels into world-space gaussians, then voxel-downsample
@@ -535,7 +554,9 @@ def _build_initial_gaussians(data: VideoData, max_points: int,
         means=means_vx, quats=quats_vx, log_s=log_s_vx, logit_o=logit_o_vx,
         sh=sh_vx, train_mask=train_mask,
         scene_scale=scene_scale, conf_thresh=conf_thresh,
-        voxel=voxel, remove_sky=bool(remove_sky),
+        voxel=voxel,
+        conf_quantile=(float(confidence) if data.conf is not None else None),
+        remove_sky=bool(remove_sky),
     )
 
 
@@ -1196,6 +1217,8 @@ class SplatTrainer:
             "voxel":          float(self.init.voxel),
             "conf_thresh":    (None if self.init.conf_thresh is None
                                else float(self.init.conf_thresh)),
+            "conf_quantile":  (None if self.init.conf_quantile is None
+                               else float(self.init.conf_quantile)),
             "remove_sky":     bool(self.init.remove_sky),
             "sh_max_deg":     int(self.sh_max_deg),
             "mode":           str(self.mode),
@@ -1252,6 +1275,10 @@ class SplatTrainer:
                                self.init.conf_thresh if self.init else None)
         if conf_thresh is not None:
             conf_thresh = float(conf_thresh)
+        conf_quantile = meta.get("conf_quantile",
+                                 self.init.conf_quantile if self.init else None)
+        if conf_quantile is not None:
+            conf_quantile = float(conf_quantile)
         remove_sky = bool(meta.get("remove_sky",
                                    self.init.remove_sky if self.init else True))
         mode = str(meta.get("mode", self.mode))
@@ -1279,7 +1306,7 @@ class SplatTrainer:
             log_s=loaded["log_s"], logit_o=loaded["logit_o"],
             sh=loaded["sh0"], train_mask=train_mask,
             scene_scale=scene_scale, conf_thresh=conf_thresh,
-            voxel=voxel, remove_sky=remove_sky,
+            voxel=voxel, conf_quantile=conf_quantile, remove_sky=remove_sky,
         )
         # Build a fresh TrainState from the loaded params. Adam moments are
         # zero — see method docstring. We then patch in the higher SH bands
@@ -1442,8 +1469,24 @@ class SplatTrainer:
         cur_max_epoch = max(self.data.frame_epoch) if self.data.frame_epoch else 0
         new_epoch = cur_max_epoch + 1
 
+        # DA3 confidence is on a DIFFERENT absolute scale every pass, so the init
+        # clip's absolute `conf_thresh` rejects ~100% of a later clip's pixels —
+        # no new splats seed AND the new frames' supervision mask comes out empty.
+        # Re-derive the threshold from THIS clip's own confidence using the init
+        # quantile, keeping the same top-(1-q) fraction of pixels init kept.
+        if joint_data.conf is not None and self.init.conf_quantile is not None:
+            conf_thresh_new = _conf_quantile_thresh(
+                joint_data.conf[n_orig:], float(self.init.conf_quantile))
+            print(f"append_video: per-clip conf threshold {conf_thresh_new:.4f} "
+                  f"(q={float(self.init.conf_quantile):.2f} of this clip's conf; "
+                  f"init clip's absolute {self.init.conf_thresh} is not comparable "
+                  f"across DA3 passes)")
+        else:
+            conf_thresh_new = self.init.conf_thresh
+
         # Append each new frame to self.data + extend init.train_mask in
-        # lock-step (same per-frame mask gates the original init used).
+        # lock-step (same per-frame mask gates the original init used, but with
+        # this clip's re-derived conf threshold).
         for i in range(n_new):
             depth_i = joint_data.depth[n_orig + i]
             sky_i = (joint_data.sky[n_orig + i]
@@ -1461,7 +1504,7 @@ class SplatTrainer:
             )
             mask_i = _per_frame_train_mask(
                 depth_i, sky_i, conf_i,
-                self.init.conf_thresh, self.init.remove_sky,
+                conf_thresh_new, self.init.remove_sky,
             )
             self.init.append_train_mask(mask_i)
 
@@ -1489,7 +1532,8 @@ class SplatTrainer:
         seed_info = {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0}
         if seed_new_splats and added > 0:
             new_idxs = list(range(first_new, first_new + added))
-            seed_info_full = self._seed_splats_for_new_frames(new_idxs)
+            seed_info_full = self._seed_splats_for_new_frames(
+                new_idxs, conf_thresh=conf_thresh_new)
             seed_info = {k: seed_info_full[k]
                          for k in ("n_candidates", "n_after_dedup", "n_seeded")}
         elif not seed_new_splats:
@@ -1595,7 +1639,8 @@ class SplatTrainer:
 
     # ---- Phase 2: seed new splats from already-appended frames -------- #
 
-    def _seed_splats_for_new_frames(self, new_frame_idxs: Sequence[int]) -> dict:
+    def _seed_splats_for_new_frames(self, new_frame_idxs: Sequence[int],
+                                    conf_thresh: float | None = None) -> dict:
         """RGBD-unproject the frames at `new_frame_idxs`, voxel-dedup against
         the existing splat distribution at `init.voxel`, voxel-downsample
         the survivors, and concat the resulting splats into the live
@@ -1608,6 +1653,11 @@ class SplatTrainer:
         are reset — momentum recovers within a few hundred steps; the
         alternative (per-row state surgery) is brittle.
 
+        `conf_thresh` overrides the confidence gate for these frames; pass the
+        per-clip value `append_video` re-derives from this clip's own DA3
+        confidence. When None, falls back to the init clip's absolute
+        `init.conf_thresh` (only safe for frames from the init DA3 pass).
+
         Returns `{"n_candidates", "n_after_dedup", "n_seeded", "epoch"}`.
         Caller is responsible for pausing the training thread first
         (the GUI handler does this; the inpainter / CLI must too).
@@ -1619,15 +1669,19 @@ class SplatTrainer:
             print("_seed_splats: called with empty index list — skipping")
             return {"n_candidates": 0, "n_after_dedup": 0, "n_seeded": 0,
                     "epoch": -1}
+        # Per-clip threshold from the caller (append_video) wins; else the init
+        # clip's absolute value. DA3 conf scale shifts per pass, so reusing the
+        # init threshold on a later clip rejects every pixel — see append_video.
+        conf_thresh = (self.init.conf_thresh if conf_thresh is None
+                       else float(conf_thresh))
         print(f"_seed_splats: starting — {len(idx_list)} new frames (indices "
               f"[{idx_list[0]}..{idx_list[-1]}]); voxel={float(self.init.voxel):.5f} "
-              f"conf_thresh={self.init.conf_thresh} remove_sky={bool(self.init.remove_sky)}")
+              f"conf_thresh={conf_thresh} remove_sky={bool(self.init.remove_sky)}")
 
         d = self.data
         device = self.device
         voxel = float(self.init.voxel)
         remove_sky = bool(self.init.remove_sky)
-        conf_thresh = self.init.conf_thresh
         H, W = int(d.H), int(d.W)
 
         sel = torch.as_tensor(idx_list, dtype=torch.long, device=device)
