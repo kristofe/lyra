@@ -45,7 +45,7 @@ import torch
 import viser
 
 # Make sibling modules (video_api, viewer, splat_trainer, training) and the repo
-# root (lyra_2 package) importable regardless of the launching CWD.
+# root (lyra_2 package) importable regardless of the launching CWD. 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 for _p in (str(_HERE), str(_REPO)):
@@ -470,7 +470,7 @@ class DemoApp:
             self.scene, cam, W, H,
             sh_degree=3, color_mode="RGB",
             near=0.01, far=1000.0,
-            adaptive_res=True, moving_scale=0.4,
+            adaptive_res=False, moving_scale=0.4,
             force_full_res=force_full_res,
         )
         client.scene.set_background_image(img)

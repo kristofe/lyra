@@ -294,6 +294,26 @@ def _average_se3(Ts: torch.Tensor) -> torch.Tensor:
     return T
 
 
+def _estimate_depth_scale(old_depth: torch.Tensor, joint_depth: torch.Tensor,
+                          lo: float = 0.2, hi: float = 5.0) -> float:
+    """Global depth-scale factor between two DA3 passes of the SAME frames:
+    median per-pixel ``old_depth / joint_depth`` over pixels valid (> 0) in both.
+
+    DA3's metric depth is ambiguous up to a global scale and drifts between
+    passes (different frame sets pick different reference views), so a later
+    joint pass can be uniformly nearer/farther than the original. A rigid SE(3)
+    alignment can't absorb that — it shows up as a depth offset on appended
+    geometry. The median ratio recovers the factor robustly (millions of pixels,
+    outlier-resistant). Clamped to [lo, hi]; falls back to 1.0 when degenerate."""
+    m = (old_depth > 0) & (joint_depth > 0)
+    if int(m.sum().item()) < 1000:
+        return 1.0
+    s = float((old_depth[m] / joint_depth[m]).median().item())
+    if not math.isfinite(s) or s <= 0.0:
+        return 1.0
+    return float(min(hi, max(lo, s)))
+
+
 def _kabsch_se3(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Classical Kabsch / Umeyama rigid alignment — find the 4x4 SE(3)
     transform T such that `(T @ A^T)^T ≈ B` for paired point sets
@@ -1419,52 +1439,74 @@ class SplatTrainer:
                 f"clip to match (same aspect ratio) and re-try."
             )
 
-        # Phase 2.5 v2: align the joint frame to the *original* world frame
-        # using per-frame SE(3) average — preserves both positions AND
-        # orientations, unlike Kabsch-on-centers which silently leaves a
-        # rotational "twist" that propagates to new frames.
+        # Align the joint-pass frames onto the ORIGINAL world frame, ANCHORED ON
+        # THE FIRST CAMERA (point A — the seed image, identical in every run), as
+        # a SIMILARITY (scale + rotation + translation):
         #
-        # T_i = c2w_old[i] @ inv(c2w_joint[i]) is the per-frame transform
-        # that takes a point in joint-world to old-world. With consistent
-        # poses these are all the same; with DA3 noise they differ slightly.
-        # `_average_se3` projects their mean onto SE(3) so we get one
-        # canonical T_joint_to_old.
+        #   * SCALE s: DA3's metric depth is ambiguous up to a global factor and
+        #     drifts between passes (different frame sets → different reference
+        #     view). A rigid SE(3) fit places the cameras right but leaves the
+        #     appended *depth* at the joint pass's scale — a visible depth offset
+        #     on the new geometry even when the cameras line up. We recover s from
+        #     point A's per-pixel depth ratio so point A's DEPTH matches exactly.
+        #   * ROTATION + TRANSLATION are taken straight from point A so the FIRST
+        #     CAMERA matches the original exactly — every run shares one point A
+        #     pose and depth, which is also the pose the session server branches
+        #     every clip from.
         old_c2w_orig = self.data.c2w[:n_orig].detach()
         joint_c2w_orig = joint_data.c2w[:n_orig].detach()
         if n_orig >= 1:
-            inv_joint = torch.linalg.inv(joint_c2w_orig)
-            T_per_frame = old_c2w_orig @ inv_joint           # (n_orig, 4, 4)
-            T = _average_se3(T_per_frame)
+            # Scale from point A's depth so the seed's depth is identical run-to-run.
+            s = _estimate_depth_scale(self.data.depth[0:1].detach(),
+                                      joint_data.depth[0:1].detach())
+            R_align = (old_c2w_orig[0, :3, :3]
+                       @ joint_c2w_orig[0, :3, :3].transpose(0, 1))
+            A_old_c = old_c2w_orig[0, :3, 3]
+            A_joint_c = joint_c2w_orig[0, :3, 3]
         else:
-            T = torch.eye(4, device=self.device, dtype=joint_data.c2w.dtype)
-            print(f"append_video: no original frames to fit alignment; "
-                  f"using identity (new splats may be globally offset).")
+            s = 1.0
+            R_align = torch.eye(3, device=self.device, dtype=joint_data.c2w.dtype)
+            A_old_c = torch.zeros(3, device=self.device, dtype=joint_data.c2w.dtype)
+            A_joint_c = torch.zeros(3, device=self.device, dtype=joint_data.c2w.dtype)
+            print("append_video: no original frames; using identity alignment.")
 
-        # Residual diagnostics: where did the averaged T leave gaps? Position
-        # residual = ||T @ c2w_joint - c2w_old||; angular residual via the
-        # SO(3) chordal distance.
-        aligned_orig = T.unsqueeze(0) @ joint_c2w_orig       # (n_orig, 4, 4)
+        def _apply_similarity(c2w_batch: torch.Tensor) -> torch.Tensor:
+            """center = A_old + s·R_align·(joint_center − A_joint); rot = R_align·joint_rot.
+            Point A maps to the original exactly (residual 0 by construction)."""
+            R = R_align.unsqueeze(0) @ c2w_batch[:, :3, :3]
+            c = A_old_c.unsqueeze(0) + s * (
+                R_align.unsqueeze(0)
+                @ (c2w_batch[:, :3, 3] - A_joint_c).unsqueeze(-1)
+            ).squeeze(-1)
+            out = (torch.eye(4, device=c2w_batch.device, dtype=c2w_batch.dtype)
+                   .unsqueeze(0).repeat(c2w_batch.shape[0], 1, 1))
+            out[:, :3, :3] = R
+            out[:, :3, 3] = c
+            return out
+
+        # Residuals on the OTHER original frames (point A is exact by anchoring):
+        # large values mean DA3's joint scale isn't globally consistent, so far
+        # geometry may still drift even though the seed matches.
+        aligned_orig = _apply_similarity(joint_c2w_orig)
         pos_err = (aligned_orig[:, :3, 3] - old_c2w_orig[:, :3, 3]).norm(dim=1)
-        # angle(R) = arccos((trace - 1)/2). Compute R_err per frame.
         R_err = aligned_orig[:, :3, :3] @ old_c2w_orig[:, :3, :3].transpose(1, 2)
-        tr = R_err.diagonal(dim1=1, dim2=2).sum(dim=1)        # (n_orig,)
-        ang_err_rad = torch.acos(((tr - 1.0) / 2.0).clamp(-1.0, 1.0))
-        ang_err_deg = ang_err_rad * 180.0 / math.pi
-        print(f"append_video: SE(3) alignment residuals — "
-              f"pos mean={pos_err.mean().item():.4f} max={pos_err.max().item():.4f} m "
-              f"(scene_scale≈{self.init.scene_scale:.3f}); "
-              f"angular mean={ang_err_deg.mean().item():.3f}° max={ang_err_deg.max().item():.3f}°")
-        if ang_err_deg.max().item() > 5.0:
-            print(f"append_video: WARNING max angular residual > 5° — joint DA3 "
-                  f"may have substantially re-estimated the original poses. "
-                  f"Existing splats may need ~hundreds of training steps to settle.")
+        tr = R_err.diagonal(dim1=1, dim2=2).sum(dim=1)
+        ang_err_deg = torch.acos(((tr - 1.0) / 2.0).clamp(-1.0, 1.0)) * 180.0 / math.pi
+        print(f"append_video: point-A similarity — depth scale s={s:.4f}; "
+              f"other-frame residuals pos mean={pos_err.mean().item():.4f} "
+              f"max={pos_err.max().item():.4f} m "
+              f"(scene_scale≈{self.init.scene_scale:.3f}); angular mean="
+              f"{ang_err_deg.mean().item():.3f}° max={ang_err_deg.max().item():.3f}°")
+        if (pos_err.max().item() > 0.5 * float(self.init.scene_scale)
+                or ang_err_deg.max().item() > 5.0):
+            print("append_video: WARNING large residual away from point A — joint "
+                  "DA3 scale may not be globally consistent; appended geometry "
+                  "could still drift from the seed despite matching at point A.")
 
-        # Apply T ONLY to new frames' c2w. The original frames' c2w (and
-        # depth, K, rgb) are NOT touched — they keep the exact poses the
-        # existing splats were trained against. This is the second half of
-        # the fix: even with imperfect alignment, the existing splats never
-        # see a rotated supervision signal.
-        new_c2w_aligned = T.unsqueeze(0) @ joint_data.c2w[n_orig:]
+        # New frames: similarity-aligned poses + scale-corrected depth, so the
+        # appended geometry shares the original's scale (no depth offset).
+        new_c2w_aligned = _apply_similarity(joint_data.c2w[n_orig:])
+        new_depth_scaled = joint_data.depth[n_orig:] * s
 
         cur_max_epoch = max(self.data.frame_epoch) if self.data.frame_epoch else 0
         new_epoch = cur_max_epoch + 1
@@ -1488,7 +1530,7 @@ class SplatTrainer:
         # lock-step (same per-frame mask gates the original init used, but with
         # this clip's re-derived conf threshold).
         for i in range(n_new):
-            depth_i = joint_data.depth[n_orig + i]
+            depth_i = new_depth_scaled[i]   # scale-corrected to the scene's depth
             sky_i = (joint_data.sky[n_orig + i]
                      if joint_data.sky is not None else None)
             conf_i = (joint_data.conf[n_orig + i]
