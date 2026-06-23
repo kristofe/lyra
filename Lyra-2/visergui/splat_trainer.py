@@ -314,6 +314,120 @@ def _estimate_depth_scale(old_depth: torch.Tensor, joint_depth: torch.Tensor,
     return float(min(hi, max(lo, s)))
 
 
+# --------------------------------------------------------------------------- #
+# Inpaint depth grounding — shared by the inpainter "Add frame" path and the
+# train_and_view "Append frames" path.
+#
+# The splat render reports depth≈0 where alpha≈0 (the disoccluded region an
+# inpainter just painted), so those pixels back-project onto the *camera origin*
+# instead of the surface they depict. We re-estimate the inpainted frame's depth
+# with DA3 and fit ONE scale s = median(splat / DA3) over the SEEN overlap (so it
+# lands in the scene's world frame + scale), then composite: SEEN pixels keep
+# their splat depth (already in world W), HOLE pixels get DA3 depth × s. See
+# visergui/notebooks/new_view_append_checks.ipynb for the verified derivation.
+# --------------------------------------------------------------------------- #
+
+_GROUND_DA3_MODEL = None  # lazily-loaded DA3, shared across grounding calls
+
+
+def _ground_da3_model(device):
+    """Lazily load + cache a DA3 model used only for grounding inpainted-frame
+    depth. Reuses the same checkpoint as `_da3_inference_on_paths`; keeps one
+    instance resident so repeated Add-frame clicks don't reload (~1-2 GB VRAM)."""
+    global _GROUND_DA3_MODEL
+    if _GROUND_DA3_MODEL is None:
+        _GROUND_DA3_MODEL = DepthAnything3.from_pretrained(
+            "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
+        ).to(device).eval()
+    return _GROUND_DA3_MODEL
+
+
+def _da3_depth_single(model, rgb_u8: np.ndarray, H: int, W: int):
+    """DA3 single-image depth for an in-memory RGB (H, W, 3) uint8.
+
+    Returns `(depth_hw float32 np, valid_hw bool np)` at (H, W). Built on the
+    already-imported `DepthAnything3` (which is pip-installed) rather than the
+    `lyra_2._src.inference` helper, so it needs no extra package on sys.path in
+    the demo process. Depth post-processing mirrors that helper verbatim."""
+    img = np.ascontiguousarray(rgb_u8).astype(np.uint8)
+    if img.shape[:2] != (H, W):
+        img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+    pred = model.inference(
+        image=[img], process_res=int(max(H, W)),
+        process_res_method="upper_bound_resize")
+    depths = getattr(pred, "depth", None)
+    if depths is None:
+        raise RuntimeError("DA3 prediction has no 'depth' field")
+    dnp = (depths[0].detach().cpu().numpy() if isinstance(depths, torch.Tensor)
+           else np.asarray(depths)[0])
+    Hd, Wd = dnp.shape[-2:]
+    dt = torch.from_numpy(dnp.astype(np.float32))[None, None]
+    if (Hd, Wd) != (H, W):
+        dt = F.interpolate(dt, size=(H, W), mode="bilinear", align_corners=False)
+    depth_hw = torch.nan_to_num(dt[0, 0], nan=1e4).clamp(min=0.0, max=1e4)
+    valid = (depth_hw < 999.9).numpy()
+    return depth_hw.numpy().astype(np.float32), valid
+
+
+def ground_inpaint_depth(rgb_u8: np.ndarray, splat_depth: np.ndarray,
+                         alpha: np.ndarray, device,
+                         alpha_thresh: float = 0.5, da3_model=None,
+                         lo: float = 0.2, hi: float = 5.0):
+    """Replace the disoccluded (alpha < alpha_thresh) pixels of a splat-rendered
+    depth map with DA3 depth scaled to the splats on the SEEN overlap.
+
+    Args:
+        rgb_u8:      (H, W, 3) uint8 — the inpainted frame DA3 runs on.
+        splat_depth: (H, W) float — depth from rendering the splats at this camera.
+        alpha:       (H, W) float — splat-render alpha; alpha<thr marks the hole.
+        device:      torch device for the (cached) DA3 model.
+    Returns:
+        (composite_depth (H, W) float32 np, info dict with s_overlap / n_overlap /
+        hole_frac). SEEN pixels keep their (in-W) splat depth; HOLE pixels get
+        DA3 depth × s_overlap. Falls back to s=1.0 (clamped to [lo, hi]) when the
+        overlap is too small to fit a scale robustly."""
+    splat_depth = np.asarray(splat_depth, dtype=np.float32)
+    alpha = np.asarray(alpha, dtype=np.float32)
+    H, W = splat_depth.shape
+    if da3_model is None:
+        da3_model = _ground_da3_model(device)
+    da3_depth, da3_valid = _da3_depth_single(da3_model, rgb_u8, H, W)
+    seen = alpha >= alpha_thresh
+    hole = ~seen
+    overlap = seen & da3_valid & (da3_depth > 0) & (splat_depth > 0)
+    n_ov = int(overlap.sum())
+    s = 1.0
+    if n_ov >= 1000:
+        s = float(np.median(splat_depth[overlap] / np.clip(da3_depth[overlap], 1e-6, None)))
+        if not math.isfinite(s) or s <= 0.0:
+            s = 1.0
+    s = float(min(hi, max(lo, s)))
+    comp = splat_depth.copy()
+    comp[hole] = da3_depth[hole] * s
+    return comp, {"s_overlap": s, "n_overlap": n_ov, "hole_frac": float(hole.mean())}
+
+
+def _render_splat_rgbd(params, c2w, K, H: int, W: int):
+    """Render the live splats at an OpenCV camera (c2w, K) → (rgb_u8, alpha, depth)
+    numpy. Mirrors inpainter._render_splats (gsplat RGB+ED, depth = ED / alpha)."""
+    device = params["means"].device
+    c2w = torch.as_tensor(c2w, dtype=torch.float32, device=device).reshape(4, 4)
+    K   = torch.as_tensor(K,   dtype=torch.float32, device=device).reshape(3, 3)
+    w2c = torch.linalg.inv(c2w)
+    with torch.no_grad():
+        sh = torch.cat([params["sh0"], params["shN"]], dim=1)
+        sh_deg = int(round(sh.shape[1] ** 0.5)) - 1
+        out, alpha, _ = rasterization(
+            means=params["means"], quats=F.normalize(params["quats"], dim=-1),
+            scales=torch.exp(params["scales"]), opacities=torch.sigmoid(params["opacities"]),
+            colors=sh, viewmats=w2c[None], Ks=K[None], width=int(W), height=int(H),
+            sh_degree=sh_deg, packed=False, render_mode="RGB+ED")
+        a = alpha[0, :, :, 0].clamp(0, 1)
+        rgb = (out[0, :, :, :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        depth = (out[0, :, :, 3] / a.clamp_min(1e-6)).cpu().numpy()
+    return rgb, a.cpu().numpy(), depth
+
+
 def _kabsch_se3(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Classical Kabsch / Umeyama rigid alignment — find the 4x4 SE(3)
     transform T such that `(T @ A^T)^T ≈ B` for paired point sets
@@ -1587,6 +1701,14 @@ class SplatTrainer:
         print(f"append_video: +{added} frames (epoch {new_epoch}; skipped {skipped}) "
               f"→ data.N={self.data.N}; seeded={seed_info['n_seeded']} new splats")
         return info
+
+    def render_rgbd_at(self, c2w, K, H, W):
+        """Render the current splats at an OpenCV camera (c2w, K) → (rgb_u8,
+        alpha, depth) numpy at (H, W). Used to ground an appended inpainted
+        frame's depth against the live scene (see `ground_inpaint_depth`)."""
+        if getattr(self, "train", None) is None:
+            raise RuntimeError("render_rgbd_at: trainer not initialized")
+        return _render_splat_rgbd(self.train.params, c2w, K, int(H), int(W))
 
     def append_supplied_frames(self, frames: Sequence[dict],
                                seed_new_splats: bool = False) -> dict:

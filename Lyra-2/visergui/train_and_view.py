@@ -313,6 +313,24 @@ def main() -> None:
             if "depth" in meta and meta["depth"]:
                 dp = (d / meta["depth"]).resolve()
                 depth = _np.load(str(dp)).astype(_np.float32)
+            if depth is None:
+                # No supplied depth → ground it against the CURRENT splats so the
+                # inpainted/disoccluded region lands in the scene frame instead of
+                # the camera origin (raw splat depth is 0 where alpha=0). Mirrors
+                # the inpainter "Add frame" path; leaves depth None on failure so
+                # append_supplied_frames skips the frame rather than misplacing it.
+                try:
+                    import splat_trainer as _st
+                    Hs, Ws = rgb.shape[:2]
+                    _, alpha_np, splat_depth = trainer.render_rgbd_at(c2w, K, Hs, Ws)
+                    depth, ginfo = _st.ground_inpaint_depth(
+                        rgb, splat_depth, alpha_np,
+                        device=trainer.train.params["means"].device)
+                    print(f"append_frames: grounded {frame_path.name} depth — "
+                          f"s_overlap={ginfo['s_overlap']:.3f} hole={ginfo['hole_frac']:.0%}")
+                except Exception as e:
+                    print(f"append_frames: depth grounding failed for {frame_path.name} "
+                          f"({e}); frame may be skipped (no depth)")
             frames.append({"rgb": rgb, "K": K, "c2w": c2w, "depth": depth})
         info = trainer.append_supplied_frames(frames, seed_new_splats=seed_new_splats)
         _republish_cams()

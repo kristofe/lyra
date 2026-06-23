@@ -67,7 +67,11 @@ from lyra_2._src.inference.lyra2_zoomgs_inference import (
     _generate_one_direction,
 )
 # Custom-trajectory path reuses the AR sampler + the npz loader directly.
-from lyra_2._src.inference.lyra2_ar_inference import run_lyra2_sample, safe_to
+from lyra_2._src.inference.lyra2_ar_inference import (
+    _predict_da3_depth_window,
+    run_lyra2_sample,
+    safe_to,
+)
 from lyra_2._src.inference.lyra2_custom_traj_inference import load_trajectory
 from lyra_2._src.inference.camera_traj_utils import CAMERA_TRAJECTORY_CHOICES
 
@@ -299,7 +303,9 @@ def run_single(
     image_path: str,
     prompt: str,
     output_path: str,
-) -> tuple[str, str]:
+    *,
+    build_assets: bool = False,
+) -> tuple[str, str, Optional[str]]:
     model = ctx["model"]
     da3_model = ctx["da3_model"]
     moge_model = ctx["moge_model"]
@@ -438,6 +444,24 @@ def run_single(
     cv2.imwrite(last_frame_path, cv2.cvtColor(last_rgb, cv2.COLOR_RGB2BGR))
     log.info(f"Saved last frame: {last_frame_path}", rank0_only=True)
 
+    # Optional sidecar: per-frame cameras + DA3 depth (+ frames) for 3D export.
+    # Done while `result` (and its video/cameras) is still alive.
+    npz_path = None
+    if build_assets:
+        npz_path = os.path.join(videos_dir, f"{base_name}_assets.npz")
+        log.info("Building per-frame assets (cameras + DA3 depth)...", rank0_only=True)
+        _build_assets_npz(
+            result=result,
+            seed_depth_hw=depth_hw,
+            seed_K_33=K_33,
+            seed_mask_hw=mask_hw,
+            da3_model=da3_model,
+            args=args,
+            npz_path=npz_path,
+            include_frames=bool(getattr(args, "include_frames", True)),
+        )
+        log.info(f"Saved assets npz: {npz_path}", rank0_only=True)
+
     del video01
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -445,7 +469,154 @@ def run_single(
 
     if not os.path.exists(video_path):
         raise RuntimeError(f"Expected output not found: {video_path}")
-    return video_path, last_frame_path
+    return video_path, last_frame_path, npz_path
+
+
+def _build_assets_npz(
+    *,
+    result: dict,
+    seed_depth_hw: torch.Tensor,
+    seed_K_33: torch.Tensor,
+    seed_mask_hw: torch.Tensor,
+    da3_model,
+    args: argparse.Namespace,
+    npz_path: str,
+    include_frames: bool = True,
+    depth_window: int = 10,
+) -> str:
+    """Write a sidecar .npz with per-frame cameras + depth for a finished clip.
+
+    The generator outputs video, not depth, so per-frame depth is recovered with a
+    post-generation DA3 pass. ``_predict_da3_depth_window`` runs DA3 with
+    ``align_to_input_ext_scale=True``, so each window's depth is aligned to the
+    trajectory cameras' metric scale; every per-frame point cloud
+    ``unproject(depth[i], intrinsics[idx], w2c[idx])`` therefore lands in one
+    coherent world frame and the clouds fuse.
+
+    DA3 is invoked once per strided residue class (~``depth_window`` well-separated
+    frames spanning the whole clip, mirroring ``--da3_frame_interval`` sampling) so
+    its Umeyama pose alignment stays well-conditioned and long clips don't OOM.
+    ``args.depth_stride`` (>=1) subsamples which frames land in the npz, for size.
+
+    npz schema (T = clip length, K = number of depth frames):
+      w2c                  [T, 4, 4]  f32  per-frame world->camera (all frames)
+      intrinsics           [T, 3, 3]  f32  per-frame K (all frames)
+      depth                [K, H, W]  f32  trajectory-aligned depth
+      depth_frame_indices  [K]        i32  index of each depth into w2c/frames timeline
+      confidence           [K, H, W]  f32  DA3 per-pixel depth confidence, if available
+      sky                  [K, H, W]  u8   DA3 sky mask (1=sky), if available
+      frames               [T, H, W, 3] u8 lossless RGB (only when include_frames)
+      seed_depth [H,W] f32, seed_K [3,3] f32, seed_mask [H,W] u8 (first-frame geometry)
+      image_height, image_width, fps, seed : scalars
+    """
+    video_bcthw = result["video"]                   # [1, C, T, H, W] in [-1, 1]
+    w2c_t = result["camera_w2c"][0].float().cpu()    # [T, 4, 4]
+    K_t = result["intrinsics"][0].float().cpu()      # [T, 3, 3]
+    T = int(video_bcthw.shape[2])
+    H = int(video_bcthw.shape[-2])
+    W = int(video_bcthw.shape[-1])
+
+    stride = max(int(getattr(args, "depth_stride", 1)), 1)
+    target_frames = sorted(set(list(range(0, T, stride)) + [T - 1]))
+
+    # Recover per-frame depth. DA3 aligns its predicted geometry to the input
+    # cameras via Umeyama, which needs cameras with real baseline spread — a
+    # contiguous block of adjacent frames is nearly collinear and makes the
+    # alignment degenerate. So each DA3 call samples a strided residue class that
+    # spans the WHOLE clip (the same trick the generator uses via da3_frame_interval),
+    # giving ~``depth_window`` well-separated frames per call. ``stride_da3`` is
+    # chosen so each call stays ~depth_window frames (bounds memory on long clips).
+    # A degenerate trajectory (e.g. a pure dolly, collinear by construction) can
+    # still fail alignment; we catch per-class so it degrades to partial depth
+    # rather than failing the whole request.
+    depth_by_frame: dict[int, np.ndarray] = {}
+    sky_by_frame: dict[int, np.ndarray] = {}
+    conf_by_frame: dict[int, np.ndarray] = {}
+
+    def _to_frame_res(a: np.ndarray, interp: int) -> np.ndarray:
+        # DA3 rounds H/W to its patch size (e.g. 256->252), so resize depth/sky/conf
+        # back to the frame resolution the cameras + intrinsics are defined at, matching
+        # the pipeline's _update_depth_cache (bilinear depth, nearest sky).
+        if a.shape[-2] == H and a.shape[-1] == W:
+            return a
+        return cv2.resize(a, (W, H), interpolation=interp)
+
+    per_call = max(int(depth_window), 2)
+    stride_da3 = max(1, round(T / per_call))
+    for r in range(stride_da3):
+        members = list(range(r, T, stride_da3))
+        if not members:
+            continue
+        try:
+            da3_out = _predict_da3_depth_window(
+                da3_model=da3_model,
+                history_frames=video_bcthw,
+                start_index=0,
+                abs_last_idx=members[-1],
+                cam_w2c=result["camera_w2c"].float(),
+                intrinsics=result["intrinsics"].float(),
+                frame_interval=stride_da3,
+                max_history_frames=len(members),
+                add_pose_alignment_offsets=True,
+            )
+        except Exception as e:  # noqa: BLE001 - degenerate alignment for some classes
+            log.warning(
+                f"DA3 depth pass (residue {r}/{stride_da3}) failed ({e}); "
+                "skipping those frames.", rank0_only=True)
+            continue
+        pred = da3_out["prediction"]
+        idxs = da3_out["frame_indices"]
+        if pred is None or len(idxs) == 0:
+            continue
+        depths_np = np.asarray(pred.depth)            # [k, hda3, wda3]
+        sky_np = getattr(pred, "sky", None)
+        conf_np = getattr(pred, "conf", None)         # DA3's field is `conf`, not `confidence`
+        for j, f in enumerate(idxs):
+            depth_by_frame[int(f)] = _to_frame_res(
+                depths_np[j].astype(np.float32), cv2.INTER_LINEAR)
+            if sky_np is not None:
+                sky_by_frame[int(f)] = _to_frame_res(
+                    np.asarray(sky_np[j]).astype(np.uint8), cv2.INTER_NEAREST)
+            if conf_np is not None:
+                conf_by_frame[int(f)] = _to_frame_res(
+                    np.asarray(conf_np[j]).astype(np.float32), cv2.INTER_LINEAR)
+
+    sel = [f for f in target_frames if f in depth_by_frame]
+    if sel:
+        depth_arr = np.stack([depth_by_frame[f] for f in sel], axis=0)  # [K, H, W]
+    else:
+        depth_arr = np.zeros((0, H, W), dtype=np.float32)
+        log.warning(
+            "No per-frame depth could be aligned (degenerate trajectory?); "
+            "npz carries cameras + frames + seed depth only.", rank0_only=True)
+
+    payload = {
+        "w2c": w2c_t.numpy().astype(np.float32),
+        "intrinsics": K_t.numpy().astype(np.float32),
+        "depth": depth_arr,
+        "depth_frame_indices": np.asarray(sel, dtype=np.int32),
+        "seed_depth": seed_depth_hw.float().cpu().numpy().astype(np.float32),
+        "seed_K": seed_K_33.float().cpu().numpy().astype(np.float32),
+        "seed_mask": (seed_mask_hw > 0.5).float().cpu().numpy().astype(np.uint8),
+        "image_height": np.int32(H),
+        "image_width": np.int32(W),
+        "fps": np.int32(int(args.fps)),
+        "seed": np.int32(int(args.seed)),
+    }
+    if len(sky_by_frame) == len(depth_by_frame) and sky_by_frame:
+        payload["sky"] = np.stack([sky_by_frame[f] for f in sel], axis=0)
+    if len(conf_by_frame) == len(depth_by_frame) and conf_by_frame:
+        payload["confidence"] = np.stack([conf_by_frame[f] for f in sel], axis=0)
+    if include_frames:
+        # Lossless RGB for ALL frames (independent of depth_stride): [T, H, W, 3] uint8.
+        vid01 = (video_bcthw[0].clamp(-1, 1) * 0.5 + 0.5)  # [C, T, H, W] in [0,1]
+        frames_u8 = (
+            vid01.permute(1, 2, 3, 0).float().cpu().numpy() * 255.0
+        ).round().clip(0, 255).astype(np.uint8)            # [T, H, W, 3]
+        payload["frames"] = frames_u8
+
+    np.savez_compressed(npz_path, **payload)
+    return npz_path
 
 
 def _prepare_seed_depth_t5(ctx: dict, args: argparse.Namespace, image_path: str,
@@ -763,7 +934,7 @@ async def generate(
             return run_single(STATE["ctx"], req_args, image_path, prompt, job_dir)
 
     try:
-        mp4_path, last_frame_path = await anyio.to_thread.run_sync(_job)
+        mp4_path, last_frame_path, _ = await anyio.to_thread.run_sync(_job)
     except ValueError as e:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
@@ -776,6 +947,108 @@ async def generate(
     return FileResponse(
         mp4_path, media_type="video/mp4", filename=f"{job_id}.mp4",
         headers={"X-Job-Id": job_id},
+    )
+
+
+@app.post("/generate_assets")
+async def generate_assets(
+    image: UploadFile = File(...),
+    prompt: str = Form(""),
+    resolution: str = Form(DEFAULT_RESOLUTION),
+    trajectory: str = Form(DEFAULT_TRAJECTORY),
+    direction: str = Form(DEFAULT_DIRECTION),
+    num_frames: int = Form(81),
+    strength: float = Form(0.5),
+    fps: int = Form(16),
+    seed: int = Form(1),
+    depth_stride: int = Form(1),
+    include_frames: bool = Form(True),
+):
+    """Like /generate, but ALSO build a sidecar .npz with per-frame cameras + depth.
+
+    Returns the mp4 as the body with an ``X-Job-Id`` header (byte-for-byte the same
+    as /generate, so existing clients keep working); then ``GET /assets/{job_id}``
+    downloads the companion npz. The npz holds per-frame ``w2c`` [T,4,4],
+    ``intrinsics`` [T,3,3], DA3 ``depth`` [K,H,W] (+ ``depth_frame_indices`` [K],
+    ``confidence``, ``sky``), lossless ``frames`` [T,H,W,3] when ``include_frames``,
+    plus seed_depth/seed_K and metadata. A frame's point cloud is
+    ``unproject(depth[i], intrinsics[idx], w2c[idx])`` where ``idx =
+    depth_frame_indices[i]``. ``depth_stride`` (>=1) subsamples depth frames for speed.
+    """
+    if STATE["ctx"] is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+    # Validate request params before doing any heavy work.
+    try:
+        res = resolve_resolution(resolution)
+        n = validate_num_frames(num_frames, "num_frames")
+        traj = validate_trajectory(trajectory)
+        dirn = validate_direction(direction)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty image upload.")
+
+    job_id = uuid.uuid4().hex[:12]
+    server_args = STATE["server_args"]
+    job_dir = os.path.join(server_args.output_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    if cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) is None:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Could not decode uploaded image.")
+    suffix = os.path.splitext(image.filename or "")[1].lower()
+    if suffix not in (".png", ".jpg", ".jpeg"):
+        suffix = ".png"
+    image_path = os.path.join(job_dir, f"input{suffix}")
+    with open(image_path, "wb") as f:
+        f.write(data)
+
+    req_args = argparse.Namespace(**vars(STATE["args"]))
+    req_args.resolution = res
+    req_args.num_frames = n
+    req_args.trajectory = traj
+    req_args.direction = dirn
+    req_args.strength = float(strength)
+    req_args.fps = int(fps)
+    req_args.seed = int(seed)
+    req_args.depth_stride = max(int(depth_stride), 1)
+    req_args.include_frames = bool(include_frames)
+
+    import anyio
+
+    def _job():
+        with GPU_LOCK:
+            return run_single(STATE["ctx"], req_args, image_path, prompt, job_dir,
+                              build_assets=True)
+
+    try:
+        mp4_path, last_frame_path, npz_path = await anyio.to_thread.run_sync(_job)
+    except ValueError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - surface a clean error, keep server up
+        log.error(f"Asset generation failed for job {job_id}: {e}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    JOBS[job_id] = {"video": mp4_path, "last_frame": last_frame_path, "assets": npz_path}
+    return FileResponse(
+        mp4_path, media_type="video/mp4", filename=f"{job_id}.mp4",
+        headers={"X-Job-Id": job_id},
+    )
+
+
+@app.get("/assets/{job_id}")
+def assets(job_id: str):
+    """Return the per-frame cameras + depth sidecar .npz for a /generate_assets job."""
+    job = JOBS.get(job_id)
+    if not job or not os.path.exists(job.get("assets") or ""):
+        raise HTTPException(status_code=404, detail=f"No assets for job_id {job_id!r}.")
+    return FileResponse(
+        job["assets"], media_type="application/octet-stream",
+        filename=f"{job_id}_assets.npz",
     )
 
 

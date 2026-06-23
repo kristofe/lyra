@@ -88,6 +88,8 @@ time).
 | `GET /resolutions` | `{"default":"240p","presets":[{label,height,width}, …]}` — drives the GUI resolution dropdown. |
 | `GET /trajectories` | `{"default":"horizontal_zoom","default_direction":"right","directions":[…],"trajectories":[…]}` — drives the GUI camera dropdowns. |
 | `POST /generate` | multipart form → returns an `mp4` (`Content-Type: video/mp4`) plus an `X-Job-Id` response header. |
+| `POST /generate_assets` | same as `/generate`, but also builds a per-frame sidecar `.npz` (cameras + depth + confidence + sky + frames). Returns the `mp4` + `X-Job-Id`; fetch the npz via `/assets/{job_id}` (see *3D export*). |
+| `GET /assets/{job_id}` | returns the `.npz` of per-frame cameras + depth for a `/generate_assets` job. |
 | `GET /last_frame/{job_id}` | returns the **final frame** of a previous job as a PNG — POST it back as the next `image` to continue the scene (see *Chaining*). |
 
 **One camera move per call** — `/generate` runs a single trajectory (no zoom-in/out
@@ -132,6 +134,72 @@ curl -s -X POST localhost:8000/generate \
 Invalid inputs (resolution not ÷16, frame count not `1 + 80k`, unknown
 trajectory/direction) return a clean `400` with a JSON `{"detail": "..."}`; the
 server stays up.
+
+### Get frames + cameras + depth (3D export)
+
+`/generate` returns only the mp4 and throws the rest away. `/generate_assets` runs
+the *same* generation but also writes a sidecar `.npz` with everything you need to
+rebuild the clip in 3D: every frame, every camera, and a per-frame depth map.
+
+The generator outputs video, not depth — so per-frame depth is recovered with a
+post-generation **DA3** pass that is aligned to the trajectory cameras' metric
+scale. All frames therefore share one world frame, so a frame's point cloud is just
+`unproject(depth[i], intrinsics[idx], w2c[idx])` and the clouds **fuse** into one
+coherent scene.
+
+It accepts the same form fields as `/generate`, plus:
+
+| Field | Default | Notes |
+|---|---|---|
+| `depth_stride` | `1` | Run DA3 on every `depth_stride`-th frame (cameras/frames are still kept for all frames). `>1` trades depth coverage for speed; the last frame is always included. |
+| `include_frames` | `true` | Embed lossless RGB `frames` `[T,H,W,3]` in the npz. Set `false` to keep the npz small and decode the mp4 instead. |
+
+Two-step download (the POST returns the mp4 + `X-Job-Id`, then GET the npz):
+
+```bash
+# generate + capture the job id from the response header
+JOB=$(curl -s -D - -o /tmp/clip.mp4 -X POST localhost:8000/generate_assets \
+  -F image=@assets/samples/00.png \
+  -F trajectory=orbit_horizontal -F num_frames=81 \
+  | awk -v IGNORECASE=1 '/^x-job-id:/{print $2}' | tr -d "\r")
+
+# fetch the per-frame cameras + depth sidecar
+curl -s "localhost:8000/assets/$JOB" -o /tmp/clip_assets.npz
+```
+
+`.npz` contents (T = clip length, K = number of depth frames, K = T when `depth_stride=1`):
+
+| Key | Shape / dtype | Meaning |
+|---|---|---|
+| `w2c` | `[T,4,4]` f32 | per-frame world→camera (all frames) |
+| `intrinsics` | `[T,3,3]` f32 | per-frame pinhole K (all frames) |
+| `depth` | `[K,H,W]` f32 | trajectory-aligned metric depth |
+| `depth_frame_indices` | `[K]` i32 | index of each depth into the `w2c`/`frames` timeline |
+| `confidence` | `[K,H,W]` f32 | DA3 per-pixel depth confidence (if available) |
+| `sky` | `[K,H,W]` u8 | DA3 sky mask, `1`=sky (if available) |
+| `frames` | `[T,H,W,3]` u8 | lossless RGB (only when `include_frames=true`) |
+| `seed_depth`, `seed_K`, `seed_mask` | `[H,W]` / `[3,3]` / `[H,W]` | first-frame geometry used to ground the trajectory |
+| `image_height`, `image_width`, `fps`, `seed` | scalars | metadata |
+
+Quick check in Python:
+
+```python
+import numpy as np
+d = np.load("/tmp/clip_assets.npz")
+print({k: d[k].shape for k in d.files})
+# point cloud for depth frame i:
+i = 0; idx = int(d["depth_frame_indices"][i])
+H, W = int(d["image_height"]), int(d["image_width"])
+K, w2c, z = d["intrinsics"][idx], d["w2c"][idx], d["depth"][i]
+u, v = np.meshgrid(np.arange(W), np.arange(H))
+xyz_cam = np.stack([(u - K[0,2]) / K[0,0] * z,
+                    (v - K[1,2]) / K[1,1] * z, z], -1).reshape(-1, 3)
+c2w = np.linalg.inv(w2c)
+xyz_world = xyz_cam @ c2w[:3,:3].T + c2w[:3,3]
+```
+
+visergui's `PointCloudLoader` ([`visergui/viewer.py`](visergui/viewer.py)) reads `.npz`
+directly, so you can also drop the sidecar straight into the 3D viewer.
 
 ### Chaining — continue the same scene across calls
 

@@ -935,6 +935,33 @@ class InpainterPanel:
                 rgb_src = ss["rgb"]
                 src_tag = "raw splat render"
 
+            # Ground the inpainted depth. gsplat returns depth≈0 where alpha≈0, so
+            # the painted (disoccluded) pixels would back-project onto the camera
+            # origin. Re-estimate depth on the inpainted RGB with DA3 and scale it
+            # to the splats on the seen overlap; the seen pixels keep their (in-W)
+            # splat depth. See splat_trainer.ground_inpaint_depth. (Skipped for the
+            # raw render and for outpaint, where the inpaint RGB and the splat
+            # depth/alpha are not the same resolution.)
+            grounded = False
+            alpha_np = ss.get("alpha")
+            if (src_tag == "flux-inpainted" and alpha_np is not None
+                    and rgb_src.shape[:2] == depth_np.shape[:2]):
+                try:
+                    from splat_trainer import ground_inpaint_depth
+                    alpha_thresh = float(self.gui_alpha_thresh.value)
+                    depth_np, ginfo = ground_inpaint_depth(
+                        rgb_src, depth_np, alpha_np,
+                        device=t.means_t.device, alpha_thresh=alpha_thresh)
+                    grounded = True
+                    print(f"  inpainter: grounded inpaint depth — s_overlap={ginfo['s_overlap']:.3f} "
+                          f"hole={ginfo['hole_frac']:.0%} overlap_px={ginfo['n_overlap']}",
+                          file=sys.stderr, flush=True)
+                except Exception as e:
+                    import traceback
+                    print(f"  inpainter: depth grounding failed ({e}); using raw splat depth",
+                          file=sys.stderr, flush=True)
+                    traceback.print_exc()
+
             d = t.data
             H, W = int(d.H), int(d.W)
             # Resize to training resolution if needed (data tensors are fixed H×W).
@@ -964,11 +991,19 @@ class InpainterPanel:
             # meaningful here; the inpainted region is the part we care about.
             init = getattr(t, "init", None)
             if init is not None:
-                mask = torch.ones((H, W), device=init.train_mask.device, dtype=init.train_mask.dtype)
+                # When depth is grounded, supervise only depth>0 pixels (a DA3 hole
+                # pixel can still be invalid); otherwise keep supervising the whole
+                # frame, as before.
+                if grounded:
+                    mask = torch.from_numpy(np.ascontiguousarray(depth_np > 0)).to(
+                        device=init.train_mask.device, dtype=init.train_mask.dtype)
+                else:
+                    mask = torch.ones((H, W), device=init.train_mask.device, dtype=init.train_mask.dtype)
                 init.append_train_mask(mask)
 
             self.gui_add_frame_status.content = (
-                f"_Appended frame #{new_idx} ({src_tag}) → trainer.data now has {d.N} frames._"
+                f"_Appended frame #{new_idx} ({src_tag}{', grounded depth' if grounded else ''}) "
+                f"→ trainer.data now has {d.N} frames._"
             )
             print(f"  inpainter: appended frame #{new_idx} (src={src_tag}); data.N={d.N}",
                   file=sys.stderr, flush=True)

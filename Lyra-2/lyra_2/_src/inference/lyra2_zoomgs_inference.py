@@ -454,6 +454,13 @@ def _generate_one_direction(
     finally:
         args.num_frames = saved_num_frames
 
+    # Surface the camera trajectory that drove generation so callers can export
+    # per-frame cameras alongside the video. Callers that only need the video
+    # (e.g. the standard /generate path) simply ignore these extra keys.
+    if result is not None:
+        result["camera_w2c"] = w2cs_b_t_44  # [1, T, 4, 4]
+        result["intrinsics"] = Ks_b_t_33    # [1, T, 3, 3]
+
     return result
 
 
