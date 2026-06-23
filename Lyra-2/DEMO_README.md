@@ -201,6 +201,36 @@ xyz_world = xyz_cam @ c2w[:3,:3].T + c2w[:3,3]
 visergui's `PointCloudLoader` ([`visergui/viewer.py`](visergui/viewer.py)) reads `.npz`
 directly, so you can also drop the sidecar straight into the 3D viewer.
 
+#### How per-frame depth is produced (and its gotchas)
+
+The generator emits **video, not depth**, so `/generate_assets` recovers depth with a
+post-generation **DA3** pass over the rendered frames, reusing
+`_predict_da3_depth_window` from [`lyra2_ar_inference.py`](lyra_2/_src/inference/lyra2_ar_inference.py).
+DA3 runs with `align_to_input_ext_scale=True`, so each pass is aligned to the
+trajectory cameras' metric scale — that's why all frames share one world frame and the
+clouds **fuse** (validated: frame-0's per-frame cloud vs the seed cloud agree to ~0.4%).
+
+Things worth knowing if you touch this path:
+
+- **Strided sampling, not contiguous.** DA3 aligns its predicted poses to the input
+  cameras via Umeyama, which needs cameras with real baseline spread. Feeding a
+  contiguous block of adjacent frames (nearly collinear) raises
+  `Degenerate covariance rank, Umeyama alignment is not possible`. So each DA3 call
+  samples a **strided residue class spanning the whole clip** (~`da3_max_history_frames`
+  well-separated frames), mirroring the generator's own `da3_frame_interval` sampling.
+- **Degenerate trajectories degrade gracefully.** A pure dolly/zoom is collinear by
+  construction and can still fail alignment; each pass is wrapped in try/except, so such
+  frames are simply omitted (`depth_frame_indices` tells you which frames have depth)
+  rather than failing the whole request. `seed_depth` is always present as a fallback.
+- **Depth is resized to frame resolution.** DA3 rounds H/W to its patch size (e.g.
+  256→252), so depth/sky/conf are resized back to the frame resolution (bilinear depth,
+  nearest sky) before export — the cameras/`intrinsics` are defined at frame resolution.
+- **DA3's confidence field is `conf`, not `confidence`.** The `Prediction` dataclass
+  ([`specs.py`](lyra_2/_src/inference/depth_anything_3/src/depth_anything_3/specs.py))
+  exposes `.conf`; reading `.confidence` silently yields `None`. (Heads-up: visergui's
+  [`splat_trainer.py`](visergui/splat_trainer.py) reads `getattr(pred, "confidence", None)`,
+  so its confidence-based gating is effectively disabled.)
+
 ### Chaining — continue the same scene across calls
 
 Each call is independent: it re-estimates depth from whatever seed image you give and
