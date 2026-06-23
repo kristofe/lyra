@@ -509,3 +509,18 @@ python visergui/mock_video_server.py            # serves assets/ours/*.mp4 on :8
 - For arbitrary, fully-authored camera paths (your own per-frame `w2c`/intrinsics),
   see `lyra2_custom_traj_inference` — it takes a trajectory `.npz` and is the route
   for paths the 27 presets don't cover.
+- **Adding a new (inpainted) view lands in the scene's frame — depth is grounded.**
+  When you author a fresh camera, render the splats, inpaint the disocclusion, and add
+  it to training (the full viewer's **Inpaint → Add frame**, and the Incremental
+  **Append frames** path in [`train_and_view.py`](visergui/train_and_view.py); not the
+  slim `demo.py`), the painted region's depth is **re-grounded** instead of reusing the
+  raw splat render. The splat render reports depth≈0 where alpha≈0, so those pixels would
+  back-project onto the **camera origin**; instead we run **DA3** on the inpainted frame,
+  fit one scale `s = median(splat / DA3)` over the *seen* overlap, and composite — seen
+  pixels keep their (already in-world) splat depth, the hole gets `DA3 × s`. The camera's
+  **true K** is stored (never the `fov=60°` fallback unless that is its real fov). Shared
+  helper: `ground_inpaint_depth` in
+  [`splat_trainer.py`](visergui/splat_trainer.py). The check is derived and verified
+  end-to-end in
+  [`visergui/notebooks/new_view_append_checks.ipynb`](visergui/notebooks/new_view_append_checks.ipynb)
+  (seen-region back-projection nn-dist ≈ 0.04 of scene scale, seam continuity ≈ 0.94).
