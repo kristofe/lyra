@@ -1710,6 +1710,72 @@ class SplatTrainer:
             raise RuntimeError("render_rgbd_at: trainer not initialized")
         return _render_splat_rgbd(self.train.params, c2w, K, int(H), int(W))
 
+    def backproject_frame(self, idx: int, max_points: int = 0,
+                          alpha_thresh: float = 0.5, rel_tol: float = 0.1):
+        """Back-project a stored training frame's depth into world points, for the
+        GUI alignment check. Uses `self.data.depth[idx]` — exactly the depth the
+        photometric loss trains on (for an inpaint-added frame, the grounded
+        composite) — and unprojects it the same way init does
+        (`cam = Kinv @ [u,v,1] * z ; world = R @ cam + t`).
+
+        Each returned point is classified **painted** vs **seen**: rendering the
+        live splats at this camera, a pixel is *painted* when the splats don't
+        already explain it — `alpha < alpha_thresh` OR the stored depth disagrees
+        with the splat-rendered depth by more than `rel_tol` (relative). The
+        painted points are the genuinely-novel geometry (depth came from DA3, not
+        the splats), so they are the real alignment test; seen points sit on the
+        splats by construction. If no splats exist yet, everything is 'seen'.
+
+        Returns `(points (M,3) float32 np, painted (M,) bool np, n_painted int,
+        n_seen int)`. Read-only; raises on a bad index / no data."""
+        d = self.data
+        if d is None:
+            raise RuntimeError("backproject_frame: no data")
+        i = int(idx)
+        if i < 0 or i >= int(d.N):
+            raise IndexError(f"frame {i} out of range [0, {int(d.N)})")
+        device = d.depth.device
+        H, W = int(d.H), int(d.W)
+        depth_i = d.depth[i]
+        c2w_i, K_i = d.c2w[i], d.K[i]
+
+        ii, jj = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device), indexing="ij")
+        uv1 = torch.stack([jj, ii, torch.ones_like(ii)], -1).float()          # (H,W,3)
+        cam = torch.einsum("ij,hwj->hwi", torch.linalg.inv(K_i), uv1) * depth_i[..., None]
+        world = torch.einsum("ij,hwj->hwi", c2w_i[:3, :3], cam) + c2w_i[:3, 3]
+
+        # Valid = any pixel with positive stored depth. We deliberately do NOT gate
+        # on init.train_mask: this visualizes the geometry actually stored for the
+        # frame, and conf/sky gating could hide most of it — for an inpaint frame
+        # the painted region is exactly what we want to see.
+        valid = depth_i > 0
+
+        painted_full = torch.zeros((H, W), dtype=torch.bool, device=device)
+        if getattr(self, "train", None) is not None:
+            try:
+                _, alpha_np, sdep_np = self.render_rgbd_at(
+                    c2w_i.detach().cpu().numpy(), K_i.detach().cpu().numpy(), H, W)
+                alpha = torch.as_tensor(alpha_np, dtype=torch.float32, device=device)
+                sdep = torch.as_tensor(sdep_np, dtype=torch.float32, device=device)
+                rel = (depth_i - sdep).abs() / sdep.clamp_min(1e-6)
+                painted_full = (alpha < alpha_thresh) | (rel > rel_tol)
+            except Exception:
+                pass  # leave all-seen if a render fails
+
+        pts = world[valid]
+        painted = painted_full[valid]
+        M = int(pts.shape[0])
+        # max_points <= 0 means "show every valid pixel" (no subsample) so the
+        # back-projected cloud is visualized in full; a positive cap random-samples.
+        if max_points and max_points > 0 and M > max_points:
+            sel = torch.randperm(M, device=device)[:max_points]
+            pts, painted = pts[sel], painted[sel]
+        painted_np = painted.detach().cpu().numpy()
+        return (pts.detach().cpu().numpy().astype(np.float32), painted_np,
+                int(painted_np.sum()), int((~painted_np).sum()))
+
     def append_supplied_frames(self, frames: Sequence[dict],
                                seed_new_splats: bool = False) -> dict:
         """Append externally-prepared frames. Each `frames[i]` is a dict:

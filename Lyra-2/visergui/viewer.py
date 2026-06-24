@@ -2115,6 +2115,26 @@ class ViewerApp:
         self.gui_train_cam_scale.on_update(lambda _ev: self._republish_train_cams())
         self.gui_train_cam_images.on_update(lambda _ev: self._republish_train_cams())
 
+        with self.server.gui.add_folder("Alignment check (back-projected points)"):
+            self.gui_align_use_last = self.server.gui.add_checkbox(
+                "use last frame", initial_value=True,
+                hint="Back-project the most recently added frame (e.g. a just-"
+                     "inpainted view). Untick to choose a frame by index.",
+            )
+            self.gui_align_frame_idx = self.server.gui.add_number(
+                "frame index", initial_value=0, min=0, step=1,
+                hint="Frame to back-project when 'use last frame' is off "
+                     "(clamped to the valid range).",
+            )
+            self.gui_align_show_btn = self.server.gui.add_button(
+                "Show back-projected points")
+            self.gui_align_clear_btn = self.server.gui.add_button("Clear")
+            self.gui_align_status = self.server.gui.add_markdown(
+                "_cyan = painted (depth from DA3 — the real alignment test); "
+                "grey = already-seen (lands on splats by construction)._")
+        self.gui_align_show_btn.on_click(lambda _ev: self._on_align_show_click())
+        self.gui_align_clear_btn.on_click(lambda _ev: self._on_align_clear_click())
+
         # Debug: push a hard-coded magenta point cloud to test whether viser's
         # point rendering works at all in this scene/coord-frame.
         self.gui_debug_test_pc = self.server.gui.add_button("debug: test point cloud")
@@ -2146,6 +2166,142 @@ class ViewerApp:
                 self.renderer.motion, "rot_thresh", float(self.gui_rot_thresh.value)
             )
         )
+
+    # ---- Alignment check: back-projected points overlay -------------- #
+
+    _ALIGN_PAINTED_NAME = "align_painted"
+    _ALIGN_SEEN_NAME = "align_seen"
+    _ALIGN_CAM_NAME = "align_highlight_cam"
+
+    def _on_align_show_click(self) -> None:
+        """Back-project a stored frame's depth into world points and overlay them
+        on the splats-as-points: cyan = painted (DA3-grounded, the real alignment
+        test), grey = already-seen. Also highlights that frame's camera frustum.
+        Switches Display to 'points' so the overlay (and the splat centers) show."""
+        t = self._trainer_ref
+        if t is None or getattr(t, "data", None) is None:
+            self.gui_align_status.content = "_Initialize training first._"
+            return
+        try:
+            d = t.data
+            N = int(d.N)
+            if N <= 0:
+                self.gui_align_status.content = "_No frames yet._"
+                return
+            i = (N - 1) if bool(self.gui_align_use_last.value) \
+                else max(0, min(N - 1, int(self.gui_align_frame_idx.value)))
+            pts, painted, n_p, n_s = t.backproject_frame(i)  # no cap → every pixel
+            if pts.shape[0] == 0:
+                dd = d.depth[i]
+                frac = float((dd > 0).float().mean()) if int(dd.numel()) else 0.0
+                self.gui_align_status.content = (
+                    f"_Frame {i}: nothing to show — stored depth has only {frac:.1%} "
+                    f"pixels > 0 (range [{float(dd.min()):.3f}, {float(dd.max()):.3f}]). "
+                    f"If ~0%, this frame's depth is empty — e.g. Add-frame ran without "
+                    f"inpaint depth-grounding, or the captured view was entirely "
+                    f"disoccluded (alpha 0 ⇒ splat depth 0)._")
+                return
+            # Two layers so the painted points are unmistakable: painted = BIG bright
+            # cyan (the real alignment test), seen = small dim grey (context). Sizes
+            # scale with the scene. Routed through the layer system (a direct
+            # server.scene.add_point_cloud obstructs splat rendering — see
+            # _add_or_refresh_debug_layer); shown in 'points' mode w/ the splat centers.
+            ss = float(getattr(getattr(t, "init", None), "scene_scale", 0.0) or 0.0)
+            size_painted = max(ss * 0.05, 0.035)     # BIG — painted points dominate
+            size_seen = max(ss * 0.02, 0.014)         # clearly visible (full cloud), still < painted
+            pp = pts[painted].astype(np.float32)
+            sp = pts[~painted].astype(np.float32)
+            if pp.shape[0] > 0:
+                self._add_or_refresh_debug_layer(PointCloudLayer(
+                    name=self._ALIGN_PAINTED_NAME, points=pp,
+                    colors_rgb=np.zeros((pp.shape[0], 3), np.uint8),
+                    point_size=size_painted, color_mode="uniform",
+                    uniform_color=(0, 255, 255)))
+            else:
+                self._teardown_debug_layer(self._ALIGN_PAINTED_NAME)
+            if sp.shape[0] > 0:
+                self._add_or_refresh_debug_layer(PointCloudLayer(
+                    name=self._ALIGN_SEEN_NAME, points=sp,
+                    colors_rgb=np.zeros((sp.shape[0], 3), np.uint8),
+                    point_size=size_seen, color_mode="uniform",
+                    uniform_color=(255, 150, 40)))   # bright orange — lands on existing splats
+            else:
+                self._teardown_debug_layer(self._ALIGN_SEEN_NAME)
+            # Shrink the dense scene (splat_centers) points so they don't bury the
+            # cyan painted points where the two coincide (i.e. exactly when the frame
+            # IS aligned). Saved once and restored on Clear.
+            self._shrink_scene_points()
+            # Highlight the frame's camera frustum (direct add, like the training
+            # cams) so the just-added camera is obvious.
+            c2w = d.c2w[i].detach().cpu().numpy()
+            K = d.K[i].detach().cpu().numpy()
+            H, W = int(d.H), int(d.W)
+            fov_y = 2.0 * math.atan(0.5 * H / max(float(K[1, 1]), 1e-9))
+            scale = max(float(self.gui_train_cam_scale.value), 0.15) * 1.5
+            img = (d.rgb[i].detach().cpu().numpy() * 255).astype(np.uint8)
+            self.server.scene.add_camera_frustum(
+                name=self._ALIGN_CAM_NAME, fov=fov_y, aspect=W / max(H, 1),
+                scale=scale, color=(0, 255, 255),
+                wxyz=tuple(float(x) for x in _rotmat_to_wxyz(c2w[:3, :3])),
+                position=tuple(float(x) for x in c2w[:3, 3]),
+                image=img,
+            )
+            # Make the overlay visible: point-cloud layers only render in 'points' mode.
+            switched = ""
+            if self.display_mode != "points":
+                self.gui_display.value = "points"
+                self._apply_display_mode()
+                switched = " — switched Display to 'points'"
+            ep = d.frame_epoch[i] if d.frame_epoch else 0
+            self.gui_align_status.content = (
+                f"_Camera {i}/{N - 1} (epoch {ep}) ONLY — all {n_p + n_s} depth points: "
+                f"{n_p} painted/novel (BIG cyan), {n_s} on existing splats (orange). "
+                f"Scene points shrunk so the overlay shows{switched}. Clear restores "
+                f"scene size; per-layer sliders in the Point Clouds folder._")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.gui_align_status.content = (
+                f"_Alignment-check error: {type(e).__name__}: {e}_")
+
+    def _shrink_scene_points(self) -> None:
+        """Shrink the 'splat_centers' scene cloud so it doesn't bury the alignment
+        overlay, but keep it visible as a reference (~40% of its size, not the
+        floor). Saves the prior size once for restore on Clear."""
+        try:
+            h = self._handles.get("splat_centers")
+            if h is None or "size" not in h:
+                return
+            if getattr(self, "_align_saved_splat_size", None) is None:
+                self._align_saved_splat_size = float(h["size"].value)
+            target = max(self._align_saved_splat_size * 0.4, 1e-4)
+            h["size"].value = target  # viser clamps into the slider's range
+            self._push_layer("splat_centers")
+        except Exception:
+            pass
+
+    def _restore_scene_points(self) -> None:
+        try:
+            h = self._handles.get("splat_centers")
+            saved = getattr(self, "_align_saved_splat_size", None)
+            if h is not None and "size" in h and saved is not None:
+                h["size"].value = saved
+                self._push_layer("splat_centers")
+        except Exception:
+            pass
+        self._align_saved_splat_size = None
+
+    def _on_align_clear_click(self) -> None:
+        for nm in (self._ALIGN_PAINTED_NAME, self._ALIGN_SEEN_NAME):
+            try:
+                self._teardown_debug_layer(nm)
+            except Exception:
+                pass
+        try:
+            self.server.scene.remove_by_name(self._ALIGN_CAM_NAME)
+        except Exception:
+            pass
+        self._restore_scene_points()
+        self.gui_align_status.content = "_Cleared (scene point size restored)._"
 
     # ---- Display mode (splats vs points) ----------------------------- #
 

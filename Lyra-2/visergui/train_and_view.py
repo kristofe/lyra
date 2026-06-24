@@ -51,7 +51,7 @@ def main() -> None:
     )
     p.add_argument(
         "--video", type=Path,
-        default=Path("assets/ours/museum_fwd.mp4"),
+        default=Path("assets/ours/arch_orbit_left_fast.mp4"),
         help="Default value populated into the Setup→video field at boot.",
     )
     p.add_argument("--name", type=str, default=None)
