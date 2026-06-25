@@ -4,20 +4,27 @@
 # Pinned snapshot of the `splat` Gaussian-splatting / visergui training env.
 # Generated from `pip freeze`; the CUDA-specific lines are annotated below.
 #
-# Install on a server (run from the REPO ROOT so the editable path resolves):
+# Install on a server (two steps -- the second is an in-repo editable package
+# that is NOT in this file, because pip resolves -e paths against your CWD):
 #
 #   conda create -n splat -y python=3.10 pip
 #   conda activate splat
+#   cd Lyra-2                       # the repo root
 #   pip install -r requirements-splat.txt
+#   pip install -e ./lyra_2/_src/inference/depth_anything_3
+#
+# depth_anything_3 is imported by visergui/splat_trainer.py. It lives in this
+# repo (a submodule) -- make sure `git submodule update --init --recursive` has
+# populated lyra_2/_src/inference/depth_anything_3 before the editable install.
 #
 # Notes:
 #   * torch/torchvision/triton are cu128 (Blackwell sm_120) builds and come
 #     from the PyTorch index pinned below, not plain PyPI.
-#   * fvdb-core is pinned to its exact local build tag (+pt210.cu128); the
-#     matching wheel is published on PyPI under version 0.4.2.
-#   * depth_anything_3 is installed editable from this repo (last line). The
-#     relative path resolves against the directory you run pip from, so run
-#     pip from the repo root. Requires the repo's git submodules to be present.
+#   * fvdb-core ships ONLY as an sdist on PyPI (no prebuilt wheel), so pip
+#     builds it from source against the installed torch/CUDA -- that source
+#     build is what stamps the local "+pt210.cu128" tag. Pin it as plain
+#     ==0.4.2 (NOT ==0.4.2+pt210.cu128, which exists nowhere to download).
+#     The build needs a CUDA toolchain (nvcc) matching torch's cu128.
 # ============================================================================
 
 --extra-index-url https://download.pytorch.org/whl/cu128
@@ -68,8 +75,10 @@ Flask==3.1.3
 fonttools==4.63.0
 fsspec==2026.4.0
 ftfy==6.3.1
-fvdb-core==0.4.2+pt210.cu128
+fvdb-core==0.4.2
 fvdb_reality_capture==0.4.0
+glcontext==3.0.0
+glfw==2.10.0
 grpcio==1.80.0
 gsplat==1.5.3
 h11==0.16.0
@@ -110,6 +119,7 @@ MarkupSafe==3.0.3
 matplotlib==3.10.9
 matplotlib-inline==0.2.2
 mdurl==0.1.2
+moderngl==5.12.0
 moviepy==2.2.1
 mpmath==1.3.0
 msgpack==1.1.2
@@ -239,5 +249,13 @@ yourdfpy==0.0.60
 zipp==3.23.1
 zstandard==0.25.0
 
-# --- editable, in-repo (was recorded by pip freeze as a broken git+subdirectory URL) ---
--e ./lyra_2/_src/inference/depth_anything_3
+# NOTE: depth_anything_3 (editable, in this repo) is intentionally NOT listed
+# here -- install it separately, AFTER this file, with --no-deps:
+#   pip install --no-deps -e ./lyra_2/_src/inference/depth_anything_3
+# Two reasons it must be separate + --no-deps:
+#   1. pip resolves -e relative paths against your CWD, not this file's location,
+#      so keeping it here breaks `pip install -r Lyra-2/requirements-splat.txt`
+#      when run from outside the repo.
+#   2. DA3's pyproject pins numpy<2, which is incompatible with numpy==2.2.6
+#      above. --no-deps keeps numpy 2.x (DA3 imports fine under it; all of DA3's
+#      real runtime deps are already pinned in this file).
