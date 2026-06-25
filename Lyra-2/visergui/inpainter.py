@@ -75,11 +75,14 @@ class InpainterPanel:
             # ---- Phase 2a: mask + neighbors
             self.gui_mode = self.server.gui.add_dropdown(
                 "mode",
-                options=["disocclusion_only", "outpaint"],
+                options=["disocclusion_only", "outpaint", "whole_image"],
                 initial_value="disocclusion_only",
                 hint=(
                     "disocclusion_only = mask from low-alpha pixels of splat render. "
-                    "outpaint = pad the image + mask the padding."
+                    "outpaint = pad the image + mask the padding. "
+                    "whole_image = full-image edit driven by the prompt (e.g. 'make "
+                    "it night'; for deblur use a 'sharp, in focus, denoised' prompt + "
+                    "low strength). Strength controls how much of the original is kept."
                 ),
             )
             self.gui_alpha_thresh = self.server.gui.add_slider(
@@ -142,9 +145,11 @@ class InpainterPanel:
             self.gui_strength = self.server.gui.add_slider(
                 "strength", initial_value=0.85, min=0.1, max=1.0, step=0.05,
                 hint="How much noise to add to the masked region (1.0=full inpaint, lower=preserve "
-                     "more of the original). FLUX2-Klein default: 0.8.",
+                     "more of the original). FLUX2-Klein default: 0.8. "
+                     "whole_image mode: ~0.25-0.35 = deblur / light touch, "
+                     "~0.5-0.7 = bold edit; 1.0 ignores the original.",
             )
-            self.gui_inpaint_btn = self.server.gui.add_button("Inpaint")
+            self.gui_inpaint_btn = self.server.gui.add_button("Render/Inpaint")
             self.gui_inpaint_preview = self.server.gui.add_image(placeholder, label="inpaint result")
 
             # ---- Phase 3: InstaInpaint backend (parallel to FLUX-Kontext)
@@ -486,43 +491,56 @@ class InpainterPanel:
             H, W = ss["H"], ss["W"]
             c2w_curr = ss["c2w"]                       # (4, 4) numpy float
 
-            # 1. Build the mask. Always start with the alpha-disocclusion mask
-            #    from the splat render captured in Phase 1.
-            alpha_thresh = float(self.gui_alpha_thresh.value)
-            mask = (ss["alpha"] < alpha_thresh).astype(np.uint8)  # (H, W)
-
             mode = self.gui_mode.value
-            # For 'disocclusion_only' we use the alpha mask as-is.
-            # For 'outpaint' we keep mask as the alpha disocclusion of the
-            # original image; the padding is applied at inpaint time (Phase 2b).
+
+            # 1. Build the mask.
+            # For 'whole_image' the prompt edits the entire frame, so the mask is
+            # the whole image (no alpha gate). Otherwise start from the
+            # alpha-disocclusion mask from the splat render captured in Phase 1.
+            # For 'disocclusion_only' we use that alpha mask as-is; for 'outpaint'
+            # we keep it and apply the padding at inpaint time (Phase 2b).
+            if mode == "whole_image":
+                mask = np.ones((H, W), dtype=np.uint8)
+            else:
+                alpha_thresh = float(self.gui_alpha_thresh.value)
+                mask = (ss["alpha"] < alpha_thresh).astype(np.uint8)  # (H, W)
 
             # 2. Find nearest training cameras (composite of position dist + fwd dot).
-            K_neighbors = int(self.gui_n_neighbors.value)
-            c2w_train = d.c2w.detach().cpu().numpy()    # (N, 4, 4)
-            t_curr = c2w_curr[:3, 3]
-            t_train = c2w_train[:, :3, 3]               # (N, 3)
-            # OpenCV camera +Z is forward.
-            fwd_curr = c2w_curr[:3, :3] @ np.array([0.0, 0.0, 1.0])
-            fwd_train = c2w_train[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
-            pos_dist = np.linalg.norm(t_train - t_curr[None], axis=1)            # (N,)
-            fwd_dot = (fwd_train * fwd_curr[None]).sum(axis=1)                   # (N,)
-            # Higher score = better. Position closeness contributes more than orientation.
-            score = (1.0 / (pos_dist + 1e-6)) + 0.5 * fwd_dot
-            order = np.argsort(-score)
-            neighbor_idx = order[:K_neighbors].tolist()
+            #    Skipped for 'whole_image': the edit should follow the prompt, not
+            #    the appearance of neighbor views (which carry the original look).
+            if mode == "whole_image":
+                neighbor_idx = []
+                rgbs = []
+                neighbor_c2ws = []
+                pos_dist = None
+            else:
+                K_neighbors = int(self.gui_n_neighbors.value)
+                c2w_train = d.c2w.detach().cpu().numpy()    # (N, 4, 4)
+                t_curr = c2w_curr[:3, 3]
+                t_train = c2w_train[:, :3, 3]               # (N, 3)
+                # OpenCV camera +Z is forward.
+                fwd_curr = c2w_curr[:3, :3] @ np.array([0.0, 0.0, 1.0])
+                fwd_train = c2w_train[:, :3, :3] @ np.array([0.0, 0.0, 1.0])
+                pos_dist = np.linalg.norm(t_train - t_curr[None], axis=1)            # (N,)
+                fwd_dot = (fwd_train * fwd_curr[None]).sum(axis=1)                   # (N,)
+                # Higher score = better. Position closeness contributes more than orientation.
+                score = (1.0 / (pos_dist + 1e-6)) + 0.5 * fwd_dot
+                order = np.argsort(-score)
+                neighbor_idx = order[:K_neighbors].tolist()
 
-            # 3. Pull the neighbor RGB frames (training data is uint-ish float [0,1]).
-            rgbs = []
-            for i in neighbor_idx:
-                frame = d.rgb[i].detach().cpu().numpy()  # (H, W, 3) float [0,1]
-                rgbs.append((frame * 255).clip(0, 255).astype(np.uint8))
+                # 3. Pull the neighbor RGB frames (training data is uint-ish float [0,1]).
+                rgbs = []
+                for i in neighbor_idx:
+                    frame = d.rgb[i].detach().cpu().numpy()  # (H, W, 3) float [0,1]
+                    rgbs.append((frame * 255).clip(0, 255).astype(np.uint8))
+                neighbor_c2ws = [c2w_train[i] for i in neighbor_idx]
 
             # 4. Stash + display.
             self.last_neighbors = {
                 "mask": mask,
                 "indices": neighbor_idx,
                 "rgbs": rgbs,
-                "c2ws": [c2w_train[i] for i in neighbor_idx],
+                "c2ws": neighbor_c2ws,
                 "K": ss["K"],
                 "H": H, "W": W,
                 "mode": mode,
@@ -530,14 +548,24 @@ class InpainterPanel:
 
             mask_overlay = _overlay_mask(ss["rgb"], mask)
             self.gui_mask_preview.image = _thumbnail(mask_overlay, max_side=384)
-            self.gui_neighbors_preview.image = _thumbnail(_tile_images(rgbs), max_side=512)
+            if rgbs:
+                self.gui_neighbors_preview.image = _thumbnail(_tile_images(rgbs), max_side=512)
+            else:
+                self.gui_neighbors_preview.image = np.zeros((64, 64, 3), dtype=np.uint8)
 
             n_masked = int(mask.sum())
             mask_pct = 100.0 * n_masked / mask.size
+            if neighbor_idx:
+                neighbor_line = (
+                    f"_picked neighbors: {neighbor_idx} "
+                    f"(closest pos {pos_dist[neighbor_idx[0]]:.3f}m)_"
+                )
+            else:
+                neighbor_line = "_no neighbors (whole_image edit follows the prompt)_"
             self.gui_status.content = (
                 f"_mode={mode}_  \n"
                 f"_mask covers {mask_pct:.1f}% of pixels_  \n"
-                f"_picked neighbors: {neighbor_idx} (closest pos {pos_dist[neighbor_idx[0]]:.3f}m)_"
+                f"{neighbor_line}"
             )
             print(f"  inpainter: mode={mode} mask_px={n_masked} neighbors={neighbor_idx}",
                   file=sys.stderr, flush=True)

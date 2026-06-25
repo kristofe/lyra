@@ -954,6 +954,18 @@ class ViewerApp:
                     import traceback
                     print(f"  inpainter: panel init skipped: {e}", file=__import__("sys").stderr)
                     traceback.print_exc()
+            with tabs.add_tab("Segment"):
+                try:
+                    from segmenter import SegmenterPanel
+                    self.segmenter = SegmenterPanel(
+                        server=self.server,
+                        trainer_ref=self._trainer_ref,
+                        viewer=self,
+                    )
+                except Exception as e:
+                    import traceback
+                    print(f"  segmenter: panel init skipped: {e}", file=__import__("sys").stderr)
+                    traceback.print_exc()
         else:
             self._build_inspect_panel()
 

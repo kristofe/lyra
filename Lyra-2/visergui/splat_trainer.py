@@ -1710,6 +1710,93 @@ class SplatTrainer:
             raise RuntimeError("render_rgbd_at: trainer not initialized")
         return _render_splat_rgbd(self.train.params, c2w, K, int(H), int(W))
 
+    def select_splats_by_masks(self, masks=None, frac: float = 0.5,
+                               min_seen: int = 1, depth_tol: float = 0.06,
+                               accumulate: bool = False) -> dict:
+        """Select the gaussian splats that make up an object, from per-frame 2D
+        masks, by a front-surface multi-view vote.
+
+        For each training frame, project every gaussian center; keep only the
+        splats that are the visible front surface (camera-space depth matches
+        the rendered splat depth at that pixel) AND whose pixel falls inside
+        that frame's object mask. A splat is selected if it lands in-mask in
+        `frac` of the frames that see it (and is seen in >= `min_seen` views).
+
+        `masks`: (N, H, W) bool tensor aligned to `self.data`; defaults to
+        `self.object_masks` (set by the Segment panel). When `accumulate` is
+        True the new object's splats are UNION'd into the existing
+        `self.selected_splat_mask` (so you can segment + select several objects
+        in turn); otherwise the selection is replaced. Stores the result in
+        `self.selected_splat_mask` (M,) bool and returns summary stats.
+        """
+        if self.train is None or self.data is None:
+            raise RuntimeError("select_splats_by_masks: trainer not initialized")
+        if masks is None:
+            masks = getattr(self, "object_masks", None)
+        if masks is None:
+            raise ValueError("no object masks — run the Segment step first")
+
+        d = self.data
+        device = self.means_t.device
+        H, W, N = int(d.H), int(d.W), int(d.N)
+        masks = torch.as_tensor(masks, device=device, dtype=torch.bool)
+        if tuple(masks.shape) != (N, H, W):
+            raise ValueError(f"masks shape {tuple(masks.shape)} != (N,H,W)=({N},{H},{W})")
+
+        means = self.train.params["means"].detach()               # (M, 3)
+        M = int(means.shape[0])
+        means_h = torch.cat(
+            [means, torch.ones((M, 1), device=device, dtype=means.dtype)], dim=1)  # (M, 4)
+
+        votes_seen = torch.zeros(M, dtype=torch.int32, device=device)
+        votes_in   = torch.zeros(M, dtype=torch.int32, device=device)
+
+        w2c_all = d.w2c.to(device)                                # (N, 4, 4)
+        K_all   = d.K.to(device)                                  # (N, 3, 3)
+        c2w_np  = d.c2w.detach().cpu().numpy()
+        K_np    = d.K.detach().cpu().numpy()
+
+        with torch.no_grad():
+            for i in range(N):
+                p_cam = (w2c_all[i] @ means_h.T).T[:, :3]         # (M, 3)
+                z = p_cam[:, 2]
+                z_safe = z.clamp_min(1e-6)
+                fx, fy = K_all[i, 0, 0], K_all[i, 1, 1]
+                cx, cy = K_all[i, 0, 2], K_all[i, 1, 2]
+                pix_x = fx * (p_cam[:, 0] / z_safe) + cx
+                pix_y = fy * (p_cam[:, 1] / z_safe) + cy
+                in_front  = z > 0
+                in_bounds = (pix_x >= 0) & (pix_x < W) & (pix_y >= 0) & (pix_y < H)
+
+                # Rendered splat depth at this view, for the front-surface gate.
+                _, _, depth_np = _render_splat_rgbd(
+                    self.train.params, c2w_np[i], K_np[i], H, W)
+                depth_t = torch.as_tensor(depth_np, device=device, dtype=torch.float32)
+
+                px = pix_x.clamp(0, W - 1).long()
+                py = pix_y.clamp(0, H - 1).long()
+                rendered   = depth_t[py, px]                       # (M,)
+                in_mask_px = masks[i][py, px]                      # (M,) bool
+                front = (z - rendered).abs() <= depth_tol * z_safe
+                seen = in_front & in_bounds & (rendered > 0) & front
+                votes_seen += seen.to(torch.int32)
+                votes_in   += (seen & in_mask_px).to(torch.int32)
+
+        this_obj = (votes_seen >= int(min_seen)) & (
+            votes_in.float() >= float(frac) * votes_seen.float())
+        prior = getattr(self, "selected_splat_mask", None)
+        if accumulate and prior is not None and tuple(prior.shape) == tuple(this_obj.shape):
+            selected = this_obj | prior.to(this_obj.device)
+        else:
+            selected = this_obj
+        self.selected_splat_mask = selected
+        n_new = int(this_obj.sum().item())
+        n_sel = int(selected.sum().item())
+        print(f"select_splats_by_masks: M={M} new={n_new} total={n_sel} "
+              f"({100.0 * n_sel / max(M, 1):.1f}%) accumulate={accumulate} "
+              f"frames={N} frac={frac} depth_tol={depth_tol}")
+        return {"n_selected": n_sel, "n_new": n_new, "M": M, "n_frames": N}
+
     def backproject_frame(self, idx: int, max_points: int = 0,
                           alpha_thresh: float = 0.5, rel_tol: float = 0.1):
         """Back-project a stored training frame's depth into world points, for the

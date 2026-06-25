@@ -55,6 +55,33 @@ def _get_predictor(device: str = "cuda"):
     return _PREDICTOR
 
 
+_VIDEO_PREDICTOR = None
+
+
+def _get_video_predictor(device: str = "cuda"):
+    """Lazy-load + cache the SAM 2 *video* predictor (temporal propagation).
+
+    Mirrors `_get_predictor` but builds the video model, used to propagate a
+    single object's mask across an ordered sequence of frames (the training
+    frames). Reuses the same config + checkpoint as the image predictor.
+    """
+    global _VIDEO_PREDICTOR
+    if _VIDEO_PREDICTOR is None:
+        from sam2.build_sam import build_sam2_video_predictor
+
+        if not _DEFAULT_SAM_CKPT.is_file():
+            raise FileNotFoundError(
+                f"SAM 2 checkpoint not found at {_DEFAULT_SAM_CKPT}. "
+                f"Download via: "
+                f"wget -O {_DEFAULT_SAM_CKPT} 'https://dl.fbaipublicfiles.com/"
+                f"segment_anything_2/092824/sam2.1_hiera_large.pt'"
+            )
+        _VIDEO_PREDICTOR = build_sam2_video_predictor(
+            _DEFAULT_SAM_CFG, str(_DEFAULT_SAM_CKPT), device=device
+        )
+    return _VIDEO_PREDICTOR
+
+
 def _mask_centroid(mask: np.ndarray) -> tuple[int, int] | None:
     """Return (u, v) pixel centroid of the non-zero region, or None if empty."""
     if mask.dtype != np.bool_:
