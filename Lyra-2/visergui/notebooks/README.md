@@ -23,6 +23,11 @@ Key parameters (first code cell, papermill-injectable):
 | `MODEL_ID` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | HF checkpoint |
 | `PROCESS_RES` | 504 | DA3 inference resolution — lower if you OOM |
 | `TRAIN_STEPS` | 0 | `0` = init only; `>0` runs the gsplat training loop |
+| `MODE` | `3dgs` | `3dgs` or `2dgs` (flat disks + distortion/normal regularizers) |
+| `SH_MAX_DEG` | 2 | max spherical-harmonics degree (0 = flat color) |
+| `SH_RAMP` | 1000 | steps per SH band unlock |
+| `LPIPS_WEIGHT` | 0.05 | perceptual loss weight (0 disables) |
+| `USE_DENSIFY` | True | gsplat clone/split/prune during training |
 
 ## Smoke harness
 
@@ -31,6 +36,18 @@ Key parameters (first code cell, papermill-injectable):
 .\run_smoke.ps1 -MaxFrames 32            # full-size confirmation run
 .\run_smoke.ps1 -Video ..\..\path\to\other.mp4
 ```
+
+Training smoke runs on Windows go through `run_train_smoke.cmd`, which sets up the
+MSVC + CUDA env that gsplat's JIT kernel build needs and forwards its args:
+
+```bat
+run_train_smoke.cmd -TrainSteps 600 -Mode 3dgs -ShDeg 2 -ShRamp 200 -LpipsWeight 0.05 -Densify 1
+run_train_smoke.cmd -TrainSteps 800 -Mode 2dgs -ShDeg 1
+```
+
+Output lands in `_work\train_smoke.log` (last line `TRAIN_SMOKE_EXIT=<code>`);
+`verify_train.py` checks the trained PLY (count, SH field count, params moved off
+init values, loss curve rendered) in addition to `verify_init.py`.
 
 `run_smoke.ps1` executes the notebook headlessly with papermill into
 `_work/smoke_out.ipynb` (per-cell stdout + the failing cell's traceback survive
