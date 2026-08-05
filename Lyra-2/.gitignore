@@ -52,7 +52,7 @@ venv.bak/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+#*.ipynb
 
 # PyCharm
 .idea/
@@ -108,3 +108,6 @@ results/
 .checkpoint_keep
 attn_mask_vis/
 attn_mask_vis_*
+
+# splat notebook smoke-run outputs
+visergui/notebooks/_work/
