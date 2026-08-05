@@ -1,5 +1,8 @@
 # Splat notebooks
 
+Pip deps for both notebooks: [requirements.txt](requirements.txt) (install torch
+from the cu128 index first — instructions at the top of the file).
+
 ## `splat_init_and_train.ipynb`
 
 Standalone, fully self-contained distillation of `visergui/splat_trainer.py`:
@@ -28,6 +31,26 @@ Key parameters (first code cell, papermill-injectable):
 | `SH_RAMP` | 1000 | steps per SH band unlock |
 | `LPIPS_WEIGHT` | 0.05 | perceptual loss weight (0 disables) |
 | `USE_DENSIFY` | True | gsplat clone/split/prune during training |
+
+Besides the PLYs, the init run saves `_work/cameras.npz` (frames, K, poses,
+depth) so downstream notebooks can reuse the scene without re-running DA3.
+
+## `splat_segmentation.ipynb`
+
+Distills the Segment tab (`segmenter.py` + `multiview_mask.py` +
+`splat_trainer.select_splats_by_masks`): a **click** — here `(CLICK_FRAME,
+CLICK_U, CLICK_V)` instead of a live viser pointer event — is backprojected via
+rendered splat depth to a world point, the closest camera that sees it becomes
+the seed frame, SAM 2 segments the seed and propagates the mask across all
+frames as a video, and an occlusion-aware multi-view vote lifts the masks to a
+splat selection. Outputs in `_work/segment/`: per-frame `objmask_*.png`,
+`object.ply` + `background.ply` (partition of the input scene), and proof
+figures (`click_seed.png`, `seed_mask.png`, `masks_montage.png`,
+`segment_result.png`).
+
+Needs `_work/` from an init run, `sam2`, and the SAM 2.1 hiera-large checkpoint
+at `Lyra-2/vendor/InstaInpaint/checkpoints/sam2.1_hiera_large.pt` (URL in
+requirements.txt).
 
 ## Smoke harness
 
